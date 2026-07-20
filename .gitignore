@@ -1,0 +1,20 @@
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# Generated project (regenerate with `xcodegen generate`)
+Warehouse.xcodeproj/
+
+# SPM
+.build/
+.swiftpm/
+
+# Firebase config contains API keys tied to Jack's Firebase project
+WarehouseApp/GoogleService-Info.plist
+
+# macOS
+.DS_Store
