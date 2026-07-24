@@ -21,6 +21,10 @@ struct AddProductView: View {
     @State private var barcodeMode: BarcodeMode
     @State private var scannedBarcode: String
     @State private var showsScanner = false
+    @State private var showsObjectScanner = false
+    @State private var objectScanCapture: ObjectScanCapture?
+    @State private var displayUnit: DimensionDisplayUnit = .centimetres
+    @State private var canBeRotated = false
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -35,6 +39,7 @@ struct AddProductView: View {
             Form {
                 photoSection
                 detailsSection
+                objectScanSection
                 barcodeSection
             }
             .navigationTitle("New Product")
@@ -58,6 +63,11 @@ struct AddProductView: View {
             .sheet(isPresented: $showsScanner) {
                 ScannerSheet(title: "Scan Barcode") { scannedBarcode = $0 }
             }
+            .fullScreenCover(isPresented: $showsObjectScanner) {
+                ObjectScanCaptureView { capture in
+                    objectScanCapture = capture
+                }
+            }
             .alert("Couldn't Save", isPresented: .init(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } }
@@ -65,6 +75,37 @@ struct AddProductView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(errorMessage ?? "")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var objectScanSection: some View {
+        if let objectScanCapture {
+            ObjectScanSummaryView(
+                capture: objectScanCapture,
+                displayUnit: $displayUnit,
+                canBeRotated: $canBeRotated,
+                onRescan: { showsObjectScanner = true }
+            )
+        } else {
+            Section("Storage Dimensions") {
+                Button {
+                    showsObjectScanner = true
+                } label: {
+                    Label("Start Object Scan", systemImage: "arkit")
+                }
+                Text("Choose multi-frame LiDAR Fusion or Apple Object Capture, then review the measured storage bounding box.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if !ObjectScannerCapabilities.hasLiDAR {
+                    Label(
+                        "This device will use standard ARKit without LiDAR. Measurements may be less reliable.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
             }
         }
     }
@@ -167,7 +208,14 @@ struct AddProductView: View {
                     productCode: productCode.trimmingCharacters(in: .whitespaces),
                     type: type.trimmingCharacters(in: .whitespaces),
                     shelfLifeDays: shelfLifeText.isEmpty ? nil : Int(shelfLifeText),
-                    photoJpeg: photo.flatMap(PhotoService.thumbnailJpeg)
+                    photoJpeg: photo.flatMap(PhotoService.thumbnailJpeg),
+                    objectScan: objectScanCapture.map {
+                        ObjectDimensionCalculator.makeRecord(
+                            capture: $0,
+                            displayUnit: displayUnit,
+                            canBeRotated: canBeRotated
+                        )
+                    }
                 )
                 let productId = try await ProductRepository.create(draft)
 

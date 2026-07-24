@@ -12,4 +12,6 @@ struct Product: Identifiable, Codable, Equatable {
     let totalStock: Int
     let createdAt: Date
     let lastReceivedAt: Date?
+    /// Optional for backward compatibility with products created before object scanning.
+    let objectScan: ProductObjectScan?
 }

@@ -8,6 +8,7 @@ struct ProductDraft {
     let type: String
     let shelfLifeDays: Int?
     let photoJpeg: Data?
+    let objectScan: ProductObjectScan?
 }
 
 enum ProductRepository {
@@ -25,7 +26,8 @@ enum ProductRepository {
             shelfLifeDays: draft.shelfLifeDays,
             totalStock: 0,
             createdAt: .now,
-            lastReceivedAt: nil
+            lastReceivedAt: nil,
+            objectScan: draft.objectScan
         )
         try FirestoreCollections.products.document(id).setData(from: product)
         if let jpeg = draft.photoJpeg {

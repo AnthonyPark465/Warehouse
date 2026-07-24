@@ -20,6 +20,9 @@ and watch shelf life.
   tab shows units received per day, per product.
 - **Sorting & grouping** — sort by newest, stock amount, or name; group by
   product type or by shipment.
+- **Object scanning** — measure a product with native ARKit and optional LiDAR
+  inside Add Product, apply configurable measurement tolerance and storage
+  clearance, then review the object and storage bounding box in 3D.
 
 ## Stack
 
@@ -60,3 +63,7 @@ WarehouseAppTests/  unit tests for all the pure logic
 
 The camera scanner only works on a real device; on the simulator the app
 falls back to manual barcode entry everywhere scanning is offered.
+
+Object measurement also requires a physical ARKit-capable device. LiDAR is
+used when available; see [docs/object-scanning.md](docs/object-scanning.md) for
+architecture, calibration limits, and physical-device testing.

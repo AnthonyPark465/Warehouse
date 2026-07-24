@@ -3,6 +3,13 @@ import XCTest
 
 final class SmokeTests: XCTestCase {
     func testAppTargetLinks() {
-        XCTAssertFalse(FirebaseBootstrap.isConfigured, "Firebase should stay unconfigured without GoogleService-Info.plist")
+        let hasConfigurationFile =
+            Bundle.main.url(forResource: "GoogleService-Info", withExtension: "plist") != nil
+
+        XCTAssertEqual(
+            FirebaseBootstrap.isConfigured,
+            hasConfigurationFile,
+            "Firebase configuration should match the presence of GoogleService-Info.plist"
+        )
     }
 }
