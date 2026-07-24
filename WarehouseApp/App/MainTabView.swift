@@ -9,6 +9,8 @@ struct MainTabView: View {
                 .tabItem { Label("Inventory", systemImage: "shippingbox") }
             ScanView()
                 .tabItem { Label("Scan", systemImage: "barcode.viewfinder") }
+            PlacementView()
+                .tabItem { Label("Place", systemImage: "square.3.layers.3d") }
             ReceiveView()
                 .tabItem { Label("Receive", systemImage: "tray.and.arrow.down") }
             ReportsView()
