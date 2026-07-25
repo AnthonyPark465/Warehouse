@@ -29,9 +29,16 @@ is ever needed). Bundle ID: `com.tetris.warehouse`.
 
 ## Getting started
 
-1. **Backend:** follow [docs/firebase-setup.md](docs/firebase-setup.md) to
-   create the free Firebase project and drop `GoogleService-Info.plist` into
-   `WarehouseApp/`.
+0. **Prerequisites:** a Mac with [Xcode](https://apps.apple.com/app/xcode/id497799835)
+   (16 or newer) and [Homebrew](https://brew.sh).
+1. **Backend config** — one of:
+   - **Joining an existing inventory?** Get `GoogleService-Info.plist` from
+     whoever runs the Firebase project (it's gitignored on purpose — never
+     commit it) and drop it into `WarehouseApp/`. Don't create a new Firebase
+     project; you'd get a separate empty inventory.
+   - **Setting up from scratch?** Follow [docs/firebase-setup.md](docs/firebase-setup.md)
+     to create the free Firebase project, then drop the downloaded
+     `GoogleService-Info.plist` into `WarehouseApp/`.
 2. **Project file:** the Xcode project is generated — after changing
    `project.yml` or adding files, run:
    ```sh
@@ -43,8 +50,20 @@ is ever needed). Bundle ID: `com.tetris.warehouse`.
    xcodebuild -project Warehouse.xcodeproj -scheme WarehouseApp \
      -destination 'platform=iOS Simulator,name=iPhone 15' test
    ```
-4. **Run on an iPhone:** see the device section at the end of
-   [docs/firebase-setup.md](docs/firebase-setup.md).
+4. **Run on an iPhone:**
+   1. Open `Warehouse.xcodeproj`, add your Apple ID under Xcode → Settings →
+      Accounts (a free account works), then select the WarehouseApp target →
+      Signing & Capabilities → pick your **Team**.
+   2. Plug in the iPhone (data cable, phone unlocked, tap **Trust**), enable
+      **Developer Mode** on it (Settings → Privacy & Security), and select the
+      phone in Xcode's device dropdown.
+   3. Press **⌘R**. If macOS shows a *"codesign wants to access key…"*
+      password prompt, enter your Mac password and click **Always Allow**.
+   4. First launch only: on the phone, Settings → General → VPN & Device
+      Management → trust your developer certificate, then open the app.
+   5. Free Apple accounts: the install expires after 7 days — reconnect and
+      press Run to refresh. In the app, **Create Account** once (any email +
+      6-char password) or **Sign In** with the inventory's existing account.
 
 ## Project layout
 
