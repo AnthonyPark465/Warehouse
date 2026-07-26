@@ -7,6 +7,8 @@ struct MeasuredShelfSurface: Equatable {
     let id: UUID
     let widthCM: Double
     let depthCM: Double
+    /// nil when no obstruction was found above (open-topped shelf).
+    let measuredFreeHeightCM: Double?
 }
 
 struct LiDARSurfaceScannerView: UIViewRepresentable {
@@ -32,6 +34,9 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
         configuration.planeDetection = [.horizontal]
         if Self.isSupported {
             configuration.sceneReconstruction = .mesh
+            // Give the reconstruction mesh collision shapes so upward
+            // clearance rays can hit shelf undersides.
+            view.environment.sceneUnderstanding.options.insert(.collision)
         }
         configuration.environmentTexturing = .automatic
         view.session.delegate = context.coordinator
@@ -124,11 +129,11 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
             let localPosition = simd_inverse(plane.transform) * worldPosition
             mappedPoints.append(SIMD3<Float>(localPosition.x, 0.006, localPosition.z))
             mappedPointCount.wrappedValue = mappedPoints.count
-            updateMeasurement(planeID: plane.identifier)
+            updateMeasurement(on: plane)
             showMappedArea(on: plane)
         }
 
-        private func updateMeasurement(planeID: UUID) {
+        private func updateMeasurement(on plane: ARPlaneAnchor) {
             guard mappedPoints.count >= 3 else {
                 measuredSurfaces.wrappedValue = []
                 return
@@ -143,11 +148,49 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
 
             measuredSurfaces.wrappedValue = [
                 MeasuredShelfSurface(
-                    id: planeID,
+                    id: plane.identifier,
                     widthCM: Double((maxX - minX) * 100),
-                    depthCM: Double((maxZ - minZ) * 100)
+                    depthCM: Double((maxZ - minZ) * 100),
+                    measuredFreeHeightCM: measureClearance(on: plane)
                 )
             ]
+        }
+
+        /// Casts a grid of upward rays from inside the mapped footprint
+        /// against the reconstruction mesh to find the free height below the
+        /// shelf (or ceiling) above. nil = open top or too few rays hit.
+        private func measureClearance(on plane: ARPlaneAnchor) -> Double? {
+            guard let arView else { return nil }
+            let configuration = ShelfClearanceConfiguration.shelf
+            let polygon = mappedPoints.map { SIMD2<Float>($0.x, $0.z) }
+            let samples = ShelfClearanceEstimator.samplePoints(
+                insidePolygon: polygon,
+                configuration: configuration
+            )
+            guard !samples.isEmpty else { return nil }
+
+            let hitHeights: [Float?] = samples.map { sample in
+                let surfacePoint = plane.transform * SIMD4<Float>(sample.x, 0, sample.y, 1)
+                let origin = SIMD3<Float>(
+                    surfacePoint.x,
+                    surfacePoint.y + configuration.minimumClearanceM,
+                    surfacePoint.z
+                )
+                // The white marker/line/fill overlay entities carry no
+                // collision components, so only the scene mesh can be hit.
+                guard let hit = arView.scene.raycast(
+                    origin: origin,
+                    direction: SIMD3<Float>(0, 1, 0),
+                    length: configuration.maximumSearchLengthM,
+                    query: .nearest,
+                    mask: .sceneUnderstanding
+                ).first else { return nil }
+                return configuration.minimumClearanceM + hit.distance
+            }
+            return ShelfClearanceEstimator.estimate(
+                hitHeightsM: hitHeights,
+                configuration: configuration
+            )?.freeHeightCM
         }
 
         /// Draws the user's control points, joins them with white lines, and

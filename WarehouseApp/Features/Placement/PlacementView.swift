@@ -13,6 +13,7 @@ struct PlacementView: View {
     @State private var showProductScanner = false
     @State private var showSurfaceScanner = false
     @State private var measuredSurfaces: [MeasuredShelfSurface] = []
+    @State private var assumedHeight = "40"
     @State private var mappedPointCount = 0
     @State private var lidarResetToken = 0
     @State private var selectedRecommendation: PlacementRecommendation?
@@ -89,8 +90,19 @@ struct PlacementView: View {
                     "Selected surface",
                     value: "\(surface.widthCM.formatted(.number.precision(.fractionLength(0)))) × \(surface.depthCM.formatted(.number.precision(.fractionLength(0)))) cm"
                 )
+                if let measuredHeight = surface.measuredFreeHeightCM {
+                    LabeledContent(
+                        "Clear height",
+                        value: "\(measuredHeight.formatted(.number.precision(.fractionLength(0)))) cm · measured"
+                    )
+                } else {
+                    dimensionField("Clear height", text: $assumedHeight)
+                    Text("No shelf was detected above the scanned surface — enter the clear height manually.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-            Text("LiDAR measures the shelf footprint. Clear height and weight rating still come from the location master data.")
+            Text("LiDAR measures the shelf footprint and the clear height above it. The weight rating still comes from the location master data.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -166,10 +178,13 @@ struct PlacementView: View {
                     if let surface = measuredSurfaces.first {
                         Label("\(mappedPointCount)-point area mapped", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.white)
-                        Text(
-                            "\(surface.widthCM.formatted(.number.precision(.fractionLength(0)))) cm wide × \(surface.depthCM.formatted(.number.precision(.fractionLength(0)))) cm deep"
-                        )
-                        .font(.headline.monospacedDigit())
+                        Text(surfaceSummary(for: surface))
+                            .font(.headline.monospacedDigit())
+                        if surface.measuredFreeHeightCM == nil {
+                            Text("No shelf detected above — enter the clear height after closing.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
                         Label(
                             mappedPointCount == 0
@@ -205,6 +220,16 @@ struct PlacementView: View {
     private func dimensionField(_ label: String, text: Binding<String>) -> some View {
         TextField("\(label) (cm)", text: text)
             .keyboardType(.decimalPad)
+    }
+
+    private func surfaceSummary(for surface: MeasuredShelfSurface) -> String {
+        let width = surface.widthCM.formatted(.number.precision(.fractionLength(0)))
+        let depth = surface.depthCM.formatted(.number.precision(.fractionLength(0)))
+        guard let height = surface.measuredFreeHeightCM else {
+            return "\(width) cm wide × \(depth) cm deep"
+        }
+        let clear = height.formatted(.number.precision(.fractionLength(0)))
+        return "\(width) cm wide × \(depth) cm deep × \(clear) cm clear"
     }
 
     private var packageProfile: PackagePlacementProfile? {
@@ -252,7 +277,9 @@ struct PlacementView: View {
         if let surface = measuredSurfaces.first {
             locations.append(StorageLocation(
                 id: "LIDAR-01", label: "Current LiDAR scan", barcode: "LOC-LIDAR-01",
-                freeWidthCM: surface.widthCM, freeHeightCM: 40, freeDepthCM: surface.depthCM,
+                freeWidthCM: surface.widthCM,
+                freeHeightCM: surface.measuredFreeHeightCM ?? (Double(assumedHeight) ?? 40),
+                freeDepthCM: surface.depthCM,
                 remainingWeightKG: 25, walkingDistanceM: 10, orderAffinity: 0.5, source: .lidarScan
             ))
         }

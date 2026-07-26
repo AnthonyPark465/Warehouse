@@ -9,6 +9,9 @@ The `Place` tab implements one complete operational path:
 3. Scan the shelf with LiDAR and tap the intended horizontal surface. A
    translucent cyan rectangle and bright outline show the exact measured
    region while live width and depth measurements remain visible on screen.
+   Upward rays against the reconstruction mesh also measure the free height
+   below the shelf above; when nothing is detected overhead (a top shelf),
+   the clear height falls back to a manually editable value.
 4. Exclude locations that fail dimension, handling-clearance, or weight checks.
 5. Rank feasible locations using space efficiency, walking distance, order
    affinity, weight-capacity utilization, demand velocity, and business scale.
