@@ -41,14 +41,182 @@ struct LiDARScanVolume: Equatable {
     }
 }
 
+/// User-defined polygon plus lower/upper offsets along its fitted plane normal.
+/// This is a spatial crop only; its extents are never reported as product dimensions.
+struct LiDARPolygonalPrism: Equatable {
+    let origin: SIMD3<Float>
+    let axisU: SIMD3<Float>
+    let axisV: SIMD3<Float>
+    let normal: SIMD3<Float>
+    let polygon: [SIMD2<Float>]
+    let lowerOffset: Float
+    let upperOffset: Float
+
+    init(
+        origin: SIMD3<Float>,
+        axisU: SIMD3<Float>,
+        axisV: SIMD3<Float>,
+        normal: SIMD3<Float>,
+        polygon: [SIMD2<Float>],
+        lowerOffset: Float,
+        upperOffset: Float
+    ) {
+        self.origin = origin
+        self.axisU = simd_normalize(axisU)
+        self.axisV = simd_normalize(axisV)
+        self.normal = simd_normalize(normal)
+        self.polygon = polygon
+        self.lowerOffset = min(lowerOffset, upperOffset)
+        self.upperOffset = max(lowerOffset, upperOffset)
+    }
+
+    func contains(_ point: SIMD3<Float>, margin: Float = 0) -> Bool {
+        let local = coordinates(of: point)
+        return local.y >= lowerOffset - margin
+            && local.y <= upperOffset + margin
+            && Self.pointInPolygon(SIMD2(local.x, local.z), polygon: polygon, margin: margin)
+    }
+
+    func isNearBoundary(_ point: SIMD3<Float>, distance: Float) -> Bool {
+        let local = coordinates(of: point)
+        let horizontal = SIMD2(local.x, local.z)
+        let nearSide = polygon.indices.contains {
+            Self.distance(
+                from: horizontal,
+                toSegmentFrom: polygon[$0],
+                to: polygon[($0 + 1) % polygon.count]
+            ) <= distance
+        }
+        return nearSide
+            || abs(local.y - upperOffset) <= distance
+    }
+
+    func coordinates(of point: SIMD3<Float>) -> SIMD3<Float> {
+        let offset = point - origin
+        return SIMD3(
+            simd_dot(offset, axisU),
+            simd_dot(offset, normal),
+            simd_dot(offset, axisV)
+        )
+    }
+
+    private static func pointInPolygon(
+        _ point: SIMD2<Float>,
+        polygon: [SIMD2<Float>],
+        margin: Float
+    ) -> Bool {
+        guard polygon.count >= 3 else { return false }
+        if polygon.indices.contains(where: {
+            distance(
+                from: point,
+                toSegmentFrom: polygon[$0],
+                to: polygon[($0 + 1) % polygon.count]
+            ) <= margin
+        }) {
+            return true
+        }
+        var inside = false
+        var previous = polygon.count - 1
+        for current in polygon.indices {
+            let a = polygon[current]
+            let b = polygon[previous]
+            if (a.y > point.y) != (b.y > point.y) {
+                let crossingX = (b.x - a.x) * (point.y - a.y)
+                    / (b.y - a.y) + a.x
+                if point.x < crossingX { inside.toggle() }
+            }
+            previous = current
+        }
+        return inside
+    }
+
+    private static func distance(
+        from point: SIMD2<Float>,
+        toSegmentFrom start: SIMD2<Float>,
+        to end: SIMD2<Float>
+    ) -> Float {
+        let segment = end - start
+        let lengthSquared = simd_length_squared(segment)
+        guard lengthSquared > 0 else { return simd_distance(point, start) }
+        let t = min(max(simd_dot(point - start, segment) / lengthSquared, 0), 1)
+        return simd_distance(point, start + segment * t)
+    }
+}
+
+enum LiDARSpatialRegion: Equatable {
+    case box(LiDARScanVolume)
+    case polygonalPrism(LiDARPolygonalPrism)
+
+    func contains(_ point: SIMD3<Float>, margin: Float = 0) -> Bool {
+        switch self {
+        case .box(let volume): volume.contains(point, margin: margin)
+        case .polygonalPrism(let prism): prism.contains(point, margin: margin)
+        }
+    }
+
+    func isNearBoundary(_ point: SIMD3<Float>, distance: Float) -> Bool {
+        switch self {
+        case .box(let volume):
+            guard volume.contains(point, margin: distance) else { return false }
+            let offset = point - volume.centre
+            return abs(abs(simd_dot(offset, volume.axisX)) - volume.halfExtents.x) <= distance
+                || abs(abs(simd_dot(offset, volume.axisY)) - volume.halfExtents.y) <= distance
+                || abs(abs(simd_dot(offset, volume.axisZ)) - volume.halfExtents.z) <= distance
+        case .polygonalPrism(let prism):
+            return prism.isNearBoundary(point, distance: distance)
+        }
+    }
+
+    var referenceOrigin: SIMD3<Float> {
+        switch self {
+        case .box(let volume): volume.centre
+        case .polygonalPrism(let prism): prism.origin
+        }
+    }
+
+    var axisX: SIMD3<Float> {
+        switch self {
+        case .box(let volume): volume.axisX
+        case .polygonalPrism(let prism): prism.axisU
+        }
+    }
+
+    var axisY: SIMD3<Float> {
+        switch self {
+        case .box(let volume): volume.axisY
+        case .polygonalPrism(let prism): prism.normal
+        }
+    }
+
+    var axisZ: SIMD3<Float> {
+        switch self {
+        case .box(let volume): volume.axisZ
+        case .polygonalPrism(let prism): prism.axisV
+        }
+    }
+
+    func coordinates(of point: SIMD3<Float>) -> SIMD3<Float> {
+        let offset = point - referenceOrigin
+        return SIMD3(
+            simd_dot(offset, axisX),
+            simd_dot(offset, axisY),
+            simd_dot(offset, axisZ)
+        )
+    }
+}
+
 struct LiDARFusionIntegrationResult: Equatable {
     let acceptedPointCount: Int
     let rejectedOutsideVolumeCount: Int
+    let nearBoundaryCount: Int
 }
 
 struct LiDARFusionMeasurement: Equatable {
     let dimensionsCM: ObjectDimensions
     let centredPointsInMetres: [SIMD3<Float>]
+    let worldPointsInMetres: [SIMD3<Float>]
+    let boundingBoxCornersWorld: [SIMD3<Float>]
+    let touchesRegionBoundary: Bool
     let fusedVoxelCount: Int
     let averageObservationsPerVoxel: Double
     let supportPlaneY: Float
@@ -66,6 +234,8 @@ struct LiDARFusionConfiguration: Equatable {
     var minimumStableVoxelCount = 120
     /// Small allowance at the locked crop boundary for LiDAR quantization.
     var cropMargin: Float = 0.003
+    /// Product points this close to an ROI face trigger a possible-cropping warning.
+    var boundaryWarningDistance: Float = 0.006
     /// Removes noisy returns immediately above the support while retaining its height.
     var supportPlaneNoiseBand: Float = 0.006
     /// Vertical histogram resolution used for horizontal support-plane detection.
@@ -103,7 +273,7 @@ final class LiDARVoxelFusionEngine {
     }
 
     let configuration: LiDARFusionConfiguration
-    private var selection: (volume: LiDARScanVolume, seed: SIMD3<Float>)?
+    private var selection: (region: LiDARSpatialRegion, seed: SIMD3<Float>)?
     private var voxels: [VoxelKey: Voxel] = [:]
 
     init(configuration: LiDARFusionConfiguration = .smallObject) {
@@ -113,7 +283,11 @@ final class LiDARVoxelFusionEngine {
     var voxelCount: Int { voxels.count }
 
     func lockSelection(volume: LiDARScanVolume, seed: SIMD3<Float>) {
-        selection = (volume, seed)
+        lockSelection(region: .box(volume), seed: seed)
+    }
+
+    func lockSelection(region: LiDARSpatialRegion, seed: SIMD3<Float>) {
+        selection = (region, seed)
         voxels.removeAll(keepingCapacity: true)
     }
 
@@ -129,19 +303,27 @@ final class LiDARVoxelFusionEngine {
         guard let selection else {
             return LiDARFusionIntegrationResult(
                 acceptedPointCount: 0,
-                rejectedOutsideVolumeCount: framePoints.count
+                rejectedOutsideVolumeCount: framePoints.count,
+                nearBoundaryCount: 0
             )
         }
 
         var sums: [VoxelKey: SIMD3<Float>] = [:]
         var counts: [VoxelKey: Int] = [:]
         var rejected = 0
+        var nearBoundary = 0
         sums.reserveCapacity(framePoints.count)
 
         for point in framePoints where point.x.isFinite && point.y.isFinite && point.z.isFinite {
-            guard selection.volume.contains(point, margin: configuration.cropMargin) else {
+            guard selection.region.contains(point, margin: configuration.cropMargin) else {
                 rejected += 1
                 continue
+            }
+            if selection.region.isNearBoundary(
+                point,
+                distance: configuration.boundaryWarningDistance
+            ) {
+                nearBoundary += 1
             }
             let key = voxelKey(for: point)
             sums[key, default: .zero] += point
@@ -162,7 +344,8 @@ final class LiDARVoxelFusionEngine {
 
         return LiDARFusionIntegrationResult(
             acceptedPointCount: counts.count,
-            rejectedOutsideVolumeCount: rejected
+            rejectedOutsideVolumeCount: rejected,
+            nearBoundaryCount: nearBoundary
         )
     }
 
@@ -176,36 +359,49 @@ final class LiDARVoxelFusionEngine {
         let stablePoints = stable.mapValues {
             $0.positionSum / Float($0.frameObservations)
         }
-        guard let supportY = detectSupportPlane(in: Array(stablePoints.values)) else {
+        let localCoordinates = stablePoints.mapValues {
+            selection.region.coordinates(of: $0)
+        }
+        guard let supportCoordinate = detectSupportPlane(
+            in: localCoordinates.values.map(\.y)
+        ) else {
             return nil
         }
 
         // The support itself is removed, but supportY remains the lower height
         // boundary so the contact-noise band does not shorten the object.
         let aboveSupport = stablePoints.filter {
-            $0.value.y > supportY + configuration.supportPlaneNoiseBand
+            guard let local = localCoordinates[$0.key] else { return false }
+            return local.y > supportCoordinate + configuration.supportPlaneNoiseBand
         }
         guard aboveSupport.count >= configuration.minimumStableVoxelCount else { return nil }
 
-        guard let seedKey = aboveSupport.min(by: {
-            simd_distance_squared($0.value, selection.seed)
-                < simd_distance_squared($1.value, selection.seed)
-        })?.key,
-        let seedPoint = aboveSupport[seedKey],
-        simd_distance(seedPoint, selection.seed) <= configuration.maximumSeedDistance
-        else { return nil }
-
-        let component = connectedComponent(from: seedKey, in: aboveSupport)
-        guard component.count >= configuration.minimumStableVoxelCount else { return nil }
+        let components = connectedComponents(in: aboveSupport).filter {
+            $0.count >= configuration.minimumStableVoxelCount
+        }
+        guard let component = components.min(by: {
+            componentDistanceSquared($0, points: aboveSupport, seed: selection.seed)
+                < componentDistanceSquared($1, points: aboveSupport, seed: selection.seed)
+        }) else { return nil }
+        if case .box = selection.region {
+            let distance = sqrt(
+                componentDistanceSquared(
+                    component,
+                    points: aboveSupport,
+                    seed: selection.seed
+                )
+            )
+            guard distance <= configuration.maximumSeedDistance else { return nil }
+        }
 
         let points = component.compactMap { aboveSupport[$0] }
-        guard let bounds = orientedBounds(points: points, supportY: supportY) else { return nil }
+        guard let bounds = orientedBounds(
+            points: points,
+            region: selection.region,
+            supportCoordinate: supportCoordinate
+        ) else { return nil }
 
-        let centre = SIMD3<Float>(
-            bounds.worldCentre.x,
-            (supportY + bounds.maximumY) / 2,
-            bounds.worldCentre.y
-        )
+        let centre = bounds.worldCentre
         let displayStep = max(1, points.count / 4_000)
         let displayPoints = points.enumerated().compactMap { index, point in
             index.isMultiple(of: displayStep) ? point - centre : nil
@@ -218,12 +414,23 @@ final class LiDARVoxelFusionEngine {
             dimensionsCM: ObjectDimensions(
                 length: Double(max(bounds.extentU, bounds.extentV)) * 100,
                 width: Double(min(bounds.extentU, bounds.extentV)) * 100,
-                height: Double(bounds.maximumY - supportY) * 100
+                height: Double(bounds.maximumHeight - supportCoordinate) * 100
             ),
             centredPointsInMetres: displayPoints,
+            worldPointsInMetres: points,
+            boundingBoxCornersWorld: bounds.corners,
+            touchesRegionBoundary: points.contains {
+                selection.region.isNearBoundary(
+                    $0,
+                    distance: configuration.boundaryWarningDistance
+                )
+            },
             fusedVoxelCount: component.count,
             averageObservationsPerVoxel: averageObservations,
-            supportPlaneY: supportY
+            supportPlaneY: (
+                selection.region.referenceOrigin
+                    + selection.region.axisY * supportCoordinate
+            ).y
         )
     }
 
@@ -235,74 +442,92 @@ final class LiDARVoxelFusionEngine {
         )
     }
 
-    private func detectSupportPlane(in points: [SIMD3<Float>]) -> Float? {
-        guard !points.isEmpty else { return nil }
+    private func detectSupportPlane(in heights: [Float]) -> Float? {
+        guard !heights.isEmpty else { return nil }
         var bins: [Int32: [Float]] = [:]
-        for point in points {
-            let bin = Int32((point.y / configuration.supportPlaneBinSize).rounded())
-            bins[bin, default: []].append(point.y)
+        for height in heights {
+            let bin = Int32((height / configuration.supportPlaneBinSize).rounded())
+            bins[bin, default: []].append(height)
         }
         let minimumPlaneSamples = max(
             24,
-            Int(Double(points.count) * 0.04)
+            Int(Double(heights.count) * 0.04)
         )
         let candidates = bins.filter { $0.value.count >= minimumPlaneSamples }
         if let lowest = candidates.min(by: { $0.key < $1.key }) {
             return lowest.value.reduce(0, +) / Float(lowest.value.count)
         }
-        return percentile(points.map(\.y), fraction: 0.02)
+        return percentile(heights, fraction: 0.02)
     }
 
-    private func connectedComponent(
-        from seed: VoxelKey,
+    private func connectedComponents(
         in points: [VoxelKey: SIMD3<Float>]
-    ) -> Set<VoxelKey> {
+    ) -> [Set<VoxelKey>] {
         var unvisited = Set(points.keys)
-        guard unvisited.remove(seed) != nil else { return [] }
-        var queue = [seed]
-        var cursor = 0
-        var component: Set<VoxelKey> = [seed]
+        var components: [Set<VoxelKey>] = []
         let radius = Int32(configuration.connectivityRadiusInVoxels)
 
-        while cursor < queue.count {
-            let key = queue[cursor]
-            cursor += 1
-            for dx in -radius...radius {
-                for dy in -radius...radius {
-                    for dz in -radius...radius where dx != 0 || dy != 0 || dz != 0 {
-                        let neighbour = VoxelKey(
-                            x: key.x + dx,
-                            y: key.y + dy,
-                            z: key.z + dz
-                        )
-                        if unvisited.remove(neighbour) != nil {
-                            component.insert(neighbour)
-                            queue.append(neighbour)
+        while let seed = unvisited.first {
+            unvisited.remove(seed)
+            var queue = [seed]
+            var cursor = 0
+            var component: Set<VoxelKey> = [seed]
+            while cursor < queue.count {
+                let key = queue[cursor]
+                cursor += 1
+                for dx in -radius...radius {
+                    for dy in -radius...radius {
+                        for dz in -radius...radius
+                        where dx != 0 || dy != 0 || dz != 0 {
+                            let neighbour = VoxelKey(
+                                x: key.x + dx,
+                                y: key.y + dy,
+                                z: key.z + dz
+                            )
+                            if unvisited.remove(neighbour) != nil {
+                                component.insert(neighbour)
+                                queue.append(neighbour)
+                            }
                         }
                     }
                 }
             }
+            components.append(component)
         }
-        return component
+        return components
+    }
+
+    private func componentDistanceSquared(
+        _ component: Set<VoxelKey>,
+        points: [VoxelKey: SIMD3<Float>],
+        seed: SIMD3<Float>
+    ) -> Float {
+        component.reduce(.greatestFiniteMagnitude) { distance, key in
+            guard let point = points[key] else { return distance }
+            return min(distance, simd_distance_squared(point, seed))
+        }
     }
 
     private func orientedBounds(
         points: [SIMD3<Float>],
-        supportY: Float
+        region: LiDARSpatialRegion,
+        supportCoordinate: Float
     ) -> (
         extentU: Float,
         extentV: Float,
-        maximumY: Float,
-        worldCentre: SIMD2<Float>
+        maximumHeight: Float,
+        worldCentre: SIMD3<Float>,
+        corners: [SIMD3<Float>]
     )? {
         guard points.count >= 3 else { return nil }
-        let meanX = points.reduce(0) { $0 + $1.x } / Float(points.count)
-        let meanZ = points.reduce(0) { $0 + $1.z } / Float(points.count)
+        let local = points.map { region.coordinates(of: $0) }
+        let meanX = local.reduce(0) { $0 + $1.x } / Float(local.count)
+        let meanZ = local.reduce(0) { $0 + $1.z } / Float(local.count)
 
         var xx: Float = 0
         var zz: Float = 0
         var xz: Float = 0
-        for point in points {
+        for point in local {
             let x = point.x - meanX
             let z = point.z - meanZ
             xx += x * x
@@ -313,27 +538,74 @@ final class LiDARVoxelFusionEngine {
         let angle = 0.5 * atan2(2 * xz, xx - zz)
         let axisU = SIMD2<Float>(cos(angle), sin(angle))
         let axisV = SIMD2<Float>(-sin(angle), cos(angle))
-        let horizontal = points.map { SIMD2<Float>($0.x - meanX, $0.z - meanZ) }
+        let horizontal = local.map { SIMD2<Float>($0.x - meanX, $0.z - meanZ) }
         let u = horizontal.map { simd_dot($0, axisU) }
         let v = horizontal.map { simd_dot($0, axisV) }
-        let y = points.map(\.y)
+        let heights = local.map(\.y)
 
         guard let lowU = percentile(u, fraction: configuration.lowerPercentile),
               let highU = percentile(u, fraction: configuration.upperPercentile),
               let lowV = percentile(v, fraction: configuration.lowerPercentile),
               let highV = percentile(v, fraction: configuration.upperPercentile),
-              let maximumY = percentile(y, fraction: configuration.upperPercentile),
-              maximumY > supportY
+              let maximumHeight = percentile(
+                heights,
+                fraction: configuration.upperPercentile
+              ),
+              maximumHeight > supportCoordinate
         else { return nil }
 
         let localCentre = axisU * ((lowU + highU) / 2)
             + axisV * ((lowV + highV) / 2)
+        let horizontalCentre = SIMD2<Float>(meanX, meanZ) + localCentre
+        let verticalCentre = (supportCoordinate + maximumHeight) / 2
+        let worldCentre = worldPoint(
+            horizontal: horizontalCentre,
+            height: verticalCentre,
+            region: region
+        )
+        let localAxisU = axisU
+        let localAxisV = axisV
+        let rectangleCentre = horizontalCentre
+        let halfU = (highU - lowU + configuration.voxelSize) / 2
+        let halfV = (highV - lowV + configuration.voxelSize) / 2
+        let adjustedMaximumHeight = maximumHeight + configuration.voxelSize / 2
+        var corners: [SIMD3<Float>] = []
+        corners.reserveCapacity(8)
+        for height in [supportCoordinate, adjustedMaximumHeight] {
+            let horizontalCorners: [SIMD2<Float>] = [
+                rectangleCentre - localAxisU * halfU - localAxisV * halfV,
+                rectangleCentre + localAxisU * halfU - localAxisV * halfV,
+                rectangleCentre + localAxisU * halfU + localAxisV * halfV,
+                rectangleCentre - localAxisU * halfU + localAxisV * halfV
+            ]
+            for horizontalCorner in horizontalCorners {
+                corners.append(
+                    worldPoint(
+                        horizontal: horizontalCorner,
+                        height: height,
+                        region: region
+                    )
+                )
+            }
+        }
         return (
             extentU: highU - lowU + configuration.voxelSize,
             extentV: highV - lowV + configuration.voxelSize,
-            maximumY: maximumY + configuration.voxelSize / 2,
-            worldCentre: SIMD2<Float>(meanX, meanZ) + localCentre
+            maximumHeight: adjustedMaximumHeight,
+            worldCentre: worldCentre,
+            corners: corners
         )
+    }
+
+    private func worldPoint(
+        horizontal: SIMD2<Float>,
+        height: Float,
+        region: LiDARSpatialRegion
+    ) -> SIMD3<Float> {
+        region.referenceOrigin
+            + region.axisX * horizontal.x
+            + region.axisY * height
+            + region.axisZ * horizontal.y
     }
 
     private func percentile(_ values: [Float], fraction: Double) -> Float? {

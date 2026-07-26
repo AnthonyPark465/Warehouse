@@ -5,34 +5,44 @@
 The Add Product form remains the owner of the final product draft. It can now
 receive dimensions from three sources:
 
-- Manual AR Boundary (`ARSCNView`, ARKit raycasts/anchors, and SceneKit rendering)
+- Manual Region Product Scan (`ARSCNView`, ARKit depth/raycasts/anchors, voxel
+  fusion, and SceneKit rendering)
 - Existing automatic LiDAR/Object Capture scanning
 - Manual dimension entry
 
 `ManualARSessionView` owns the AR session, centre raycasts, preview marker,
 real-world `ARAnchor`s, and lightweight SceneKit rendering.
 `ManualARMeasurementState` owns stages and user actions.
-`ManualMeasurementGeometry` owns plane, polygon, oriented-rectangle, and height
-math. The result is converted to the existing `ObjectScanCapture` and
+`ManualMeasurementGeometry` owns plane and polygon validation.
+`LiDARVoxelFusionEngine` owns the product segmentation and measurement. The
+result is converted to the existing `ObjectScanCapture` and
 `ProductObjectScan` path so Add Product and Firestore do not need a parallel
 persistence workflow.
 
-## Geometry
+## Region versus product geometry
 
 Boundary points are fitted to a least-squares plane using the smallest
 eigenvector of their covariance matrix. Points are projected into the plane's
-local 2D basis before validation and polygon calculations. The footprint
-rectangle is found by evaluating the convex hull at every hull-edge angle and
-keeping the minimum-area result. Height is the signed perpendicular distance
-from the top marker to the fitted base plane; the bottom marker is used for
-plane and footprint validation.
+local 2D basis before validation and polygon calculations. The polygon plus the
+bottom and top markers defines a polygonal-prism region of interest. Those
+coordinates only crop incoming AR points; the polygon width, length, and
+top-to-bottom distance are never reported as the product dimensions.
+
+During the product scan, registered scene-depth samples (or lower-density AR
+feature points without LiDAR) are filtered to the prism before fusion. Repeated
+voxels are retained, the support plane is removed, connected product geometry
+is isolated, and a robust oriented bounding box supplies the product length,
+width, and height. The UI renders the cyan region separately from the green
+detected points and orange calculated product box. A product reaching a side or
+top limit is treated as possible clipping and cannot be finished.
 
 ARKit coordinates remain in metres. Product records remain in centimetres for
 compatibility with the existing model.
 
-Valid manual boundaries do not have a warehouse-size minimum or maximum.
-Duplicate markers must be at least 1 mm apart. Height has a separate technical
-safety range of 1 mm through 25 m; a 5 cm height is explicitly supported.
+Valid region boundaries do not have a warehouse-size minimum or maximum.
+Duplicate markers must be at least 1 mm apart. The bottom-to-top region span has
+a technical safety range of 1 mm through 25 m. Product size is independent of
+that span; a 5 cm-tall product is explicitly covered by fusion tests.
 
 ## Tolerance
 
@@ -62,13 +72,15 @@ non-LiDAR iPhone.
 1. Build and run on the phone, open Inventory > Add Product > Measure with AR,
    and grant camera access.
 2. Scan slowly until tracking reports ready and the centre target turns green.
-3. Mark the base clockwise, close it, confirm the base, then place bottom and
-   top points. Move around after every placement and verify markers remain
-   attached to their physical points.
-4. Compare raw length, width, and height with a tape measure. Record device
+3. Mark a region around the base clockwise, close and confirm it, then set
+   bottom and top scan limits. Make the cyan prism larger than the product.
+4. Start Product Scan and move around the product until the green detected
+   points and orange product box stabilise. If overflow is reported, enlarge
+   the region rather than accepting a clipped measurement.
+5. Compare detected length, width, and height with a tape measure. Record device
    model, LiDAR availability, target distance, lighting, raw error, and adjusted
    result.
-5. Save and reopen the product. Confirm final dimensions, raw dimensions,
+6. Save and reopen the product. Confirm final dimensions, raw dimensions,
    tolerance, method, quality, rotation permission, and manual boundary metadata.
 
 Test these shapes:
@@ -97,9 +109,8 @@ Test these actions and recovery paths:
 - AR measurements are estimates and cannot claim tape-measure accuracy.
 - Reflective, transparent, featureless, dark, distant, or occluded edges can
   produce weak raycasts even on LiDAR devices.
-- Tracking confidence is an application-level quality indicator based on
-  tracking, raycast type/distance, LiDAR availability, and plane consistency;
-  it is not an accuracy guarantee from ARKit.
+- Scan confidence is an application-level coverage and stability indicator; it
+  is not an accuracy guarantee from ARKit.
 - The translucent polygon uses the user's boundary order and ear-clipping
   triangulation. Highly intricate outlines should still be checked visually.
 - Simulator tests cover geometry and app integration only. Camera tracking,

@@ -162,7 +162,7 @@ struct ObjectScanSummaryView: View {
         case .standardAR:
             "Standard ARKit"
         case .manualBoundary:
-            "Manual AR Boundary"
+            "Manual Region Product Scan"
         case .manualEntry:
             "Manual Entry"
         }

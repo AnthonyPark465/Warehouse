@@ -3,27 +3,30 @@ import Foundation
 import SwiftUI
 
 enum ManualMeasurementStage: String, CaseIterable {
-    case scanning = "Scan Environment"
+    case environment = "Scan Environment"
     case boundary = "Mark Base Boundary"
     case confirmBase = "Confirm Base"
-    case bottom = "Mark Bottom"
-    case top = "Mark Top"
+    case bottomLimit = "Set Bottom Limit"
+    case topLimit = "Set Top Limit"
+    case productScan = "Scan Product"
     case review = "Review Measurements"
 
     var instruction: String {
         switch self {
-        case .scanning:
+        case .environment:
             "Move the phone slowly. Keep the product and surrounding surface visible."
         case .boundary:
             "Aim the centre dot at a base corner, then press Place."
         case .confirmBase:
             "Review the highlighted footprint and confirm the base."
-        case .bottom:
-            "Aim at the bottom of the product, then press Place Bottom."
-        case .top:
-            "Aim at the top of the product, then press Place Top."
+        case .bottomLimit:
+            "Aim at the lowest permitted scan level, then set the bottom limit."
+        case .topLimit:
+            "Aim at the highest permitted scan level, then set the top limit."
+        case .productScan:
+            "Move slowly around the product. Capture its front, sides, and top."
         case .review:
-            "Review the estimate before applying it to the product."
+            "Review the detected product—not the scanning-region dimensions."
         }
     }
 }
@@ -36,11 +39,26 @@ struct CentreRaycastSample: Equatable {
     let cameraDistanceMetres: Double
 }
 
+struct ManualProductScanStatus: Equatable {
+    var message = "Ready to scan geometry inside the selected region."
+    var integratedFrameCount = 0
+    var stablePointCount = 0
+    var rejectedOutsideRegionCount = 0
+    var detectedDimensionsCM: ObjectDimensions?
+    var detectedWorldPoints: [SIMD3<Float>] = []
+    var centredDisplayPoints: [SIMD3<Float>] = []
+    var boundingBoxCornersWorld: [SIMD3<Float>] = []
+    var confidence = 0.0
+    var dimensionsAreStable = false
+    var touchesBoundary = false
+    var canFinish = false
+}
+
 @MainActor
 final class ManualARMeasurementState: ObservableObject {
     let sessionIdentifier = UUID()
 
-    @Published private(set) var stage: ManualMeasurementStage = .scanning
+    @Published private(set) var stage: ManualMeasurementStage = .environment
     @Published private(set) var boundaryMarkers: [ManualBoundaryMarker] = []
     @Published private(set) var bottomMarker: ManualBoundaryMarker?
     @Published private(set) var topMarker: ManualBoundaryMarker?
@@ -50,6 +68,10 @@ final class ManualARMeasurementState: ObservableObject {
     @Published private(set) var trackingIsNormal = false
     @Published private(set) var renderRevision = 0
     @Published private(set) var placementRequestID = 0
+    @Published private(set) var productScanStartRequestID = 0
+    @Published private(set) var productScanStopRequestID = 0
+    @Published private(set) var productScanStatus = ManualProductScanStatus()
+    @Published private(set) var productScanIsActive = false
     @Published var errorMessage: String?
     @Published var percentageTolerance = ObjectDimensionPolicy.default.percentageTolerance
     @Published var fixedToleranceCM = ObjectDimensionPolicy.default.fixedToleranceCM
@@ -68,21 +90,13 @@ final class ManualARMeasurementState: ObservableObject {
     }
 
     var rawDimensionsCM: ObjectDimensions? {
-        guard let boundaryMeasurement, let topMarker, let bottomMarker,
-              let height = try? ManualMeasurementGeometry.height(
-                top: topMarker.position.simd,
-                bottom: bottomMarker.position.simd,
-                boundary: boundaryMeasurement
-              )
-        else { return nil }
-        return ObjectDimensions(
-            length: boundaryMeasurement.footprint.lengthMetres * 100,
-            width: boundaryMeasurement.footprint.widthMetres * 100,
-            height: height * 100
-        )
+        productScanStatus.detectedDimensionsCM
     }
 
     var confidence: Double {
+        if productScanStatus.detectedDimensionsCM != nil {
+            return productScanStatus.confidence
+        }
         guard !trackingScores.isEmpty else { return 0 }
         let tracking = trackingScores.reduce(0, +) / Double(trackingScores.count)
         let lidarBonus = ObjectScannerCapabilities.hasLiDAR ? 0.08 : 0
@@ -103,7 +117,7 @@ final class ManualARMeasurementState: ObservableObject {
         case .normal:
             trackingIsNormal = true
             trackingMessage = "Tracking ready"
-            if stage == .scanning, currentSample != nil {
+            if stage == .environment, currentSample != nil {
                 stage = .boundary
             }
         case .notAvailable:
@@ -163,24 +177,24 @@ final class ManualARMeasurementState: ObservableObject {
                 }
                 boundaryMarkers.append(marker)
             }
-        case .bottom:
+        case .bottomLimit:
             bottomMarker = marker
-            stage = .top
-        case .top:
+            stage = .topLimit
+        case .topLimit:
             guard let boundaryMeasurement, let bottomMarker else { return }
-            do {
-                _ = try ManualMeasurementGeometry.height(
-                    top: marker.position.simd,
-                    bottom: bottomMarker.position.simd,
-                    boundary: boundaryMeasurement
-                )
-                topMarker = marker
-                stage = .review
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
-            } catch {
-                reject(error.localizedDescription)
+            let bottomOffset = boundaryMeasurement.plane.signedDistance(
+                to: SIMD3<Double>(bottomMarker.position.simd)
+            )
+            let topOffset = boundaryMeasurement.plane.signedDistance(
+                to: SIMD3<Double>(marker.position.simd)
+            )
+            guard topOffset - bottomOffset >= ManualMeasurementGeometry.minimumHeightMetres else {
+                reject("The top scan limit must be above the bottom limit. Aim higher and try again.")
                 return
             }
+            topMarker = marker
+            stage = .productScan
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
         default:
             return
         }
@@ -204,7 +218,7 @@ final class ManualARMeasurementState: ObservableObject {
 
     func confirmBase() {
         guard boundaryMeasurement != nil else { return }
-        stage = .bottom
+        stage = .bottomLimit
     }
 
     func undo() {
@@ -214,16 +228,19 @@ final class ManualARMeasurementState: ObservableObject {
         case .confirmBase:
             boundaryMeasurement = nil
             stage = .boundary
-        case .bottom:
+        case .bottomLimit:
             boundaryMeasurement = nil
             stage = .boundary
-        case .top:
+        case .topLimit:
             bottomMarker = nil
-            stage = .bottom
-        case .review:
+            stage = .bottomLimit
+        case .productScan:
+            stopProductScan()
             topMarker = nil
-            stage = .top
-        case .scanning:
+            stage = .topLimit
+        case .review:
+            stage = .productScan
+        case .environment:
             break
         }
         renderRevision += 1
@@ -235,6 +252,7 @@ final class ManualARMeasurementState: ObservableObject {
         boundaryMeasurement = nil
         bottomMarker = nil
         topMarker = nil
+        clearDetectedProduct()
         stage = .boundary
         renderRevision += 1
     }
@@ -242,25 +260,131 @@ final class ManualARMeasurementState: ObservableObject {
     func replaceBottom() {
         bottomMarker = nil
         topMarker = nil
-        stage = .bottom
+        clearDetectedProduct()
+        stage = .bottomLimit
         renderRevision += 1
     }
 
     func replaceTop() {
         topMarker = nil
-        stage = .top
+        clearDetectedProduct()
+        stage = .topLimit
         renderRevision += 1
     }
 
     func reset() {
+        stopProductScan()
         boundaryMarkers.removeAll()
         bottomMarker = nil
         topMarker = nil
         boundaryMeasurement = nil
         replacementIndex = nil
         trackingScores.removeAll()
-        stage = trackingIsNormal ? .boundary : .scanning
+        clearDetectedProduct()
+        stage = trackingIsNormal ? .boundary : .environment
         renderRevision += 1
+    }
+
+    var productScanRegion: LiDARPolygonalPrism? {
+        guard let boundaryMeasurement, let bottomMarker, let topMarker else {
+            return nil
+        }
+        let plane = boundaryMeasurement.plane
+        let bottomOffset = Float(
+            plane.signedDistance(to: SIMD3<Double>(bottomMarker.position.simd))
+        )
+        let topOffset = Float(
+            plane.signedDistance(to: SIMD3<Double>(topMarker.position.simd))
+        )
+        guard topOffset - bottomOffset >= Float(ManualMeasurementGeometry.minimumHeightMetres)
+        else { return nil }
+        return LiDARPolygonalPrism(
+            origin: SIMD3<Float>(plane.origin),
+            axisU: SIMD3<Float>(plane.axisU),
+            axisV: SIMD3<Float>(plane.axisV),
+            normal: SIMD3<Float>(plane.normal),
+            polygon: boundaryMeasurement.projectedBoundary.map { SIMD2<Float>($0) },
+            lowerOffset: bottomOffset,
+            upperOffset: topOffset
+        )
+    }
+
+    var productSeed: SIMD3<Float>? {
+        guard let region = productScanRegion, !region.polygon.isEmpty else { return nil }
+        let centre = region.polygon.reduce(SIMD2<Float>.zero, +)
+            / Float(region.polygon.count)
+        return region.origin
+            + region.axisU * centre.x
+            + region.axisV * centre.y
+            + region.normal * (region.lowerOffset + 0.02)
+    }
+
+    func startProductScan() {
+        guard stage == .productScan, productScanRegion != nil, productSeed != nil else {
+            reject("Finish the scanning boundary and its bottom/top limits first.")
+            return
+        }
+        clearDetectedProduct()
+        productScanIsActive = true
+        productScanStatus.message = ObjectScannerCapabilities.hasLiDAR
+            ? "Scanning only inside the highlighted region. Move around the product."
+            : "LiDAR is unavailable. Collecting lower-density AR feature points."
+        productScanStartRequestID += 1
+    }
+
+    func stopProductScan() {
+        guard productScanIsActive else { return }
+        productScanIsActive = false
+        productScanStopRequestID += 1
+    }
+
+    func finishProductScan() {
+        guard productScanStatus.canFinish else {
+            reject(scanCompletionProblem)
+            return
+        }
+        stopProductScan()
+        stage = .review
+        renderRevision += 1
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+
+    func continueProductScan() {
+        stage = .productScan
+        productScanIsActive = true
+        productScanStartRequestID += 1
+    }
+
+    func updateProductScan(_ status: ManualProductScanStatus) {
+        let detectedGeometryChanged =
+            productScanStatus.detectedWorldPoints != status.detectedWorldPoints
+            || productScanStatus.boundingBoxCornersWorld
+                != status.boundingBoxCornersWorld
+        productScanStatus = status
+        if detectedGeometryChanged {
+            renderRevision += 1
+        }
+    }
+
+    private var scanCompletionProblem: String {
+        if productScanStatus.touchesBoundary {
+            return "The detected product touches the scanning limit. Expand the boundary or limits and rescan."
+        }
+        if productScanStatus.stablePointCount < LiDARFusionConfiguration.smallObject.minimumStableVoxelCount {
+            return "Too little product geometry was collected. Scan the front, sides, and top."
+        }
+        if !productScanStatus.dimensionsAreStable {
+            return "The calculated dimensions are still changing. Continue scanning slowly."
+        }
+        return "More scan coverage is required before finishing."
+    }
+
+    private func clearDetectedProduct() {
+        if productScanIsActive {
+            productScanStopRequestID += 1
+        }
+        productScanIsActive = false
+        productScanStatus = ManualProductScanStatus()
     }
 
     func makeCapture() -> ObjectScanCapture? {
@@ -279,13 +403,16 @@ final class ManualARMeasurementState: ObservableObject {
             ),
             footprintAreaSquareMetres: boundaryMeasurement.footprint.areaSquareMetres,
             perimeterMetres: boundaryMeasurement.footprint.perimeterMetres,
-            orientationAngleDegrees: boundaryMeasurement.footprint.orientationRadians * 180 / .pi
+            orientationAngleDegrees: boundaryMeasurement.footprint.orientationRadians * 180 / .pi,
+            scanningRegionOnly: true,
+            detectedProductPointCount: productScanStatus.stablePointCount,
+            detectedProductTouchedRegionBoundary: productScanStatus.touchesBoundary
         )
         return ObjectScanCapture(
             id: sessionIdentifier,
             rawDimensionsCM: rawDimensionsCM,
-            pointsInMetres: boundaryMarkers.map { $0.position.simd },
-            scanMethod: .manualBoundary,
+            pointsInMetres: productScanStatus.centredDisplayPoints,
+            scanMethod: ObjectScannerCapabilities.hasLiDAR ? .manualBoundary : .standardAR,
             deviceModel: ObjectScannerCapabilities.deviceModelIdentifier,
             hasLiDAR: ObjectScannerCapabilities.hasLiDAR,
             confidence: confidence,

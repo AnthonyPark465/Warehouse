@@ -13,7 +13,7 @@ struct ManualARMeasurementView: View {
             ZStack {
                 if ObjectScannerCapabilities.isSupported {
                     ManualARSessionView(state: state).ignoresSafeArea()
-                    if state.stage != .review {
+                    if state.stage != .review && state.stage != .productScan {
                         centreTarget
                     }
                     interface
@@ -153,6 +153,8 @@ struct ManualARMeasurementView: View {
                 Button("Confirm Base") { state.confirmBase() }
                     .buttonStyle(.borderedProminent)
                     .frame(maxWidth: .infinity)
+            } else if state.stage == .productScan {
+                productScanControls
             }
         }
         .padding()
@@ -170,22 +172,65 @@ struct ManualARMeasurementView: View {
                 placeButtonLabel("Place")
             }
             .disabled(!state.canPlace)
-        case .bottom:
+        case .bottomLimit:
             Button {
                 state.requestPlacement()
             } label: {
-                placeButtonLabel("Place Bottom")
+                placeButtonLabel("Set Bottom")
             }
             .disabled(!state.canPlace)
-        case .top:
+        case .topLimit:
             Button {
                 state.requestPlacement()
             } label: {
-                placeButtonLabel("Place Top")
+                placeButtonLabel("Set Top")
             }
             .disabled(!state.canPlace)
         default:
             EmptyView()
+        }
+    }
+
+    private var productScanControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(state.productScanStatus.message)
+                .font(.subheadline.weight(.semibold))
+            HStack {
+                Label(
+                    "\(state.productScanStatus.integratedFrameCount) frames",
+                    systemImage: "camera.metering.multispot"
+                )
+                Spacer()
+                Label(
+                    "\(state.productScanStatus.stablePointCount) points",
+                    systemImage: "point.3.connected.trianglepath.dotted"
+                )
+            }
+            .font(.caption.monospacedDigit())
+            if let dimensions = state.productScanStatus.detectedDimensionsCM {
+                Text(
+                    "Detected product: \(dimensions.length.formatted(.number.precision(.fractionLength(1)))) × \(dimensions.width.formatted(.number.precision(.fractionLength(1)))) × \(dimensions.height.formatted(.number.precision(.fractionLength(1)))) cm"
+                )
+                .font(.caption.monospacedDigit())
+            }
+            if state.productScanStatus.touchesBoundary {
+                Label(
+                    "Product reaches the scan boundary. Enlarge the region and rescan.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+            }
+            if state.productScanIsActive {
+                Button("Finish Product Scan") { state.finishProductScan() }
+                    .buttonStyle(.borderedProminent)
+                    .frame(maxWidth: .infinity)
+                    .disabled(!state.productScanStatus.canFinish)
+            } else {
+                Button("Start Product Scan") { state.startProductScan() }
+                    .buttonStyle(.borderedProminent)
+                    .frame(maxWidth: .infinity)
+            }
         }
     }
 
@@ -206,13 +251,37 @@ struct ManualARMeasurementView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
 
-                if let raw = state.rawDimensionsCM,
-                   let boundary = state.boundaryMeasurement {
-                    reviewDimensions("Measured", raw)
+                if let raw = state.rawDimensionsCM {
+                    Text("Scanning Region")
+                        .font(.headline)
+                    Text("The cyan polygon and height limits only restricted where the app searched. Their size was not used as the product size.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    LabeledContent(
+                        "Boundary points",
+                        value: "\(state.boundaryMarkers.count)"
+                    )
+
+                    reviewDimensions("Detected Product", raw)
                     reviewDimensions("Storage after tolerance", adjusted(raw))
-                    LabeledContent("Footprint area") {
-                        Text("\((boundary.footprint.areaSquareMetres * 10_000).formatted(.number.precision(.fractionLength(2)))) cm²")
-                    }
+                    LabeledContent(
+                        "Detected surface points",
+                        value: "\(state.productScanStatus.stablePointCount)"
+                    )
+                    LabeledContent(
+                        "Scan coverage",
+                        value: state.productScanStatus.confidence.formatted(
+                            .percent.precision(.fractionLength(0))
+                        )
+                    )
+                    LabeledContent(
+                        "Supporting surface",
+                        value: "Removed during segmentation"
+                    )
+                    LabeledContent(
+                        "Region overflow",
+                        value: state.productScanStatus.touchesBoundary ? "Detected" : "None"
+                    )
                     LabeledContent("Quality", value: qualityName)
                     LabeledContent("LiDAR", value: ObjectScannerCapabilities.hasLiDAR ? "Available" : "Unavailable")
                 }
@@ -247,6 +316,7 @@ struct ManualARMeasurementView: View {
                 HStack {
                     Button("Restart", role: .destructive) { state.reset() }
                     Button("Enter Manually") { showsManualEntry = true }
+                    Button("Continue Scanning") { state.continueProductScan() }
                     Spacer()
                     Button("Apply to Product") { apply() }
                         .buttonStyle(.borderedProminent)

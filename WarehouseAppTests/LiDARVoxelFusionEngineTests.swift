@@ -14,6 +14,53 @@ final class LiDARVoxelFusionEngineTests: XCTestCase {
         XCTAssertEqual(measurement.supportPlaneY, 0, accuracy: configuration.voxelSize)
     }
 
+    func testPolygonalRegionIsOnlyACropAndDoesNotBecomeProductDimensions() throws {
+        let engine = makePolygonEngine(
+            halfWidth: 0.12,
+            upperOffset: 0.20
+        )
+        for frame in repeatedFrames(cylinderPoints() + tablePoints(extent: 0.11)) {
+            engine.integrate(framePoints: frame)
+        }
+
+        let measurement = try XCTUnwrap(engine.measurement())
+        assertCylinderDimensions(measurement.dimensionsCM)
+        XCTAssertLessThan(measurement.dimensionsCM.length, 8)
+        XCTAssertLessThan(measurement.dimensionsCM.height, 10)
+        XCTAssertFalse(measurement.touchesRegionBoundary)
+    }
+
+    func testFiveCentimetreProductHeightIsSupportedInsideTallerRegion() throws {
+        let engine = makePolygonEngine(
+            halfWidth: 0.10,
+            upperOffset: 0.15
+        )
+        for frame in repeatedFrames(
+            cylinderPoints(radius: 0.025, height: 0.05)
+                + tablePoints(extent: 0.09)
+        ) {
+            engine.integrate(framePoints: frame)
+        }
+
+        let measurement = try XCTUnwrap(engine.measurement())
+        XCTAssertEqual(measurement.dimensionsCM.length, 5, accuracy: voxelToleranceCM)
+        XCTAssertEqual(measurement.dimensionsCM.width, 5, accuracy: voxelToleranceCM)
+        XCTAssertEqual(measurement.dimensionsCM.height, 5, accuracy: voxelToleranceCM)
+    }
+
+    func testPolygonalRegionRejectsOutsidePointsBeforeFusion() {
+        let engine = makePolygonEngine()
+        let result = engine.integrate(framePoints: [
+            SIMD3<Float>(0, 0.04, 0),
+            SIMD3<Float>(0.20, 0.04, 0),
+            SIMD3<Float>(0, 0.20, 0)
+        ])
+
+        XCTAssertEqual(result.acceptedPointCount, 1)
+        XCTAssertEqual(result.rejectedOutsideVolumeCount, 2)
+        XCTAssertEqual(engine.voxelCount, 1)
+    }
+
     func testNearbyLargeObjectDoesNotMateriallyChangeSelectedCylinder() throws {
         let cylinderAndTable = cylinderPoints() + tablePoints()
         let baseline = try measure(frames: repeatedFrames(cylinderAndTable))
@@ -131,6 +178,32 @@ final class LiDARVoxelFusionEngineTests: XCTestCase {
                 halfExtents: halfExtents
             ),
             seed: SIMD3<Float>(0.03, 0.04, 0)
+        )
+        return engine
+    }
+
+    private func makePolygonEngine(
+        halfWidth: Float = 0.10,
+        upperOffset: Float = 0.15
+    ) -> LiDARVoxelFusionEngine {
+        let engine = LiDARVoxelFusionEngine(configuration: configuration)
+        let region = LiDARPolygonalPrism(
+            origin: .zero,
+            axisU: SIMD3<Float>(1, 0, 0),
+            axisV: SIMD3<Float>(0, 0, 1),
+            normal: SIMD3<Float>(0, 1, 0),
+            polygon: [
+                SIMD2<Float>(-halfWidth, -halfWidth),
+                SIMD2<Float>(halfWidth, -halfWidth),
+                SIMD2<Float>(halfWidth, halfWidth),
+                SIMD2<Float>(-halfWidth, halfWidth)
+            ],
+            lowerOffset: -0.005,
+            upperOffset: upperOffset
+        )
+        engine.lockSelection(
+            region: .polygonalPrism(region),
+            seed: SIMD3<Float>(0, 0.02, 0)
         )
         return engine
     }

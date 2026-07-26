@@ -23,7 +23,9 @@ struct ManualARSessionView: UIViewRepresentable {
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         context.coordinator.handle(
             placementRequestID: state.placementRequestID,
-            renderRevision: state.renderRevision
+            renderRevision: state.renderRevision,
+            productScanStartRequestID: state.productScanStartRequestID,
+            productScanStopRequestID: state.productScanStopRequestID
         )
     }
 
@@ -37,9 +39,23 @@ struct ManualARSessionView: UIViewRepresentable {
         private let previewNode = SCNNode()
         private let measurementGeometryNode = SCNNode()
         private var markerAnchors: [ARAnchor] = []
+        private var renderedMarkerPositions: [SIMD3<Float>] = []
         private var lastPreviewUpdate: TimeInterval = 0
         private var handledPlacementRequestID = 0
         private var renderedRevision = -1
+        private var handledProductScanStartRequestID = 0
+        private var handledProductScanStopRequestID = 0
+        private let fusionConfiguration = LiDARFusionConfiguration.smallObject
+        private var fusion = LiDARVoxelFusionEngine()
+        private var stabilizer = LiDARMeasurementStabilizer()
+        private var stableProductMeasurement: LiDARFusionMeasurement?
+        private var fusionFrameCount = 0
+        private var rejectedOutsideRegionCount = 0
+        private var productScanIsActive = false
+        private let fusionQueue = DispatchQueue(
+            label: "com.tetris.warehouse.manual-region-fusion",
+            qos: .userInitiated
+        )
 
         init(state: ManualARMeasurementState) {
             self.state = state
@@ -88,13 +104,19 @@ struct ManualARSessionView: UIViewRepresentable {
             guard let sceneView else { return }
             markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
             markerAnchors.removeAll()
+            renderedMarkerPositions.removeAll()
             sceneView.session.delegate = nil
             sceneView.delegate = nil
             sceneView.session.pause()
         }
 
         @MainActor
-        func handle(placementRequestID: Int, renderRevision: Int) {
+        func handle(
+            placementRequestID: Int,
+            renderRevision: Int,
+            productScanStartRequestID: Int,
+            productScanStopRequestID: Int
+        ) {
             if placementRequestID != handledPlacementRequestID {
                 handledPlacementRequestID = placementRequestID
                 // Place performs a fresh raycast; it never promotes a stale
@@ -105,6 +127,14 @@ struct ManualARSessionView: UIViewRepresentable {
                 renderedRevision = renderRevision
                 rebuildPermanentGeometry()
             }
+            if productScanStopRequestID != handledProductScanStopRequestID {
+                handledProductScanStopRequestID = productScanStopRequestID
+                productScanIsActive = false
+            }
+            if productScanStartRequestID != handledProductScanStartRequestID {
+                handledProductScanStartRequestID = productScanStartRequestID
+                startProductFusion()
+            }
         }
 
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
@@ -114,12 +144,23 @@ struct ManualARSessionView: UIViewRepresentable {
             guard now - lastPreviewUpdate >= 0.1 else { return }
             lastPreviewUpdate = now
             let trackingState = frame.camera.trackingState
+            let shouldIntegrate: Bool
+            if case .normal = trackingState {
+                shouldIntegrate = productScanIsActive
+            } else {
+                shouldIntegrate = false
+            }
+            let scanPoints = shouldIntegrate ? extractMeasurementPoints(from: frame) : []
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 state.updateTracking(trackingState)
                 let sample = raycastAtCentre()
                 state.updatePreview(sample)
                 updatePreview(sample)
+            }
+            guard !scanPoints.isEmpty else { return }
+            fusionQueue.async { [weak self] in
+                self?.integrateProductPoints(scanPoints)
             }
         }
 
@@ -174,6 +215,124 @@ struct ManualARSessionView: UIViewRepresentable {
             sceneView.session.run(makeConfiguration(), options: options)
         }
 
+        @MainActor
+        private func startProductFusion() {
+            guard let region = state.productScanRegion,
+                  let seed = state.productSeed
+            else {
+                state.errorMessage = "The scanning region is incomplete. Set the polygon, bottom limit, and top limit again."
+                return
+            }
+            productScanIsActive = false
+            fusionQueue.sync {
+                fusion.reset()
+                fusion.lockSelection(region: .polygonalPrism(region), seed: seed)
+                stabilizer.reset()
+                stableProductMeasurement = nil
+                fusionFrameCount = 0
+                rejectedOutsideRegionCount = 0
+            }
+            productScanIsActive = true
+        }
+
+        private func integrateProductPoints(_ points: [SIMD3<Float>]) {
+            guard productScanIsActive else { return }
+            let result = fusion.integrate(framePoints: points)
+            fusionFrameCount += 1
+            rejectedOutsideRegionCount += result.rejectedOutsideVolumeCount
+
+            guard fusionFrameCount.isMultiple(of: 4),
+                  let measurement = fusion.measurement()
+            else {
+                publishProductStatus(ManualProductScanStatus(
+                    message: "Collecting product surfaces inside the scanning region…",
+                    integratedFrameCount: fusionFrameCount,
+                    rejectedOutsideRegionCount: rejectedOutsideRegionCount
+                ))
+                return
+            }
+
+            let decision = stabilizer.consider(measurement.dimensionsCM)
+            let dimensions: ObjectDimensions?
+            let isStable: Bool
+            let message: String
+            switch decision {
+            case .warmingUp:
+                dimensions = measurement.dimensionsCM
+                isStable = false
+                message = "Product detected. Scan more sides while dimensions stabilise."
+            case .accepted(let accepted):
+                dimensions = accepted
+                isStable = true
+                stableProductMeasurement = measurement
+                message = measurement.touchesRegionBoundary
+                    ? "The detected product touches the scanning limit. Expand the region."
+                    : "Detected product is stable. Scan the top and any unseen side."
+            case .frozen(let frozen, let reason):
+                dimensions = frozen
+                isStable = false
+                message = reason
+            }
+
+            let displayMeasurement = stableProductMeasurement ?? measurement
+            let confidence = productConfidence(
+                measurement: displayMeasurement,
+                dimensionsAreStable: isStable
+            )
+            let canFinish = isStable
+                && !displayMeasurement.touchesRegionBoundary
+                && fusionFrameCount >= fusionConfiguration.minimumFusedFrameCount
+                && displayMeasurement.fusedVoxelCount
+                    >= fusionConfiguration.minimumStableVoxelCount
+                && confidence >= ObjectScanValidation.minimumConfidence
+            publishProductStatus(ManualProductScanStatus(
+                message: message,
+                integratedFrameCount: fusionFrameCount,
+                stablePointCount: displayMeasurement.fusedVoxelCount,
+                rejectedOutsideRegionCount: rejectedOutsideRegionCount,
+                detectedDimensionsCM: dimensions,
+                detectedWorldPoints: displayMeasurement.worldPointsInMetres,
+                centredDisplayPoints: displayMeasurement.centredPointsInMetres,
+                boundingBoxCornersWorld: displayMeasurement.boundingBoxCornersWorld,
+                confidence: confidence,
+                dimensionsAreStable: isStable,
+                touchesBoundary: displayMeasurement.touchesRegionBoundary,
+                canFinish: canFinish
+            ))
+        }
+
+        private func productConfidence(
+            measurement: LiDARFusionMeasurement,
+            dimensionsAreStable: Bool
+        ) -> Double {
+            let frameScore = min(
+                Double(fusionFrameCount)
+                    / Double(fusionConfiguration.minimumFusedFrameCount * 2),
+                1
+            )
+            let voxelScore = min(
+                Double(measurement.fusedVoxelCount)
+                    / Double(fusionConfiguration.minimumStableVoxelCount * 6),
+                1
+            )
+            let observationScore = min(measurement.averageObservationsPerVoxel / 8, 1)
+            let stabilityScore = dimensionsAreStable ? 1.0 : 0.25
+            return min(
+                frameScore * 0.25
+                    + voxelScore * 0.25
+                    + observationScore * 0.20
+                    + stabilityScore * 0.30,
+                0.95
+            )
+        }
+
+        private func publishProductStatus(_ status: ManualProductScanStatus) {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.productScanIsActive else { return }
+                self.state.updateProductScan(status)
+            }
+        }
+
         private func makeConfiguration() -> ARWorldTrackingConfiguration {
             let configuration = ARWorldTrackingConfiguration()
             configuration.planeDetection = [.horizontal, .vertical]
@@ -181,6 +340,91 @@ struct ManualARSessionView: UIViewRepresentable {
                 configuration.frameSemantics.insert(.sceneDepth)
             }
             return configuration
+        }
+
+        private func extractMeasurementPoints(from frame: ARFrame) -> [SIMD3<Float>] {
+            if let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth {
+                return extractDepthPoints(depthData, frame: frame)
+            }
+            // Non-LiDAR fallback: feature points remain spatially filtered by
+            // the same polygonal prism before entering fusion.
+            return frame.rawFeaturePoints.map { Array($0.points) } ?? []
+        }
+
+        private func extractDepthPoints(
+            _ depthData: ARDepthData,
+            frame: ARFrame
+        ) -> [SIMD3<Float>] {
+            let depthMap = depthData.depthMap
+            let confidenceMap = depthData.confidenceMap
+            CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+            if let confidenceMap {
+                CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+            }
+            defer {
+                CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+                if let confidenceMap {
+                    CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+                }
+            }
+            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return [] }
+            let width = CVPixelBufferGetWidth(depthMap)
+            let height = CVPixelBufferGetHeight(depthMap)
+            let depthStride = CVPixelBufferGetBytesPerRow(depthMap)
+                / MemoryLayout<Float32>.size
+            let depths = depthBase.assumingMemoryBound(to: Float32.self)
+            let confidence = confidenceMap
+                .flatMap(CVPixelBufferGetBaseAddress)?
+                .assumingMemoryBound(to: UInt8.self)
+            let confidenceStride = confidenceMap.map(CVPixelBufferGetBytesPerRow) ?? 0
+            var points: [SIMD3<Float>] = []
+            points.reserveCapacity(width * height / 4)
+            for y in stride(from: 0, to: height, by: 2) {
+                for x in stride(from: 0, to: width, by: 2) {
+                    let depth = depths[y * depthStride + x]
+                    guard depth.isFinite, depth >= 0.10, depth <= 5 else { continue }
+                    if let confidence,
+                       confidence[y * confidenceStride + x]
+                        < ARConfidenceLevel.medium.rawValue {
+                        continue
+                    }
+                    points.append(worldPoint(
+                        x: x,
+                        y: y,
+                        depth: depth,
+                        depthWidth: width,
+                        depthHeight: height,
+                        frame: frame
+                    ))
+                }
+            }
+            return points
+        }
+
+        private func worldPoint(
+            x: Int,
+            y: Int,
+            depth: Float,
+            depthWidth: Int,
+            depthHeight: Int,
+            frame: ARFrame
+        ) -> SIMD3<Float> {
+            let resolution = frame.camera.imageResolution
+            let scaleX = Float(depthWidth) / Float(resolution.width)
+            let scaleY = Float(depthHeight) / Float(resolution.height)
+            let intrinsics = frame.camera.intrinsics
+            let fx = intrinsics.columns.0.x * scaleX
+            let fy = intrinsics.columns.1.y * scaleY
+            let cx = intrinsics.columns.2.x * scaleX
+            let cy = intrinsics.columns.2.y * scaleY
+            let cameraPoint = SIMD4<Float>(
+                (Float(x) - cx) * depth / fx,
+                -(Float(y) - cy) * depth / fy,
+                -depth,
+                1
+            )
+            let world = frame.camera.transform * cameraPoint
+            return SIMD3(world.x, world.y, world.z)
         }
 
         @MainActor
@@ -288,12 +532,26 @@ struct ManualARSessionView: UIViewRepresentable {
         private func rebuildPermanentGeometry() {
             guard let sceneView else { return }
 
-            markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
-            markerAnchors.removeAll()
             measurementGeometryNode.childNodes.forEach { $0.removeFromParentNode() }
 
             let boundary = state.boundaryMarkers.map { $0.position.simd }
-            boundary.forEach { addMarkerAnchor(at: $0, name: AnchorName.boundary) }
+            let bottom = state.bottomMarker?.position.simd
+            let top = state.topMarker?.position.simd
+            let markerPositions = boundary + [bottom, top].compactMap { $0 }
+            if markerPositions != renderedMarkerPositions {
+                markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
+                markerAnchors.removeAll()
+                boundary.forEach {
+                    addMarkerAnchor(at: $0, name: AnchorName.boundary)
+                }
+                if let bottom {
+                    addMarkerAnchor(at: bottom, name: AnchorName.bottom)
+                }
+                if let top {
+                    addMarkerAnchor(at: top, name: AnchorName.top)
+                }
+                renderedMarkerPositions = markerPositions
+            }
             for (start, end) in zip(boundary, boundary.dropFirst()) {
                 addLine(from: start, to: end, color: .systemCyan)
             }
@@ -303,17 +561,16 @@ struct ManualARSessionView: UIViewRepresentable {
                let last = boundary.last {
                 addLine(from: last, to: first, color: .systemCyan)
                 addBoundarySurface()
-                addBoundingRectangle()
             }
-            if let bottom = state.bottomMarker?.position.simd {
-                addMarkerAnchor(at: bottom, name: AnchorName.bottom)
-            }
-            if let top = state.topMarker?.position.simd {
-                addMarkerAnchor(at: top, name: AnchorName.top)
-                if let bottom = state.bottomMarker?.position.simd {
+            if let top {
+                if let bottom {
                     addLine(from: bottom, to: top, color: .systemPink)
                 }
             }
+            if state.productScanRegion != nil {
+                addScanningPrism()
+            }
+            addDetectedProduct()
         }
 
         @MainActor
@@ -377,20 +634,105 @@ struct ManualARSessionView: UIViewRepresentable {
         }
 
         @MainActor
-        private func addBoundingRectangle() {
-            guard let measurement = state.boundaryMeasurement else { return }
-            let plane = measurement.plane
-            let corners = measurement.footprint.rectangle2D.map {
-                SIMD3<Float>(plane.origin + plane.axisU * $0.x + plane.axisV * $0.y)
+        private func addScanningPrism() {
+            guard let region = state.productScanRegion else { return }
+            let lower = region.polygon.map {
+                region.origin
+                    + region.axisU * $0.x
+                    + region.axisV * $0.y
+                    + region.normal * region.lowerOffset
             }
-            guard corners.count >= 3 else { return }
-            for index in corners.indices {
+            let upper = region.polygon.map {
+                region.origin
+                    + region.axisU * $0.x
+                    + region.axisV * $0.y
+                    + region.normal * region.upperOffset
+            }
+            guard lower.count >= 3, lower.count == upper.count else { return }
+            for index in lower.indices {
+                let next = (index + 1) % lower.count
+                addLine(from: lower[index], to: lower[next], color: .systemCyan)
+                addLine(from: upper[index], to: upper[next], color: .systemCyan)
                 addLine(
-                    from: corners[index],
-                    to: corners[(index + 1) % corners.count],
+                    from: lower[index],
+                    to: upper[index],
+                    color: UIColor.systemCyan.withAlphaComponent(0.65)
+                )
+            }
+        }
+
+        @MainActor
+        private func addDetectedProduct() {
+            let status = state.productScanStatus
+            if !status.detectedWorldPoints.isEmpty {
+                let step = max(1, status.detectedWorldPoints.count / 3_000)
+                let points = status.detectedWorldPoints.enumerated().compactMap {
+                    $0.offset.isMultiple(of: step) ? $0.element : nil
+                }
+                let source = SCNGeometrySource(vertices: points.map {
+                    SCNVector3($0.x, $0.y, $0.z)
+                })
+                let indices = points.indices.map(UInt32.init)
+                let element = SCNGeometryElement(
+                    data: indices.withUnsafeBytes { Data($0) },
+                    primitiveType: .point,
+                    primitiveCount: indices.count,
+                    bytesPerIndex: MemoryLayout<UInt32>.size
+                )
+                element.pointSize = 5
+                element.minimumPointScreenSpaceRadius = 2
+                element.maximumPointScreenSpaceRadius = 7
+                let geometry = SCNGeometry(sources: [source], elements: [element])
+                geometry.firstMaterial = material(
+                    color: UIColor.systemGreen.withAlphaComponent(0.9)
+                )
+                measurementGeometryNode.addChildNode(SCNNode(geometry: geometry))
+            }
+
+            let corners = status.boundingBoxCornersWorld
+            guard corners.count == 8 else { return }
+            let edgePairs = [
+                (0, 1), (1, 2), (2, 3), (3, 0),
+                (4, 5), (5, 6), (6, 7), (7, 4),
+                (0, 4), (1, 5), (2, 6), (3, 7)
+            ]
+            edgePairs.forEach {
+                addLine(
+                    from: corners[$0.0],
+                    to: corners[$0.1],
                     color: .systemOrange
                 )
             }
+            if let dimensions = status.detectedDimensionsCM {
+                let firstHorizontalIsLength =
+                    simd_distance(corners[0], corners[1])
+                    >= simd_distance(corners[1], corners[2])
+                addDimensionLabel(
+                    "\(firstHorizontalIsLength ? "Length" : "Width"): \((firstHorizontalIsLength ? dimensions.length : dimensions.width).formatted(.number.precision(.fractionLength(2)))) cm",
+                    at: (corners[0] + corners[1]) / 2
+                )
+                addDimensionLabel(
+                    "\(firstHorizontalIsLength ? "Width" : "Length"): \((firstHorizontalIsLength ? dimensions.width : dimensions.length).formatted(.number.precision(.fractionLength(2)))) cm",
+                    at: (corners[1] + corners[2]) / 2
+                )
+                addDimensionLabel(
+                    "Height: \(dimensions.height.formatted(.number.precision(.fractionLength(2)))) cm",
+                    at: (corners[0] + corners[4]) / 2
+                )
+            }
+        }
+
+        @MainActor
+        private func addDimensionLabel(_ text: String, at position: SIMD3<Float>) {
+            let textGeometry = SCNText(string: text, extrusionDepth: 0)
+            textGeometry.font = .systemFont(ofSize: 8, weight: .semibold)
+            textGeometry.flatness = 0.2
+            textGeometry.firstMaterial = material(color: .white)
+            let node = SCNNode(geometry: textGeometry)
+            node.scale = SCNVector3(0.002, 0.002, 0.002)
+            node.simdPosition = position + SIMD3<Float>(0, 0.015, 0)
+            node.constraints = [SCNBillboardConstraint()]
+            measurementGeometryNode.addChildNode(node)
         }
 
         private func makeSphere(radius: CGFloat, color: UIColor) -> SCNNode {

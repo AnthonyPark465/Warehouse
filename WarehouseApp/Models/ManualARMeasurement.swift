@@ -41,6 +41,11 @@ struct ManualARMeasurementMetadata: Codable, Equatable {
     let footprintAreaSquareMetres: Double
     let perimeterMetres: Double
     let orientationAngleDegrees: Double
+    /// `true` means boundary/limit coordinates are an ROI only and were not
+    /// used as the saved product dimensions.
+    let scanningRegionOnly: Bool?
+    let detectedProductPointCount: Int?
+    let detectedProductTouchedRegionBoundary: Bool?
 }
 
 enum MeasurementQuality: String, Codable {
