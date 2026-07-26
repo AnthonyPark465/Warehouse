@@ -4,6 +4,9 @@ struct ObjectScanSummaryView: View {
     let capture: ObjectScanCapture
     @Binding var displayUnit: DimensionDisplayUnit
     @Binding var canBeRotated: Bool
+    @Binding var percentageTolerance: Double
+    @Binding var fixedToleranceCM: Double
+    @Binding var useAdjustedDimensions: Bool
     let onRescan: () -> Void
 
     @State private var resetCameraToken = 0
@@ -12,7 +15,13 @@ struct ObjectScanSummaryView: View {
         ObjectDimensionCalculator.makeRecord(
             capture: capture,
             displayUnit: displayUnit,
-            canBeRotated: canBeRotated
+            canBeRotated: canBeRotated,
+            useAdjustedDimensions: useAdjustedDimensions,
+            policy: .init(
+                fixedToleranceCM: fixedToleranceCM,
+                percentageTolerance: percentageTolerance,
+                storageClearanceCM: 0
+            )
         )
     }
 
@@ -34,21 +43,32 @@ struct ObjectScanSummaryView: View {
                 )
             )
             dimensionGroup(
-                title: "Scan Tolerance",
+                title: "Measurement Tolerance",
                 dimensions: ObjectDimensions(
                     length: record.scanToleranceLength,
                     width: record.scanToleranceWidth,
                     height: record.scanToleranceHeight
                 )
             )
-            dimensionGroup(
-                title: "Storage Clearance",
-                dimensions: ObjectDimensions(
-                    length: record.storageClearanceLength,
-                    width: record.storageClearanceWidth,
-                    height: record.storageClearanceHeight
-                )
-            )
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Percentage")
+                    Spacer()
+                    TextField("Percent", value: $percentageTolerance, format: .percent)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                        .frame(width: 90)
+                }
+                HStack {
+                    Text("Fixed tolerance")
+                    Spacer()
+                    TextField("cm", value: $fixedToleranceCM, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                        .frame(width: 70)
+                    Text("cm").foregroundStyle(.secondary)
+                }
+            }
             dimensionGroup(
                 title: "Final Storage Dimensions",
                 dimensions: ObjectDimensions(
@@ -60,6 +80,7 @@ struct ObjectScanSummaryView: View {
             )
 
             Toggle("Item can be rotated during storage", isOn: $canBeRotated)
+            Toggle("Use tolerance for saved storage dimensions", isOn: $useAdjustedDimensions)
 
             VStack(alignment: .leading, spacing: 8) {
                 ObjectScanViewer(
@@ -140,6 +161,10 @@ struct ObjectScanSummaryView: View {
             "Multi-frame LiDAR Fusion"
         case .standardAR:
             "Standard ARKit"
+        case .manualBoundary:
+            "Manual AR Boundary"
+        case .manualEntry:
+            "Manual Entry"
         }
     }
 }

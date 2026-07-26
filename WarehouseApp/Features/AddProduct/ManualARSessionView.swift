@@ -1,0 +1,416 @@
+import ARKit
+import AVFoundation
+import SceneKit
+import SwiftUI
+
+/// ARKit/SceneKit bridge for manual product measurement.
+///
+/// The targeting dot is SwiftUI screen-space UI. This view owns only the AR
+/// camera, centre raycasts, real-world anchors, and lightweight scene geometry.
+struct ManualARSessionView: UIViewRepresentable {
+    @ObservedObject var state: ManualARMeasurementState
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(state: state)
+    }
+
+    func makeUIView(context: Context) -> ARSCNView {
+        let view = ARSCNView(frame: .zero)
+        context.coordinator.attach(to: view)
+        return view
+    }
+
+    func updateUIView(_ uiView: ARSCNView, context: Context) {
+        context.coordinator.handle(
+            placementRequestID: state.placementRequestID,
+            renderRevision: state.renderRevision
+        )
+    }
+
+    static func dismantleUIView(_ uiView: ARSCNView, coordinator: Coordinator) {
+        coordinator.stop()
+    }
+
+    final class Coordinator: NSObject, ARSessionDelegate, ARSCNViewDelegate {
+        private weak var sceneView: ARSCNView?
+        private let state: ManualARMeasurementState
+        private let previewNode = SCNNode()
+        private let measurementGeometryNode = SCNNode()
+        private var markerAnchors: [ARAnchor] = []
+        private var lastPreviewUpdate: TimeInterval = 0
+        private var handledPlacementRequestID = 0
+        private var renderedRevision = -1
+
+        init(state: ManualARMeasurementState) {
+            self.state = state
+            super.init()
+        }
+
+        @MainActor
+        func attach(to view: ARSCNView) {
+            sceneView = view
+            view.scene = SCNScene()
+            view.delegate = self
+            view.session.delegate = self
+            view.automaticallyUpdatesLighting = false
+            view.preferredFramesPerSecond = 60
+            view.scene.rootNode.addChildNode(measurementGeometryNode)
+            installPreviewNode(in: view)
+
+            guard ARWorldTrackingConfiguration.isSupported else {
+                state.errorMessage = "This device does not support AR world tracking. Enter dimensions manually."
+                return
+            }
+
+            switch AVCaptureDevice.authorizationStatus(for: .video) {
+            case .authorized:
+                startSession(resetTracking: true)
+            case .notDetermined:
+                AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        if granted {
+                            self.startSession(resetTracking: true)
+                        } else {
+                            self.state.errorMessage = "Camera access is required for AR measurement. Enable Camera in Settings or enter dimensions manually."
+                        }
+                    }
+                }
+            case .denied, .restricted:
+                state.errorMessage = "Camera access is disabled. Enable Camera in Settings or enter dimensions manually."
+            @unknown default:
+                state.errorMessage = "Camera access could not be determined. Enter dimensions manually."
+            }
+        }
+
+        @MainActor
+        func stop() {
+            guard let sceneView else { return }
+            markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
+            markerAnchors.removeAll()
+            sceneView.session.delegate = nil
+            sceneView.delegate = nil
+            sceneView.session.pause()
+        }
+
+        @MainActor
+        func handle(placementRequestID: Int, renderRevision: Int) {
+            if placementRequestID != handledPlacementRequestID {
+                handledPlacementRequestID = placementRequestID
+                // Place performs a fresh raycast; it never promotes a stale
+                // preview sample into a permanent marker.
+                state.place(raycastAtCentre())
+            }
+            if renderRevision != renderedRevision {
+                renderedRevision = renderRevision
+                rebuildPermanentGeometry()
+            }
+        }
+
+        func session(_ session: ARSession, didUpdate frame: ARFrame) {
+            // Throttle before crossing to the main actor. Do not capture the
+            // ARFrame in the Task because it owns large camera buffers.
+            let now = frame.timestamp
+            guard now - lastPreviewUpdate >= 0.1 else { return }
+            lastPreviewUpdate = now
+            let trackingState = frame.camera.trackingState
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                state.updateTracking(trackingState)
+                let sample = raycastAtCentre()
+                state.updatePreview(sample)
+                updatePreview(sample)
+            }
+        }
+
+        func session(_ session: ARSession, didFailWithError error: Error) {
+            Task { @MainActor [weak self] in
+                self?.state.errorMessage = "AR session failed: \(error.localizedDescription) Restart measurement or enter dimensions manually."
+            }
+        }
+
+        func sessionWasInterrupted(_ session: ARSession) {
+            Task { @MainActor [weak self] in
+                self?.state.errorMessage = "Measurement was interrupted. Keep the product in view while tracking recovers."
+            }
+        }
+
+        func sessionInterruptionEnded(_ session: ARSession) {
+            Task { @MainActor [weak self] in
+                self?.startSession(resetTracking: false)
+            }
+        }
+
+        func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool {
+            true
+        }
+
+        func renderer(
+            _ renderer: SCNSceneRenderer,
+            didAdd node: SCNNode,
+            for anchor: ARAnchor
+        ) {
+            guard let name = anchor.name else { return }
+            let color: UIColor
+            switch name {
+            case AnchorName.boundary:
+                color = .systemCyan
+            case AnchorName.bottom:
+                color = .systemGreen
+            case AnchorName.top:
+                color = .systemPink
+            default:
+                return
+            }
+            node.addChildNode(makeSphere(radius: 0.009, color: color))
+        }
+
+        @MainActor
+        private func startSession(resetTracking: Bool) {
+            guard let sceneView else { return }
+            let options: ARSession.RunOptions = resetTracking
+                ? [.resetTracking, .removeExistingAnchors]
+                : []
+            sceneView.session.run(makeConfiguration(), options: options)
+        }
+
+        private func makeConfiguration() -> ARWorldTrackingConfiguration {
+            let configuration = ARWorldTrackingConfiguration()
+            configuration.planeDetection = [.horizontal, .vertical]
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+                configuration.frameSemantics.insert(.sceneDepth)
+            }
+            return configuration
+        }
+
+        @MainActor
+        private func raycastAtCentre() -> CentreRaycastSample? {
+            guard let sceneView,
+                  sceneView.bounds.width > 0,
+                  sceneView.bounds.height > 0
+            else { return nil }
+            let centre = CGPoint(x: sceneView.bounds.midX, y: sceneView.bounds.midY)
+
+            let existing = raycast(
+                from: centre,
+                target: .existingPlaneGeometry,
+                in: sceneView
+            )
+            let infinite = existing == nil
+                ? raycast(from: centre, target: .existingPlaneInfinite, in: sceneView)
+                : nil
+            let estimated = existing == nil && infinite == nil
+                ? raycast(from: centre, target: .estimatedPlane, in: sceneView)
+                : nil
+            let result = existing ?? infinite ?? estimated
+            guard let result else { return nil }
+
+            let position = SIMD3<Float>(
+                result.worldTransform.columns.3.x,
+                result.worldTransform.columns.3.y,
+                result.worldTransform.columns.3.z
+            )
+            guard position.x.isFinite, position.y.isFinite, position.z.isFinite else {
+                return nil
+            }
+
+            let cameraPosition: SIMD3<Float>
+            if let frame = sceneView.session.currentFrame {
+                cameraPosition = SIMD3(
+                    frame.camera.transform.columns.3.x,
+                    frame.camera.transform.columns.3.y,
+                    frame.camera.transform.columns.3.z
+                )
+            } else {
+                cameraPosition = position
+            }
+            let alignment: String
+            if let plane = result.anchor as? ARPlaneAnchor {
+                alignment = plane.alignment == .horizontal ? "horizontal plane" : "vertical plane"
+            } else {
+                alignment = "estimated surface"
+            }
+            let raycastType: String
+            if existing != nil {
+                raycastType = "existingPlaneGeometry"
+            } else if infinite != nil {
+                raycastType = "existingPlaneInfinite"
+            } else {
+                raycastType = "estimatedPlane"
+            }
+            let distance = Double(simd_distance(cameraPosition, position))
+            let distanceScore = max(0.4, 1 - abs(distance - 0.6) / 2)
+            let surfaceScore = existing == nil ? 0.70 : 0.88
+            return CentreRaycastSample(
+                position: position,
+                raycastType: raycastType,
+                surfaceAlignment: alignment,
+                confidence: min(surfaceScore * distanceScore, 0.95),
+                cameraDistanceMetres: distance
+            )
+        }
+
+        @MainActor
+        private func raycast(
+            from point: CGPoint,
+            target: ARRaycastQuery.Target,
+            in view: ARSCNView
+        ) -> ARRaycastResult? {
+            guard let query = view.raycastQuery(
+                from: point,
+                allowing: target,
+                alignment: .any
+            ) else { return nil }
+            return view.session.raycast(query).first
+        }
+
+        @MainActor
+        private func installPreviewNode(in view: ARSCNView) {
+            previewNode.geometry = SCNSphere(radius: 0.006)
+            previewNode.geometry?.firstMaterial = material(
+                color: UIColor.systemYellow.withAlphaComponent(0.65)
+            )
+            previewNode.isHidden = true
+            view.scene.rootNode.addChildNode(previewNode)
+        }
+
+        @MainActor
+        private func updatePreview(_ sample: CentreRaycastSample?) {
+            guard let sample else {
+                previewNode.isHidden = true
+                return
+            }
+            previewNode.simdWorldPosition = sample.position
+            previewNode.isHidden = false
+        }
+
+        @MainActor
+        private func rebuildPermanentGeometry() {
+            guard let sceneView else { return }
+
+            markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
+            markerAnchors.removeAll()
+            measurementGeometryNode.childNodes.forEach { $0.removeFromParentNode() }
+
+            let boundary = state.boundaryMarkers.map { $0.position.simd }
+            boundary.forEach { addMarkerAnchor(at: $0, name: AnchorName.boundary) }
+            for (start, end) in zip(boundary, boundary.dropFirst()) {
+                addLine(from: start, to: end, color: .systemCyan)
+            }
+            if state.boundaryMeasurement != nil,
+               boundary.count >= 3,
+               let first = boundary.first,
+               let last = boundary.last {
+                addLine(from: last, to: first, color: .systemCyan)
+                addBoundarySurface()
+                addBoundingRectangle()
+            }
+            if let bottom = state.bottomMarker?.position.simd {
+                addMarkerAnchor(at: bottom, name: AnchorName.bottom)
+            }
+            if let top = state.topMarker?.position.simd {
+                addMarkerAnchor(at: top, name: AnchorName.top)
+                if let bottom = state.bottomMarker?.position.simd {
+                    addLine(from: bottom, to: top, color: .systemPink)
+                }
+            }
+        }
+
+        @MainActor
+        private func addMarkerAnchor(at position: SIMD3<Float>, name: String) {
+            guard let sceneView else { return }
+            var transform = matrix_identity_float4x4
+            transform.columns.3 = SIMD4(position.x, position.y, position.z, 1)
+            let anchor = ARAnchor(name: name, transform: transform)
+            markerAnchors.append(anchor)
+            sceneView.session.add(anchor: anchor)
+        }
+
+        @MainActor
+        private func addLine(
+            from start: SIMD3<Float>,
+            to end: SIMD3<Float>,
+            color: UIColor
+        ) {
+            let vector = end - start
+            let length = simd_length(vector)
+            guard length.isFinite, length > 0.000_1 else { return }
+            let line = SCNNode(geometry: SCNCylinder(radius: 0.0025, height: CGFloat(length)))
+            line.geometry?.firstMaterial = material(color: color)
+            line.simdPosition = (start + end) / 2
+            line.simdOrientation = simd_quatf(
+                from: SIMD3<Float>(0, 1, 0),
+                to: simd_normalize(vector)
+            )
+            measurementGeometryNode.addChildNode(line)
+        }
+
+        @MainActor
+        private func addBoundarySurface() {
+            guard let measurement = state.boundaryMeasurement else { return }
+            let plane = measurement.plane
+            let positions = measurement.projectedBoundary.map {
+                SIMD3<Float>(plane.origin + plane.axisU * $0.x + plane.axisV * $0.y)
+            }
+            let indices = ManualMeasurementGeometry.triangulationIndices(
+                for: measurement.projectedBoundary
+            )
+            guard positions.count >= 3, !indices.isEmpty else { return }
+
+            let source = SCNGeometrySource(vertices: positions.map {
+                SCNVector3($0.x, $0.y, $0.z)
+            })
+            let indexData = indices.withUnsafeBytes { Data($0) }
+            let element = SCNGeometryElement(
+                data: indexData,
+                primitiveType: .triangles,
+                primitiveCount: indices.count / 3,
+                bytesPerIndex: MemoryLayout<UInt32>.size
+            )
+            let geometry = SCNGeometry(sources: [source], elements: [element])
+            let surfaceMaterial = material(
+                color: UIColor.systemCyan.withAlphaComponent(0.22)
+            )
+            surfaceMaterial.isDoubleSided = true
+            geometry.materials = [surfaceMaterial]
+            measurementGeometryNode.addChildNode(SCNNode(geometry: geometry))
+        }
+
+        @MainActor
+        private func addBoundingRectangle() {
+            guard let measurement = state.boundaryMeasurement else { return }
+            let plane = measurement.plane
+            let corners = measurement.footprint.rectangle2D.map {
+                SIMD3<Float>(plane.origin + plane.axisU * $0.x + plane.axisV * $0.y)
+            }
+            guard corners.count >= 3 else { return }
+            for index in corners.indices {
+                addLine(
+                    from: corners[index],
+                    to: corners[(index + 1) % corners.count],
+                    color: .systemOrange
+                )
+            }
+        }
+
+        private func makeSphere(radius: CGFloat, color: UIColor) -> SCNNode {
+            let sphere = SCNSphere(radius: radius)
+            sphere.firstMaterial = material(color: color)
+            return SCNNode(geometry: sphere)
+        }
+
+        private func material(color: UIColor) -> SCNMaterial {
+            let material = SCNMaterial()
+            material.diffuse.contents = color
+            material.lightingModel = .constant
+            material.writesToDepthBuffer = true
+            return material
+        }
+    }
+}
+
+private enum AnchorName {
+    static let boundary = "manualMeasurement.boundary"
+    static let bottom = "manualMeasurement.bottom"
+    static let top = "manualMeasurement.top"
+}

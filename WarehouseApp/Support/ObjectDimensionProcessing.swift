@@ -4,14 +4,14 @@ import Foundation
 /// Future device-, warehouse-, or confidence-specific providers can supply a
 /// different policy without changing AddProduct or the 3D viewer.
 struct ObjectDimensionPolicy: Equatable {
-    let minimumToleranceCM: Double
-    let proportionalTolerance: Double
+    let fixedToleranceCM: Double
+    let percentageTolerance: Double
     let storageClearanceCM: Double
 
     static let `default` = ObjectDimensionPolicy(
-        minimumToleranceCM: 2,
-        proportionalTolerance: 0.02,
-        storageClearanceCM: 1
+        fixedToleranceCM: 0.5,
+        percentageTolerance: 0.02,
+        storageClearanceCM: 0
     )
 }
 
@@ -22,6 +22,7 @@ enum ObjectDimensionCalculator {
         capture: ObjectScanCapture,
         displayUnit: DimensionDisplayUnit,
         canBeRotated: Bool,
+        useAdjustedDimensions: Bool = true,
         policy: ObjectDimensionPolicy = .default
     ) -> ProductObjectScan {
         let raw = capture.rawDimensionsCM
@@ -35,11 +36,12 @@ enum ObjectDimensionCalculator {
             width: policy.storageClearanceCM,
             height: policy.storageClearanceCM
         )
-        let final = ObjectDimensions(
+        let adjusted = ObjectDimensions(
             length: raw.length + tolerance.length + clearance.length,
             width: raw.width + tolerance.width + clearance.width,
             height: raw.height + tolerance.height + clearance.height
         )
+        let final = useAdjustedDimensions ? adjusted : raw
 
         return ProductObjectScan(
             rawLength: raw.length,
@@ -61,7 +63,12 @@ enum ObjectDimensionCalculator {
             deviceModel: capture.deviceModel,
             hasLiDAR: capture.hasLiDAR,
             scanConfidence: capture.confidence,
-            scanTimestamp: capture.timestamp
+            scanTimestamp: capture.timestamp,
+            percentageTolerance: policy.percentageTolerance,
+            fixedToleranceCM: policy.fixedToleranceCM,
+            usesAdjustedDimensions: useAdjustedDimensions,
+            measurementQuality: quality(for: capture.confidence),
+            manualMeasurement: capture.manualMeasurement
         )
     }
 
@@ -69,7 +76,16 @@ enum ObjectDimensionCalculator {
         for measuredCM: Double,
         policy: ObjectDimensionPolicy = .default
     ) -> Double {
-        max(policy.minimumToleranceCM, measuredCM * policy.proportionalTolerance)
+        measuredCM * policy.percentageTolerance + policy.fixedToleranceCM
+    }
+
+    static func quality(for confidence: Double) -> MeasurementQuality {
+        switch confidence {
+        case 0.8...: .good
+        case 0.65..<0.8: .acceptable
+        case 0.5..<0.65: .low
+        default: .repeatRecommended
+        }
     }
 }
 

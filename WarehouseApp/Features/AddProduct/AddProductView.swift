@@ -22,9 +22,14 @@ struct AddProductView: View {
     @State private var scannedBarcode: String
     @State private var showsScanner = false
     @State private var showsObjectScanner = false
+    @State private var showsManualMeasurement = false
+    @State private var showsManualEntry = false
     @State private var objectScanCapture: ObjectScanCapture?
     @State private var displayUnit: DimensionDisplayUnit = .centimetres
     @State private var canBeRotated = false
+    @State private var percentageTolerance = ObjectDimensionPolicy.default.percentageTolerance
+    @State private var fixedToleranceCM = ObjectDimensionPolicy.default.fixedToleranceCM
+    @State private var useAdjustedDimensions = true
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -68,6 +73,21 @@ struct AddProductView: View {
                     objectScanCapture = capture
                 }
             }
+            .fullScreenCover(isPresented: $showsManualMeasurement) {
+                ManualARMeasurementView { capture, percentage, fixed, rotationAllowed, useAdjusted in
+                    objectScanCapture = capture
+                    percentageTolerance = percentage
+                    fixedToleranceCM = fixed
+                    canBeRotated = rotationAllowed
+                    useAdjustedDimensions = useAdjusted
+                }
+            }
+            .sheet(isPresented: $showsManualEntry) {
+                ManualDimensionEntryView(
+                    canBeRotated: $canBeRotated,
+                    onSave: { capture in objectScanCapture = capture }
+                )
+            }
             .alert("Couldn't Save", isPresented: .init(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } }
@@ -86,14 +106,29 @@ struct AddProductView: View {
                 capture: objectScanCapture,
                 displayUnit: $displayUnit,
                 canBeRotated: $canBeRotated,
+                percentageTolerance: $percentageTolerance,
+                fixedToleranceCM: $fixedToleranceCM,
+                useAdjustedDimensions: $useAdjustedDimensions,
                 onRescan: { showsObjectScanner = true }
             )
+            Button("Measure with AR") { showsManualMeasurement = true }
+            Button("Enter Dimensions Manually") { showsManualEntry = true }
         } else {
             Section("Storage Dimensions") {
+                Button {
+                    showsManualMeasurement = true
+                } label: {
+                    Label("Measure with AR", systemImage: "ruler")
+                }
                 Button {
                     showsObjectScanner = true
                 } label: {
                     Label("Start Object Scan", systemImage: "arkit")
+                }
+                Button {
+                    showsManualEntry = true
+                } label: {
+                    Label("Enter Dimensions Manually", systemImage: "square.and.pencil")
                 }
                 Text("Choose multi-frame LiDAR Fusion or Apple Object Capture, then review the measured storage bounding box.")
                     .font(.caption)
@@ -213,7 +248,13 @@ struct AddProductView: View {
                         ObjectDimensionCalculator.makeRecord(
                             capture: $0,
                             displayUnit: displayUnit,
-                            canBeRotated: canBeRotated
+                            canBeRotated: canBeRotated,
+                            useAdjustedDimensions: useAdjustedDimensions,
+                            policy: .init(
+                                fixedToleranceCM: max(fixedToleranceCM, 0),
+                                percentageTolerance: max(percentageTolerance, 0),
+                                storageClearanceCM: 0
+                            )
                         )
                     }
                 )
