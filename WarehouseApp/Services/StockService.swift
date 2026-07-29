@@ -41,21 +41,38 @@ enum StockService {
     }
 
     /// Removes stock FIFO across the product's batches.
+    ///
+    /// Runs inside a Firestore transaction: `remaining` is re-read per batch
+    /// before the plan is computed, so two concurrent removals cannot both
+    /// deduct from the same stale snapshot and drive stock negative.
     static func remove(product: Product, quantity: Int) async throws {
-        let batches = try await ProductRepository.fetchBatches(productId: product.id)
-        let draws = try FIFODeduction.plan(batches: batches, quantity: quantity)
-
-        let writes = FirestoreCollections.db.batch()
-        for draw in draws {
-            writes.updateData(
-                ["remaining": FieldValue.increment(Int64(-draw.quantity))],
-                forDocument: FirestoreCollections.batches(productId: product.id).document(draw.batchId)
-            )
+        let batchIds = try await ProductRepository.fetchBatches(productId: product.id).map(\.id)
+        _ = try await FirestoreCollections.db.runTransaction { transaction, errorPointer in
+            do {
+                var batches: [Batch] = []
+                for batchId in batchIds {
+                    let document = try transaction.getDocument(
+                        FirestoreCollections.batches(productId: product.id).document(batchId)
+                    )
+                    guard document.exists else { continue }
+                    batches.append(try document.data(as: Batch.self))
+                }
+                batches.sort { $0.receivedAt < $1.receivedAt }
+                let draws = try FIFODeduction.plan(batches: batches, quantity: quantity)
+                for draw in draws {
+                    transaction.updateData(
+                        ["remaining": FieldValue.increment(Int64(-draw.quantity))],
+                        forDocument: FirestoreCollections.batches(productId: product.id).document(draw.batchId)
+                    )
+                }
+                transaction.updateData(
+                    ["totalStock": FieldValue.increment(Int64(-quantity))],
+                    forDocument: FirestoreCollections.products.document(product.id)
+                )
+            } catch {
+                errorPointer?.pointee = error as NSError
+            }
+            return nil
         }
-        writes.updateData(
-            ["totalStock": FieldValue.increment(Int64(-quantity))],
-            forDocument: FirestoreCollections.products.document(product.id)
-        )
-        try await writes.commit()
     }
 }

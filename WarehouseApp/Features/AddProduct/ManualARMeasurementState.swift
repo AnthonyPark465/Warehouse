@@ -182,6 +182,16 @@ final class ManualARMeasurementState: ObservableObject {
             stage = .topLimit
         case .topLimit:
             guard let boundaryMeasurement, let bottomMarker else { return }
+            do {
+                _ = try ManualMeasurementGeometry.height(
+                    top: marker.position.simd,
+                    bottom: bottomMarker.position.simd,
+                    boundary: boundaryMeasurement
+                )
+            } catch {
+                reject(error.localizedDescription)
+                return
+            }
             let bottomOffset = boundaryMeasurement.plane.signedDistance(
                 to: SIMD3<Double>(bottomMarker.position.simd)
             )
@@ -236,6 +246,7 @@ final class ManualARMeasurementState: ObservableObject {
             stage = .bottomLimit
         case .productScan:
             stopProductScan()
+            clearDetectedProduct()
             topMarker = nil
             stage = .topLimit
         case .review:

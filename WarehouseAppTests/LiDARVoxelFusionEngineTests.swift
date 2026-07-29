@@ -83,6 +83,49 @@ final class LiDARVoxelFusionEngineTests: XCTestCase {
         XCTAssertLessThan(withNearby.dimensionsCM.length, 8)
     }
 
+    func testBackgroundObjectWithSmallGapInsideManualRegionIsNotMergedIntoProduct() throws {
+        // Arrange: manual region generously covers the cylinder, the table, and
+        // a large background box whose near face is only 8 mm from the
+        // cylinder surface — close enough to bridge at the configured
+        // connectivity radius, but physically a separate object.
+        let engine = makePolygonEngine(halfWidth: 0.20, upperOffset: 0.20)
+        let background = boxSurfacePoints(
+            size: SIMD3<Float>(0.16, 0.09, 0.12),
+            centre: SIMD3<Float>(0.118, 0.045, 0),
+            yaw: 0
+        )
+        for frame in repeatedFrames(
+            cylinderPoints() + tablePoints(extent: 0.20) + background
+        ) {
+            engine.integrate(framePoints: frame)
+        }
+
+        // Act
+        let measurement = try XCTUnwrap(engine.measurement())
+
+        // Assert: dimensions describe the cylinder alone, not a merged span.
+        assertCylinderDimensions(measurement.dimensionsCM)
+        XCTAssertLessThan(measurement.dimensionsCM.length, 8)
+    }
+
+    func testManualRegionWithoutGeometryNearSeedProducesNoMeasurement() {
+        // Arrange: the region contains only a large background object more
+        // than the maximum seed distance away from the aim point.
+        let engine = makePolygonEngine(halfWidth: 0.20, upperOffset: 0.20)
+        let background = boxSurfacePoints(
+            size: SIMD3<Float>(0.16, 0.09, 0.12),
+            centre: SIMD3<Float>(0.18, 0.045, 0),
+            yaw: 0
+        )
+        for frame in repeatedFrames(tablePoints(extent: 0.20) + background) {
+            engine.integrate(framePoints: frame)
+        }
+
+        // Act / Assert: measuring the background instead of the product is
+        // worse than measuring nothing.
+        XCTAssertNil(engine.measurement())
+    }
+
     func testTransientOneFrameOutliersDoNotAffectDimensions() throws {
         var frames = repeatedFrames(cylinderPoints() + tablePoints())
         frames[0] += [

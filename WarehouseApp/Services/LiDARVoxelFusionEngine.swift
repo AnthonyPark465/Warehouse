@@ -376,23 +376,23 @@ final class LiDARVoxelFusionEngine {
         }
         guard aboveSupport.count >= configuration.minimumStableVoxelCount else { return nil }
 
-        let components = connectedComponents(in: aboveSupport).filter {
-            $0.count >= configuration.minimumStableVoxelCount
-        }
-        guard let component = components.min(by: {
-            componentDistanceSquared($0, points: aboveSupport, seed: selection.seed)
-                < componentDistanceSquared($1, points: aboveSupport, seed: selection.seed)
-        }) else { return nil }
-        if case .box = selection.region {
-            let distance = sqrt(
-                componentDistanceSquared(
-                    component,
-                    points: aboveSupport,
-                    seed: selection.seed
-                )
+        // Tight connectivity first, so a separate object a few millimetres
+        // away cannot bridge into the product; the configured (wider) radius
+        // remains a fallback for sparse coverage with LiDAR holes.
+        let tightRadius = min(1, configuration.connectivityRadiusInVoxels)
+        var selected = selectComponent(
+            in: aboveSupport,
+            radius: tightRadius,
+            seed: selection.seed
+        )
+        if selected == nil, tightRadius < configuration.connectivityRadiusInVoxels {
+            selected = selectComponent(
+                in: aboveSupport,
+                radius: configuration.connectivityRadiusInVoxels,
+                seed: selection.seed
             )
-            guard distance <= configuration.maximumSeedDistance else { return nil }
         }
+        guard let component = selected else { return nil }
 
         let points = component.compactMap { aboveSupport[$0] }
         guard let bounds = orientedBounds(
@@ -402,9 +402,25 @@ final class LiDARVoxelFusionEngine {
         ) else { return nil }
 
         let centre = bounds.worldCentre
+        // Express review points in the measured box's own basis (X = length,
+        // Y = height, Z = width) so the 3D viewer's axis-aligned box outline
+        // lines up with the cloud even for rotated objects.
+        let lengthAxis = bounds.extentU >= bounds.extentV
+            ? bounds.worldAxisU
+            : bounds.worldAxisV
+        let widthAxis = bounds.extentU >= bounds.extentV
+            ? bounds.worldAxisV
+            : bounds.worldAxisU
+        let heightAxis = selection.region.axisY
         let displayStep = max(1, points.count / 4_000)
-        let displayPoints = points.enumerated().compactMap { index, point in
-            index.isMultiple(of: displayStep) ? point - centre : nil
+        let displayPoints = points.enumerated().compactMap { index, point -> SIMD3<Float>? in
+            guard index.isMultiple(of: displayStep) else { return nil }
+            let offset = point - centre
+            return SIMD3<Float>(
+                simd_dot(offset, lengthAxis),
+                simd_dot(offset, heightAxis),
+                simd_dot(offset, widthAxis)
+            )
         }
         let averageObservations = component.reduce(0.0) { partial, key in
             partial + Double(stable[key]?.frameObservations ?? 0)
@@ -460,12 +476,35 @@ final class LiDARVoxelFusionEngine {
         return percentile(heights, fraction: 0.02)
     }
 
+    /// The qualifying component nearest the user's aim point, or nil when no
+    /// sufficiently large component lies within the maximum seed distance —
+    /// measuring unrelated geometry is worse than measuring nothing.
+    private func selectComponent(
+        in points: [VoxelKey: SIMD3<Float>],
+        radius: Int,
+        seed: SIMD3<Float>
+    ) -> Set<VoxelKey>? {
+        let components = connectedComponents(in: points, radius: radius).filter {
+            $0.count >= configuration.minimumStableVoxelCount
+        }
+        guard let component = components.min(by: {
+            componentDistanceSquared($0, points: points, seed: seed)
+                < componentDistanceSquared($1, points: points, seed: seed)
+        }) else { return nil }
+        let distance = sqrt(
+            componentDistanceSquared(component, points: points, seed: seed)
+        )
+        guard distance <= configuration.maximumSeedDistance else { return nil }
+        return component
+    }
+
     private func connectedComponents(
-        in points: [VoxelKey: SIMD3<Float>]
+        in points: [VoxelKey: SIMD3<Float>],
+        radius radiusInVoxels: Int
     ) -> [Set<VoxelKey>] {
         var unvisited = Set(points.keys)
         var components: [Set<VoxelKey>] = []
-        let radius = Int32(configuration.connectivityRadiusInVoxels)
+        let radius = Int32(radiusInVoxels)
 
         while let seed = unvisited.first {
             unvisited.remove(seed)
@@ -517,7 +556,9 @@ final class LiDARVoxelFusionEngine {
         extentV: Float,
         maximumHeight: Float,
         worldCentre: SIMD3<Float>,
-        corners: [SIMD3<Float>]
+        corners: [SIMD3<Float>],
+        worldAxisU: SIMD3<Float>,
+        worldAxisV: SIMD3<Float>
     )? {
         guard points.count >= 3 else { return nil }
         let local = points.map { region.coordinates(of: $0) }
@@ -593,7 +634,9 @@ final class LiDARVoxelFusionEngine {
             extentV: highV - lowV + configuration.voxelSize,
             maximumHeight: adjustedMaximumHeight,
             worldCentre: worldCentre,
-            corners: corners
+            corners: corners,
+            worldAxisU: region.axisX * axisU.x + region.axisZ * axisU.y,
+            worldAxisV: region.axisX * axisV.x + region.axisZ * axisV.y
         )
     }
 

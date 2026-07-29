@@ -1,5 +1,6 @@
 import ARKit
 import AVFoundation
+import os
 import SceneKit
 import SwiftUI
 
@@ -51,7 +52,9 @@ struct ManualARSessionView: UIViewRepresentable {
         private var stableProductMeasurement: LiDARFusionMeasurement?
         private var fusionFrameCount = 0
         private var rejectedOutsideRegionCount = 0
-        private var productScanIsActive = false
+        // Read on the ARKit delegate thread and the fusion queue, written on
+        // the main actor — must be lock-protected, not a plain Bool.
+        private let productScanIsActive = OSAllocatedUnfairLock(initialState: false)
         private let fusionQueue = DispatchQueue(
             label: "com.tetris.warehouse.manual-region-fusion",
             qos: .userInitiated
@@ -129,7 +132,7 @@ struct ManualARSessionView: UIViewRepresentable {
             }
             if productScanStopRequestID != handledProductScanStopRequestID {
                 handledProductScanStopRequestID = productScanStopRequestID
-                productScanIsActive = false
+                productScanIsActive.withLock { $0 = false }
             }
             if productScanStartRequestID != handledProductScanStartRequestID {
                 handledProductScanStartRequestID = productScanStartRequestID
@@ -146,7 +149,7 @@ struct ManualARSessionView: UIViewRepresentable {
             let trackingState = frame.camera.trackingState
             let shouldIntegrate: Bool
             if case .normal = trackingState {
-                shouldIntegrate = productScanIsActive
+                shouldIntegrate = productScanIsActive.withLock { $0 }
             } else {
                 shouldIntegrate = false
             }
@@ -223,7 +226,7 @@ struct ManualARSessionView: UIViewRepresentable {
                 state.errorMessage = "The scanning region is incomplete. Set the polygon, bottom limit, and top limit again."
                 return
             }
-            productScanIsActive = false
+            productScanIsActive.withLock { $0 = false }
             fusionQueue.sync {
                 fusion.reset()
                 fusion.lockSelection(region: .polygonalPrism(region), seed: seed)
@@ -232,11 +235,11 @@ struct ManualARSessionView: UIViewRepresentable {
                 fusionFrameCount = 0
                 rejectedOutsideRegionCount = 0
             }
-            productScanIsActive = true
+            productScanIsActive.withLock { $0 = true }
         }
 
         private func integrateProductPoints(_ points: [SIMD3<Float>]) {
-            guard productScanIsActive else { return }
+            guard productScanIsActive.withLock({ $0 }) else { return }
             let result = fusion.integrate(framePoints: points)
             fusionFrameCount += 1
             rejectedOutsideRegionCount += result.rejectedOutsideVolumeCount
@@ -328,7 +331,7 @@ struct ManualARSessionView: UIViewRepresentable {
 
         private func publishProductStatus(_ status: ManualProductScanStatus) {
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.productScanIsActive else { return }
+                guard let self, self.productScanIsActive.withLock({ $0 }) else { return }
                 self.state.updateProductScan(status)
             }
         }

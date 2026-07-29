@@ -53,6 +53,9 @@ struct ARObjectScannerView: UIViewRepresentable {
         configuration.frameSemantics.insert(.smoothedSceneDepth)
         configuration.planeDetection = [.horizontal]
         view.session.delegate = context.coordinator
+        // All coordinator state is confined to the fusion queue; delegate
+        // callbacks are delivered there so no state crosses threads.
+        view.session.delegateQueue = context.coordinator.fusionQueue
         view.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         return view
     }
@@ -86,7 +89,7 @@ struct ARObjectScannerView: UIViewRepresentable {
         private var awaitingSelectionLock = false
         private var selectionAnchorEntity: AnchorEntity?
         private var stableMeasurement: LiDARFusionMeasurement?
-        private let fusionQueue = DispatchQueue(
+        let fusionQueue = DispatchQueue(
             label: "com.tetris.warehouse.lidar-fusion",
             qos: .userInitiated
         )
@@ -113,20 +116,21 @@ struct ARObjectScannerView: UIViewRepresentable {
             resetToken newResetToken: Int,
             selectionSettings newSettings: ObjectScanSelectionSettings
         ) {
-            selectionSettings = newSettings
-            if newResetToken != resetToken {
-                resetToken = newResetToken
+            fusionQueue.async { [weak self] in
+                guard let self else { return }
+                selectionSettings = newSettings
+                if newResetToken != resetToken {
+                    resetToken = newResetToken
+                    isScanning = newValue
+                    reset()
+                    return
+                }
+                guard newValue != isScanning else { return }
                 isScanning = newValue
-                reset()
-                return
-            }
-            guard newValue != isScanning else { return }
-            isScanning = newValue
-            if newValue {
-                reset()
-            } else {
-                fusionQueue.async { [weak self] in
-                    self?.finishCapture()
+                if newValue {
+                    reset()
+                } else {
+                    finishCapture()
                 }
             }
         }
@@ -162,9 +166,7 @@ struct ARObjectScannerView: UIViewRepresentable {
                         return
                     }
                     let volume = makeLockedVolume(seed: seed, cameraTransform: frame.camera.transform)
-                    fusionQueue.sync {
-                        fusion.lockSelection(volume: volume, seed: seed)
-                    }
+                    fusion.lockSelection(volume: volume, seed: seed)
                     awaitingSelectionLock = false
                     currentStatus.selectionIsLocked = true
                     currentStatus.message = "Selection locked. Move slowly around the object."
@@ -179,21 +181,19 @@ struct ARObjectScannerView: UIViewRepresentable {
                     return
                 }
 
-                fusionQueue.async { [weak self] in
-                    guard let self, self.isScanning else { return }
-                    let result = self.fusion.integrate(framePoints: points)
-                    self.currentStatus.integratedFrameCount += 1
-                    self.currentStatus.rejectedPointCount += result.rejectedOutsideVolumeCount
-                    self.updateEstimate()
-                    if result.rejectedOutsideVolumeCount > 0 {
-                        self.currentStatus.message =
-                            "\(result.rejectedOutsideVolumeCount) outside-volume samples rejected this frame."
-                    } else {
-                        self.currentStatus.message =
-                            "Fusing selected object… capture the front, sides, top, and back."
-                    }
-                    self.publishStatus()
+                guard isScanning else { return }
+                let result = fusion.integrate(framePoints: points)
+                currentStatus.integratedFrameCount += 1
+                currentStatus.rejectedPointCount += result.rejectedOutsideVolumeCount
+                updateEstimate()
+                if result.rejectedOutsideVolumeCount > 0 {
+                    currentStatus.message =
+                        "\(result.rejectedOutsideVolumeCount) outside-volume samples rejected this frame."
+                } else {
+                    currentStatus.message =
+                        "Fusing selected object… capture the front, sides, top, and back."
                 }
+                publishStatus()
             }
         }
 
@@ -203,14 +203,15 @@ struct ARObjectScannerView: UIViewRepresentable {
             }
         }
 
+        /// Runs on the fusion queue; RealityKit entities are touched on main.
         private func reset() {
-            fusionQueue.sync {
-                fusion.reset()
-                stabilizer.reset()
-                stableMeasurement = nil
+            fusion.reset()
+            stabilizer.reset()
+            stableMeasurement = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.selectionAnchorEntity?.removeFromParent()
+                self?.selectionAnchorEntity = nil
             }
-            selectionAnchorEntity?.removeFromParent()
-            selectionAnchorEntity = nil
             awaitingSelectionLock = isScanning
             currentStatus = ObjectScanLiveStatus(
                 message: isScanning
