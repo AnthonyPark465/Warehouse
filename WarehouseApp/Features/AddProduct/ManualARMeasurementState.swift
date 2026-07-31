@@ -42,6 +42,7 @@ struct CentreRaycastSample: Equatable {
 struct ManualProductScanStatus: Equatable {
     var message = "Ready to scan geometry inside the selected region."
     var integratedFrameCount = 0
+    var capturedPointCount = 0
     var stablePointCount = 0
     var rejectedOutsideRegionCount = 0
     var detectedDimensionsCM: ObjectDimensions?
@@ -52,6 +53,36 @@ struct ManualProductScanStatus: Equatable {
     var dimensionsAreStable = false
     var touchesBoundary = false
     var canFinish = false
+
+    static func finishIsAvailable(
+        dimensions: ObjectDimensions?,
+        stablePointCount: Int,
+        boundingBoxCornersWorld: [SIMD3<Float>],
+        touchesBoundary: Bool
+    ) -> Bool {
+        guard let dimensions,
+              boundingBoxCornersWorld.count == 8,
+              stablePointCount >= ObjectScanValidation.minimumPointCount,
+              !touchesBoundary
+        else { return false }
+        return dimensions.values.allSatisfy {
+            $0.isFinite
+                && $0 >= ObjectScanValidation.minimumDimensionCM
+                && $0 <= ObjectScanValidation.maximumDimensionCM
+        }
+    }
+
+    mutating func updateCaptureProgress(
+        message: String,
+        integratedFrameCount: Int,
+        capturedPointCount: Int,
+        rejectedOutsideRegionCount: Int
+    ) {
+        self.message = message
+        self.integratedFrameCount = integratedFrameCount
+        self.capturedPointCount = capturedPointCount
+        self.rejectedOutsideRegionCount = rejectedOutsideRegionCount
+    }
 }
 
 @MainActor
@@ -192,13 +223,9 @@ final class ManualARMeasurementState: ObservableObject {
                 reject(error.localizedDescription)
                 return
             }
-            let bottomOffset = boundaryMeasurement.plane.signedDistance(
-                to: SIMD3<Double>(bottomMarker.position.simd)
-            )
-            let topOffset = boundaryMeasurement.plane.signedDistance(
-                to: SIMD3<Double>(marker.position.simd)
-            )
-            guard topOffset - bottomOffset >= ManualMeasurementGeometry.minimumHeightMetres else {
+            guard marker.position.y - bottomMarker.position.y
+                    >= ManualMeasurementGeometry.minimumHeightMetres
+            else {
                 reject("The top scan limit must be above the bottom limit. Aim higher and try again.")
                 return
             }
@@ -301,20 +328,27 @@ final class ManualARMeasurementState: ObservableObject {
             return nil
         }
         let plane = boundaryMeasurement.plane
-        let bottomOffset = Float(
-            plane.signedDistance(to: SIMD3<Double>(bottomMarker.position.simd))
-        )
-        let topOffset = Float(
-            plane.signedDistance(to: SIMD3<Double>(topMarker.position.simd))
-        )
-        guard topOffset - bottomOffset >= Float(ManualMeasurementGeometry.minimumHeightMetres)
-        else { return nil }
+        guard (try? ManualMeasurementGeometry.height(
+            top: topMarker.position.simd,
+            bottom: bottomMarker.position.simd,
+            boundary: boundaryMeasurement
+        )) != nil else { return nil }
+
+        // ARKit's gravity-aligned world coordinate system uses +Y as up. Keep
+        // the fitted plane for footprint measurement, but make the scan crop
+        // and voxel engine's height axis independent of floor-plane tilt.
+        let origin = SIMD3<Float>(plane.origin)
+        let bottomOffset = bottomMarker.position.simd.y - origin.y
+        let topOffset = topMarker.position.simd.y - origin.y
+        let horizontalBoundary = boundaryMarkers.map {
+            SIMD2<Float>($0.position.simd.x - origin.x, $0.position.simd.z - origin.z)
+        }
         return LiDARPolygonalPrism(
-            origin: SIMD3<Float>(plane.origin),
-            axisU: SIMD3<Float>(plane.axisU),
-            axisV: SIMD3<Float>(plane.axisV),
-            normal: SIMD3<Float>(plane.normal),
-            polygon: boundaryMeasurement.projectedBoundary.map { SIMD2<Float>($0) },
+            origin: origin,
+            axisU: SIMD3<Float>(1, 0, 0),
+            axisV: SIMD3<Float>(0, 0, 1),
+            normal: SIMD3<Float>(0, 1, 0),
+            polygon: horizontalBoundary,
             lowerOffset: bottomOffset,
             upperOffset: topOffset
         )

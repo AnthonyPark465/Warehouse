@@ -50,6 +50,7 @@ struct ManualARSessionView: UIViewRepresentable {
         private var fusion = LiDARVoxelFusionEngine()
         private var stabilizer = LiDARMeasurementStabilizer()
         private var stableProductMeasurement: LiDARFusionMeasurement?
+        private var latestProductStatus = ManualProductScanStatus()
         private var fusionFrameCount = 0
         private var rejectedOutsideRegionCount = 0
         // Read on the ARKit delegate thread and the fusion queue, written on
@@ -122,9 +123,13 @@ struct ManualARSessionView: UIViewRepresentable {
         ) {
             if placementRequestID != handledPlacementRequestID {
                 handledPlacementRequestID = placementRequestID
-                // Place performs a fresh raycast; it never promotes a stale
-                // preview sample into a permanent marker.
-                state.place(raycastAtCentre())
+                // Defer published state changes until after SwiftUI finishes
+                // this representable update. The placement still performs a
+                // fresh surface query rather than promoting the preview.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.state.place(self.raycastAtCentre())
+                }
             }
             if renderRevision != renderedRevision {
                 renderedRevision = renderRevision
@@ -136,7 +141,9 @@ struct ManualARSessionView: UIViewRepresentable {
             }
             if productScanStartRequestID != handledProductScanStartRequestID {
                 handledProductScanStartRequestID = productScanStartRequestID
-                startProductFusion()
+                DispatchQueue.main.async { [weak self] in
+                    self?.startProductFusion()
+                }
             }
         }
 
@@ -232,6 +239,7 @@ struct ManualARSessionView: UIViewRepresentable {
                 fusion.lockSelection(region: .polygonalPrism(region), seed: seed)
                 stabilizer.reset()
                 stableProductMeasurement = nil
+                latestProductStatus = ManualProductScanStatus()
                 fusionFrameCount = 0
                 rejectedOutsideRegionCount = 0
             }
@@ -247,11 +255,14 @@ struct ManualARSessionView: UIViewRepresentable {
             guard fusionFrameCount.isMultiple(of: 4),
                   let measurement = fusion.measurement()
             else {
-                publishProductStatus(ManualProductScanStatus(
+                var progress = latestProductStatus
+                progress.updateCaptureProgress(
                     message: "Collecting product surfaces inside the scanning region…",
                     integratedFrameCount: fusionFrameCount,
+                    capturedPointCount: fusion.voxelCount,
                     rejectedOutsideRegionCount: rejectedOutsideRegionCount
-                ))
+                )
+                publishProductStatus(progress)
                 return
             }
 
@@ -282,15 +293,20 @@ struct ManualARSessionView: UIViewRepresentable {
                 measurement: displayMeasurement,
                 dimensionsAreStable: isStable
             )
-            let canFinish = isStable
-                && !displayMeasurement.touchesRegionBoundary
-                && fusionFrameCount >= fusionConfiguration.minimumFusedFrameCount
-                && displayMeasurement.fusedVoxelCount
-                    >= fusionConfiguration.minimumStableVoxelCount
-                && confidence >= ObjectScanValidation.minimumConfidence
+            // A complete orange product box means fusion has already retained
+            // enough repeated, connected surface points to form valid bounds.
+            // Let the user finish at that point; stability still improves the
+            // result but is no longer required to enable the button.
+            let canFinish = ManualProductScanStatus.finishIsAvailable(
+                dimensions: dimensions,
+                stablePointCount: displayMeasurement.fusedVoxelCount,
+                boundingBoxCornersWorld: displayMeasurement.boundingBoxCornersWorld,
+                touchesBoundary: displayMeasurement.touchesRegionBoundary
+            )
             publishProductStatus(ManualProductScanStatus(
                 message: message,
                 integratedFrameCount: fusionFrameCount,
+                capturedPointCount: fusion.voxelCount,
                 stablePointCount: displayMeasurement.fusedVoxelCount,
                 rejectedOutsideRegionCount: rejectedOutsideRegionCount,
                 detectedDimensionsCM: dimensions,
@@ -330,6 +346,7 @@ struct ManualARSessionView: UIViewRepresentable {
         }
 
         private func publishProductStatus(_ status: ManualProductScanStatus) {
+            latestProductStatus = status
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.productScanIsActive.withLock({ $0 }) else { return }
                 self.state.updateProductScan(status)
@@ -338,6 +355,7 @@ struct ManualARSessionView: UIViewRepresentable {
 
         private func makeConfiguration() -> ARWorldTrackingConfiguration {
             let configuration = ARWorldTrackingConfiguration()
+            configuration.worldAlignment = .gravity
             configuration.planeDetection = [.horizontal, .vertical]
             if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
                 configuration.frameSemantics.insert(.sceneDepth)
@@ -438,6 +456,35 @@ struct ManualARSessionView: UIViewRepresentable {
             else { return nil }
             let centre = CGPoint(x: sceneView.bounds.midX, y: sceneView.bounds.midY)
 
+            if state.stage == .topLimit {
+                // Plane raycasts do not understand visual occlusion and an
+                // infinite floor plane can therefore be returned through the
+                // product. On LiDAR devices, use the nearest foreground depth
+                // sample at the reticle and fail closed if it is not above the
+                // selected bottom. Do not fall back through the object.
+                if let frame = sceneView.session.currentFrame,
+                   frame.smoothedSceneDepth != nil || frame.sceneDepth != nil {
+                    guard let sample = depthSampleAtCentre(frame: frame),
+                          isUsableTopSample(sample)
+                    else { return nil }
+                    return sample
+                }
+
+                // Non-LiDAR fallback: use only finite/estimated surfaces.
+                // Infinite planes are deliberately excluded for the top marker.
+                for target in [
+                    ARRaycastQuery.Target.estimatedPlane,
+                    .existingPlaneGeometry
+                ] {
+                    if let result = raycast(from: centre, target: target, in: sceneView),
+                       let sample = sample(from: result, target: target, in: sceneView),
+                       isUsableTopSample(sample) {
+                        return sample
+                    }
+                }
+                return nil
+            }
+
             let existing = raycast(
                 from: centre,
                 target: .existingPlaneGeometry,
@@ -451,6 +498,19 @@ struct ManualARSessionView: UIViewRepresentable {
                 : nil
             let result = existing ?? infinite ?? estimated
             guard let result else { return nil }
+
+            let target: ARRaycastQuery.Target = existing != nil
+                ? .existingPlaneGeometry
+                : (infinite != nil ? .existingPlaneInfinite : .estimatedPlane)
+            return sample(from: result, target: target, in: sceneView)
+        }
+
+        @MainActor
+        private func sample(
+            from result: ARRaycastResult,
+            target: ARRaycastQuery.Target,
+            in sceneView: ARSCNView
+        ) -> CentreRaycastSample? {
 
             let position = SIMD3<Float>(
                 result.worldTransform.columns.3.x,
@@ -478,16 +538,16 @@ struct ManualARSessionView: UIViewRepresentable {
                 alignment = "estimated surface"
             }
             let raycastType: String
-            if existing != nil {
+            if target == .existingPlaneGeometry {
                 raycastType = "existingPlaneGeometry"
-            } else if infinite != nil {
+            } else if target == .existingPlaneInfinite {
                 raycastType = "existingPlaneInfinite"
             } else {
                 raycastType = "estimatedPlane"
             }
             let distance = Double(simd_distance(cameraPosition, position))
             let distanceScore = max(0.4, 1 - abs(distance - 0.6) / 2)
-            let surfaceScore = existing == nil ? 0.70 : 0.88
+            let surfaceScore = target == .existingPlaneGeometry ? 0.88 : 0.70
             return CentreRaycastSample(
                 position: position,
                 raycastType: raycastType,
@@ -495,6 +555,97 @@ struct ManualARSessionView: UIViewRepresentable {
                 confidence: min(surfaceScore * distanceScore, 0.95),
                 cameraDistanceMetres: distance
             )
+        }
+
+        @MainActor
+        private func depthSampleAtCentre(frame: ARFrame) -> CentreRaycastSample? {
+            guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
+                return nil
+            }
+            let depthMap = depthData.depthMap
+            let confidenceMap = depthData.confidenceMap
+            CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+            if let confidenceMap {
+                CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+            }
+            defer {
+                CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+                if let confidenceMap {
+                    CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
+                }
+            }
+            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+            let width = CVPixelBufferGetWidth(depthMap)
+            let height = CVPixelBufferGetHeight(depthMap)
+            let stride = CVPixelBufferGetBytesPerRow(depthMap)
+                / MemoryLayout<Float32>.size
+            let depths = depthBase.assumingMemoryBound(to: Float32.self)
+            let confidence = confidenceMap
+                .flatMap(CVPixelBufferGetBaseAddress)?
+                .assumingMemoryBound(to: UInt8.self)
+            let confidenceStride = confidenceMap.map(CVPixelBufferGetBytesPerRow) ?? 0
+            let centreX = width / 2
+            let centreY = height / 2
+            let minimumConfidence = UInt8(ARConfidenceLevel.medium.rawValue)
+            var candidates: [(depth: Float, x: Int, y: Int, confidence: UInt8)] = []
+            for y in max(0, centreY - 2)...min(height - 1, centreY + 2) {
+                for x in max(0, centreX - 2)...min(width - 1, centreX + 2) {
+                    let depth = depths[y * stride + x]
+                    let level = confidence.map { $0[y * confidenceStride + x] }
+                        ?? minimumConfidence
+                    guard depth.isFinite, depth >= 0.10, depth <= 5,
+                          level >= minimumConfidence
+                    else { continue }
+                    candidates.append((depth, x, y, level))
+                }
+            }
+            guard !candidates.isEmpty else { return nil }
+            candidates.sort { $0.depth < $1.depth }
+            // Prefer the foreground quartile so an edge reticle does not pick
+            // the floor/background visible beside the product.
+            let candidate = candidates[candidates.count / 4]
+            let position = worldPoint(
+                x: candidate.x,
+                y: candidate.y,
+                depth: candidate.depth,
+                depthWidth: width,
+                depthHeight: height,
+                frame: frame
+            )
+            guard position.x.isFinite, position.y.isFinite, position.z.isFinite else {
+                return nil
+            }
+            let cameraPosition = SIMD3<Float>(
+                frame.camera.transform.columns.3.x,
+                frame.camera.transform.columns.3.y,
+                frame.camera.transform.columns.3.z
+            )
+            let distance = Double(simd_distance(cameraPosition, position))
+            let surfaceScore = candidate.confidence
+                    == UInt8(ARConfidenceLevel.high.rawValue)
+                ? 0.92
+                : 0.82
+            return CentreRaycastSample(
+                position: position,
+                raycastType: "sceneDepth",
+                surfaceAlignment: "visible depth surface",
+                confidence: surfaceScore,
+                cameraDistanceMetres: distance
+            )
+        }
+
+        @MainActor
+        private func isUsableTopSample(_ sample: CentreRaycastSample) -> Bool {
+            guard let bottom = state.bottomMarker,
+                  let boundary = state.boundaryMeasurement,
+                  sample.position.y - bottom.position.simd.y
+                    >= Float(ManualMeasurementGeometry.minimumHeightMetres)
+            else { return false }
+            return (try? ManualMeasurementGeometry.height(
+                top: sample.position,
+                bottom: bottom.position.simd,
+                boundary: boundary
+            )) != nil
         }
 
         @MainActor

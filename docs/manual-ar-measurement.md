@@ -10,7 +10,7 @@ receive dimensions from three sources:
 - Existing automatic LiDAR/Object Capture scanning
 - Manual dimension entry
 
-`ManualARSessionView` owns the AR session, centre raycasts, preview marker,
+`ManualARSessionView` owns the gravity-aligned AR session, centre raycasts, preview marker,
 real-world `ARAnchor`s, and lightweight SceneKit rendering.
 `ManualARMeasurementState` owns stages and user actions.
 `ManualMeasurementGeometry` owns plane and polygon validation.
@@ -28,6 +28,17 @@ bottom and top markers defines a polygonal-prism region of interest. Those
 coordinates only crop incoming AR points; the polygon width, length, and
 top-to-bottom distance are never reported as the product dimensions.
 
+ARKit raycast translations are retained in their shared session world space.
+Height is the absolute projection of the top-to-bottom world vector onto the
+normalised gravity-aligned world-up axis (`abs(dot(top - bottom, up))`), which
+is `abs(top.y - bottom.y)` for this session's explicit `.gravity` alignment.
+Horizontal marker offset and interface orientation therefore do not add to height.
+For the top marker, LiDAR scene depth is sampled at the centre reticle so the
+nearest visible product surface wins over the floor behind it. Non-LiDAR devices
+use finite/estimated surfaces and never use an infinite plane for the top marker.
+If no candidate is above the bottom marker, placement
+is disabled rather than reporting the background or floor as product height.
+
 During the product scan, registered scene-depth samples (or lower-density AR
 feature points without LiDAR) are filtered to the prism before fusion. Repeated
 voxels are retained, the support plane is removed, connected product geometry
@@ -35,6 +46,14 @@ is isolated, and a robust oriented bounding box supplies the product length,
 width, and height. The UI renders the cyan region separately from the green
 detected points and orange calculated product box. A product reaching a side or
 top limit is treated as possible clipping and cannot be finished.
+
+Live capture progress reports accumulated in-region voxels on every integrated
+frame. Measurement is recalculated every fourth frame, while the most recent
+detected points, dimensions, and orange box remain displayed between calculations.
+The Finish Product Scan button becomes available as soon as a complete orange
+product box has valid dimensions and enough retained points. The user may finish
+then or continue scanning for a stable estimate. A box touching the scan-region
+boundary remains ineligible because its dimensions may be clipped.
 
 ARKit coordinates remain in metres. Product records remain in centimetres for
 compatibility with the existing model.

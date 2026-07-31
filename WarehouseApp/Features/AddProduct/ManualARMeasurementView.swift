@@ -202,7 +202,7 @@ struct ManualARMeasurementView: View {
                 )
                 Spacer()
                 Label(
-                    "\(state.productScanStatus.stablePointCount) points",
+                    "\(state.productScanStatus.capturedPointCount) captured",
                     systemImage: "point.3.connected.trianglepath.dotted"
                 )
             }
@@ -220,6 +220,15 @@ struct ManualARMeasurementView: View {
                 )
                 .font(.caption)
                 .foregroundStyle(.orange)
+            } else if state.productScanStatus.canFinish {
+                Label(
+                    state.productScanStatus.dimensionsAreStable
+                        ? "Scan is stable. Finish Product Scan is ready."
+                        : "Orange product box detected. You can finish now, or keep scanning for a more stable result.",
+                    systemImage: "checkmark.circle.fill"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.green)
             }
             if state.productScanIsActive {
                 Button("Finish Product Scan") { state.finishProductScan() }

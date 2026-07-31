@@ -8,6 +8,7 @@ enum ManualMeasurementGeometryError: LocalizedError, Equatable {
     case selfIntersection
     case notCoplanar(maximumDeviationCM: Double)
     case invalidHeight
+    case invalidWorldUp
     case topBelowBase
     case pointOutsideFootprint(name: String)
 
@@ -25,6 +26,8 @@ enum ManualMeasurementGeometryError: LocalizedError, Equatable {
             "Boundary points are not on the same base level (maximum deviation \(deviation.formatted(.number.precision(.fractionLength(1)))) cm)."
         case .invalidHeight:
             "The measured height is below 1 mm or greater than 25 m. Replace the top point."
+        case .invalidWorldUp:
+            "The AR session did not provide a valid gravity-aligned up direction. Restart measurement."
         case .topBelowBase:
             "The top point is below the fitted base plane. Replace it from above the product."
         case .pointOutsideFootprint(let name):
@@ -72,6 +75,8 @@ enum ManualMeasurementGeometry {
     static let maximumPlaneDeviationMetres = 0.02
     static let minimumHeightMetres = 0.001
     static let maximumHeightMetres = 25.0
+    /// ARKit world tracking with `.gravity` alignment uses +Y as world up.
+    static let arKitWorldUp = SIMD3<Double>(0, 1, 0)
 
     static func measureBoundary(_ worldPoints: [SIMD3<Float>]) throws -> BoundaryMeasurement {
         guard worldPoints.count >= 3 else {
@@ -134,30 +139,39 @@ enum ManualMeasurementGeometry {
     static func height(
         top: SIMD3<Float>,
         bottom: SIMD3<Float>,
-        boundary: BoundaryMeasurement
+        boundary: BoundaryMeasurement,
+        worldUp: SIMD3<Double> = arKitWorldUp
     ) throws -> Double {
         let top3 = SIMD3<Double>(top)
         let bottom3 = SIMD3<Double>(bottom)
-        let signedTop = boundary.plane.signedDistance(to: top3)
-        let signedBottom = boundary.plane.signedDistance(to: bottom3)
+        let worldUpLength = simd_length(worldUp)
+        guard worldUpLength.isFinite, worldUpLength > 0 else {
+            throw ManualMeasurementGeometryError.invalidWorldUp
+        }
+        let normalizedWorldUp = worldUp / worldUpLength
+        let signedHeight = simd_dot(top3 - bottom3, normalizedWorldUp)
+        let measuredHeight = abs(signedHeight)
+        let lowerPoint = signedHeight >= 0 ? bottom3 : top3
+        let upperPoint = signedHeight >= 0 ? top3 : bottom3
 
-        guard signedTop >= -0.005 else {
+        guard boundary.plane.signedDistance(to: upperPoint) >= -0.005 else {
             throw ManualMeasurementGeometryError.topBelowBase
         }
-        let measuredHeight = abs(signedTop)
         guard measuredHeight >= minimumHeightMetres,
               measuredHeight <= maximumHeightMetres
         else {
             throw ManualMeasurementGeometryError.invalidHeight
         }
-        guard abs(signedBottom) <= maximumPlaneDeviationMetres * 1.5 else {
+        guard abs(boundary.plane.signedDistance(to: lowerPoint))
+                <= maximumPlaneDeviationMetres * 1.5
+        else {
             throw ManualMeasurementGeometryError.pointOutsideFootprint(name: "bottom")
         }
         let margin = max(boundary.footprint.lengthMetres, boundary.footprint.widthMetres) * 0.25
-        guard point(boundary.plane.project(bottom3), near: boundary.projectedBoundary, margin: margin) else {
+        guard point(boundary.plane.project(lowerPoint), near: boundary.projectedBoundary, margin: margin) else {
             throw ManualMeasurementGeometryError.pointOutsideFootprint(name: "bottom")
         }
-        guard point(boundary.plane.project(top3), near: boundary.projectedBoundary, margin: margin) else {
+        guard point(boundary.plane.project(upperPoint), near: boundary.projectedBoundary, margin: margin) else {
             throw ManualMeasurementGeometryError.pointOutsideFootprint(name: "top")
         }
         return measuredHeight
