@@ -16,6 +16,10 @@ struct PlacementView: View {
     @State private var assumedHeight = "40"
     @State private var mappedPointCount = 0
     @State private var lidarResetToken = 0
+    @State private var shelfPlacementRequestID = 0
+    @State private var shelfUndoRequestID = 0
+    @State private var shelfCanPlacePoint = false
+    @State private var shelfMeasurementStage: ShelfMeasurementStage = .boundary
     @State private var selectedRecommendation: PlacementRecommendation?
     @State private var verification: PlacementVerification?
     @State private var showVerificationScanner = false
@@ -38,6 +42,10 @@ struct PlacementView: View {
             }
             .fullScreenCover(isPresented: $showSurfaceScanner) {
                 surfaceScanner
+            }
+            .onChange(of: measuredSurfaces) { _, surfaces in
+                guard let measuredHeight = surfaces.first?.measuredFreeHeightCM else { return }
+                assumedHeight = String((measuredHeight * 10).rounded() / 10)
             }
         }
     }
@@ -87,22 +95,27 @@ struct PlacementView: View {
             }
             if let surface = measuredSurfaces.first {
                 LabeledContent(
-                    "Selected surface",
+                    "Shelf footprint (X × Z)",
                     value: "\(surface.widthCM.formatted(.number.precision(.fractionLength(0)))) × \(surface.depthCM.formatted(.number.precision(.fractionLength(0)))) cm"
                 )
                 if let measuredHeight = surface.measuredFreeHeightCM {
                     LabeledContent(
-                        "Clear height",
+                        "Detected clear height (Y)",
                         value: "\(measuredHeight.formatted(.number.precision(.fractionLength(0)))) cm · measured"
                     )
-                } else {
-                    dimensionField("Clear height", text: $assumedHeight)
+                }
+                dimensionField("Usable clear height", text: $assumedHeight)
+                if surface.measuredFreeHeightCM == nil {
                     Text("No shelf was detected above the scanned surface — enter the clear height manually.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("The LiDAR result is filled in automatically. You can replace it with a verified shelf clearance.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            Text("LiDAR measures the shelf footprint and the clear height above it. The weight rating still comes from the location master data.")
+            Text("LiDAR measures X and Z across the shelf surface and Y vertically to the shelf above. All displayed and entered dimensions are centimetres. The weight rating still comes from the location master data.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -159,12 +172,16 @@ struct PlacementView: View {
 
     private var surfaceScanner: some View {
         NavigationStack {
-            ZStack(alignment: .bottom) {
+            ZStack {
                 if LiDARSurfaceScannerView.isSupported {
                     LiDARSurfaceScannerView(
                         measuredSurfaces: $measuredSurfaces,
                         mappedPointCount: $mappedPointCount,
-                        resetToken: lidarResetToken
+                        canPlacePoint: $shelfCanPlacePoint,
+                        measurementStage: $shelfMeasurementStage,
+                        resetToken: lidarResetToken,
+                        placementRequestID: shelfPlacementRequestID,
+                        undoRequestID: shelfUndoRequestID
                     )
                         .ignoresSafeArea()
                 } else {
@@ -174,46 +191,104 @@ struct PlacementView: View {
                         description: Text("Use an iPhone Pro model with a LiDAR scanner.")
                     )
                 }
-                VStack(spacing: 5) {
-                    if let surface = measuredSurfaces.first {
-                        Label("\(mappedPointCount)-point area mapped", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.white)
-                        Text(surfaceSummary(for: surface))
-                            .font(.headline.monospacedDigit())
-                        if surface.measuredFreeHeightCM == nil {
-                            Text("No shelf detected above — enter the clear height after closing.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                VStack {
+                    Spacer()
+                    VStack(spacing: 8) {
+                        if let surface = measuredSurfaces.first {
+                            Label("\(mappedPointCount)-point area mapped", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.white)
+                            Text(surfaceSummary(for: surface))
+                                .font(.headline.monospacedDigit())
+                        } else {
+                            Label(
+                                mappedPointCount == 0
+                                    ? "Aim at the first shelf corner"
+                                    : (mappedPointCount < 3
+                                        ? "Add at least \(3 - mappedPointCount) more point\(mappedPointCount == 2 ? "" : "s")"
+                                        : "Boundary is invalid — reset and mark the shelf corners in order"),
+                                systemImage: "smallcircle.filled.circle"
+                            )
                         }
-                    } else {
-                        Label(
-                            mappedPointCount == 0
-                                ? "Tap the shelf to place the first point"
-                                : "Add at least \(3 - mappedPointCount) more point\(mappedPointCount == 2 ? "" : "s")",
-                            systemImage: "smallcircle.filled.circle"
-                        )
-                    }
-                    Text("Tap around one shelf surface. White lines connect the points and fill the selected area.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if mappedPointCount > 0 {
-                        Button("Reset points", role: .destructive) {
-                            lidarResetToken += 1
+                        Text(shelfScannerInstruction)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if shelfMeasurementStage != .complete {
+                            Button {
+                                shelfPlacementRequestID += 1
+                            } label: {
+                                Label(shelfPlacementButtonTitle, systemImage: "plus.circle.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!shelfCanPlacePoint)
                         }
-                        .buttonStyle(.bordered)
+                        if shelfMeasurementStage == .boundary,
+                           mappedPointCount >= 3,
+                           !measuredSurfaces.isEmpty {
+                            Button("Finish Boundary") {
+                                shelfMeasurementStage = .bottom
+                            }
+                            .buttonStyle(.borderedProminent)
+                        } else if shelfMeasurementStage == .complete {
+                            Button("Measure Height Again") {
+                                shelfMeasurementStage = .bottom
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        if mappedPointCount > 0 || shelfMeasurementStage != .boundary {
+                            Button("Undo Last Marker") {
+                                shelfUndoRequestID += 1
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        if mappedPointCount > 0 {
+                            Button("Reset points", role: .destructive) {
+                                lidarResetToken += 1
+                            }
+                            .buttonStyle(.bordered)
+                        }
                     }
+                    .multilineTextAlignment(.center)
+                    .font(.footnote.weight(.medium))
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    .padding()
                 }
-                .multilineTextAlignment(.center)
-                .font(.footnote.weight(.medium))
-                .padding()
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-                .padding()
             }
             .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showSurfaceScanner = false }
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Use Scan") { showSurfaceScanner = false }
+                    Button("Finish Scan") { showSurfaceScanner = false }
+                        .disabled(
+                            shelfMeasurementStage != .complete
+                                || measuredSurfaces.first?.measuredFreeHeightCM == nil
+                        )
                 }
             }
+        }
+    }
+
+    private var shelfScannerInstruction: String {
+        switch shelfMeasurementStage {
+        case .boundary:
+            "Aim around the shelf surface and place points in order. Finish the boundary when the cyan outline covers the shelf."
+        case .bottom:
+            "Aim the centre target at the bottom shelf level, then press Set Bottom."
+        case .top:
+            "Aim at the visible underside of the shelf above, then press Set Top. Horizontal offset will not increase the height."
+        case .complete:
+            "Height is the world-up distance between the green bottom marker and pink top marker. Finish Scan is now available, or measure again."
+        }
+    }
+
+    private var shelfPlacementButtonTitle: String {
+        switch shelfMeasurementStage {
+        case .boundary: "Place Point"
+        case .bottom: "Set Bottom"
+        case .top: "Set Top"
+        case .complete: "Height Complete"
         }
     }
 
@@ -278,7 +353,7 @@ struct PlacementView: View {
             locations.append(StorageLocation(
                 id: "LIDAR-01", label: "Current LiDAR scan", barcode: "LOC-LIDAR-01",
                 freeWidthCM: surface.widthCM,
-                freeHeightCM: surface.measuredFreeHeightCM ?? (Double(assumedHeight) ?? 40),
+                freeHeightCM: Double(assumedHeight) ?? surface.measuredFreeHeightCM ?? 40,
                 freeDepthCM: surface.depthCM,
                 remainingWeightKG: 25, walkingDistanceM: 10, orderAffinity: 0.5, source: .lidarScan
             ))
