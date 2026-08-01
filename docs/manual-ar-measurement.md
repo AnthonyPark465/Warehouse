@@ -45,7 +45,8 @@ voxels are retained, the support plane is removed, connected product geometry
 is isolated, and a robust oriented bounding box supplies the product length,
 width, and height. The UI renders the cyan region separately from the green
 detected points and orange calculated product box. A product reaching a side or
-top limit is treated as possible clipping and cannot be finished.
+top limit is treated as possible clipping and shows a warning. A complete orange
+product box can still be finished so the user is not trapped in capture.
 
 Live capture progress reports accumulated in-region voxels on every integrated
 frame. Measurement is recalculated every fourth frame, while the most recent
@@ -53,7 +54,7 @@ detected points, dimensions, and orange box remain displayed between calculation
 The Finish Product Scan button becomes available as soon as a complete orange
 product box has valid dimensions and enough retained points. The user may finish
 then or continue scanning for a stable estimate. A box touching the scan-region
-boundary remains ineligible because its dimensions may be clipped.
+boundary remains eligible but displays a warning because it may be clipped.
 
 ARKit coordinates remain in metres. Product records remain in centimetres for
 compatibility with the existing model.

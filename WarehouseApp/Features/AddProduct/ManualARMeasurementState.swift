@@ -57,13 +57,11 @@ struct ManualProductScanStatus: Equatable {
     static func finishIsAvailable(
         dimensions: ObjectDimensions?,
         stablePointCount: Int,
-        boundingBoxCornersWorld: [SIMD3<Float>],
-        touchesBoundary: Bool
+        boundingBoxCornersWorld: [SIMD3<Float>]
     ) -> Bool {
         guard let dimensions,
               boundingBoxCornersWorld.count == 8,
-              stablePointCount >= ObjectScanValidation.minimumPointCount,
-              !touchesBoundary
+              stablePointCount >= ObjectScanValidation.minimumPointCount
         else { return false }
         return dimensions.values.allSatisfy {
             $0.isFinite
@@ -384,7 +382,12 @@ final class ManualARMeasurementState: ObservableObject {
     }
 
     func finishProductScan() {
-        guard productScanStatus.canFinish else {
+        let canFinishNow = ManualProductScanStatus.finishIsAvailable(
+            dimensions: productScanStatus.detectedDimensionsCM,
+            stablePointCount: productScanStatus.stablePointCount,
+            boundingBoxCornersWorld: productScanStatus.boundingBoxCornersWorld
+        )
+        guard canFinishNow else {
             reject(scanCompletionProblem)
             return
         }

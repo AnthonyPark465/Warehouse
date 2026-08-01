@@ -562,32 +562,10 @@ final class LiDARVoxelFusionEngine {
     )? {
         guard points.count >= 3 else { return nil }
         let local = points.map { region.coordinates(of: $0) }
-        let meanX = local.reduce(0) { $0 + $1.x } / Float(local.count)
-        let meanZ = local.reduce(0) { $0 + $1.z } / Float(local.count)
-
-        var xx: Float = 0
-        var zz: Float = 0
-        var xz: Float = 0
-        for point in local {
-            let x = point.x - meanX
-            let z = point.z - meanZ
-            xx += x * x
-            zz += z * z
-            xz += x * z
-        }
-
-        let angle = 0.5 * atan2(2 * xz, xx - zz)
-        let axisU = SIMD2<Float>(cos(angle), sin(angle))
-        let axisV = SIMD2<Float>(-sin(angle), cos(angle))
-        let horizontal = local.map { SIMD2<Float>($0.x - meanX, $0.z - meanZ) }
-        let u = horizontal.map { simd_dot($0, axisU) }
-        let v = horizontal.map { simd_dot($0, axisV) }
+        let horizontal = local.map { SIMD2<Float>($0.x, $0.z) }
         let heights = local.map(\.y)
 
-        guard let lowU = percentile(u, fraction: configuration.lowerPercentile),
-              let highU = percentile(u, fraction: configuration.upperPercentile),
-              let lowV = percentile(v, fraction: configuration.lowerPercentile),
-              let highV = percentile(v, fraction: configuration.upperPercentile),
+        guard let horizontalBounds = minimumAreaHorizontalBounds(for: horizontal),
               let maximumHeight = percentile(
                 heights,
                 fraction: configuration.upperPercentile
@@ -595,9 +573,16 @@ final class LiDARVoxelFusionEngine {
               maximumHeight > supportCoordinate
         else { return nil }
 
+        let axisU = horizontalBounds.axisU
+        let axisV = horizontalBounds.axisV
+        let lowU = horizontalBounds.lowU
+        let highU = horizontalBounds.highU
+        let lowV = horizontalBounds.lowV
+        let highV = horizontalBounds.highV
+
         let localCentre = axisU * ((lowU + highU) / 2)
             + axisV * ((lowV + highV) / 2)
-        let horizontalCentre = SIMD2<Float>(meanX, meanZ) + localCentre
+        let horizontalCentre = localCentre
         let verticalCentre = (supportCoordinate + maximumHeight) / 2
         let worldCentre = worldPoint(
             horizontal: horizontalCentre,
@@ -637,6 +622,93 @@ final class LiDARVoxelFusionEngine {
             corners: corners,
             worldAxisU: region.axisX * axisU.x + region.axisZ * axisU.y,
             worldAxisV: region.axisX * axisV.x + region.axisZ * axisV.y
+        )
+    }
+
+    /// Finds the yaw whose robust 2D bounds have the smallest area. PCA uses
+    /// point density as a weight, so an incompletely scanned face can pull its
+    /// principal axis far away from the product's actual edges.
+    private func minimumAreaHorizontalBounds(
+        for points: [SIMD2<Float>]
+    ) -> (
+        axisU: SIMD2<Float>,
+        axisV: SIMD2<Float>,
+        lowU: Float,
+        highU: Float,
+        lowV: Float,
+        highV: Float
+    )? {
+        guard points.count >= 3 else { return nil }
+
+        typealias Candidate = (
+            angle: Float,
+            area: Float,
+            lowU: Float,
+            highU: Float,
+            lowV: Float,
+            highV: Float
+        )
+
+        func candidate(at angle: Float, using samples: [SIMD2<Float>]) -> Candidate? {
+            let axisU = SIMD2<Float>(cos(angle), sin(angle))
+            let axisV = SIMD2<Float>(-sin(angle), cos(angle))
+            let u = samples.map { simd_dot($0, axisU) }
+            let v = samples.map { simd_dot($0, axisV) }
+            guard let lowU = percentile(u, fraction: configuration.lowerPercentile),
+                  let highU = percentile(u, fraction: configuration.upperPercentile),
+                  let lowV = percentile(v, fraction: configuration.lowerPercentile),
+                  let highV = percentile(v, fraction: configuration.upperPercentile)
+            else { return nil }
+            let area = (highU - lowU) * (highV - lowV)
+            guard area.isFinite, area > 0 else { return nil }
+            return (angle, area, lowU, highU, lowV, highV)
+        }
+
+        // Searching every angle does not require every fused voxel. Use an
+        // evenly distributed subset for yaw, then recompute the final robust
+        // bounds from the complete point set at the selected angle.
+        let maximumSearchPointCount = 512
+        let searchPoints: [SIMD2<Float>]
+        if points.count > maximumSearchPointCount {
+            let stride = max(1, points.count / maximumSearchPointCount)
+            searchPoints = points.enumerated().compactMap {
+                $0.offset.isMultiple(of: stride) ? $0.element : nil
+            }
+        } else {
+            searchPoints = points
+        }
+
+        let coarseStep = Float.pi / 60 // 3 degrees
+        var best: Candidate?
+        for index in 0..<30 {
+            guard let current = candidate(
+                at: Float(index) * coarseStep,
+                using: searchPoints
+            ) else { continue }
+            if best == nil || current.area < best!.area { best = current }
+        }
+        guard let coarseBest = best else { return nil }
+
+        // Refine to 0.25 degrees. A rectangle's yaw repeats every 90 degrees.
+        let quarterTurn = Float.pi / 2
+        let fineStep = Float.pi / 720
+        for offset in -12...12 {
+            var angle = coarseBest.angle + Float(offset) * fineStep
+            while angle < 0 { angle += quarterTurn }
+            while angle >= quarterTurn { angle -= quarterTurn }
+            guard let current = candidate(at: angle, using: searchPoints) else { continue }
+            if current.area < best!.area { best = current }
+        }
+        guard let searchBest = best,
+              let final = candidate(at: searchBest.angle, using: points)
+        else { return nil }
+        return (
+            axisU: SIMD2<Float>(cos(final.angle), sin(final.angle)),
+            axisV: SIMD2<Float>(-sin(final.angle), cos(final.angle)),
+            lowU: final.lowU,
+            highU: final.highU,
+            lowV: final.lowV,
+            highV: final.highV
         )
     }
 

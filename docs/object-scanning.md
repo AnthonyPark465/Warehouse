@@ -40,7 +40,8 @@ The replacement pipeline is:
    remains the lower height boundary.
 7. Region growing starts at the stable voxel nearest the locked user seed.
    Disconnected geometry is discarded; the largest cluster is not used.
-8. Horizontal PCA supplies oriented axes. Interpolated 1st/99th percentiles
+8. A robust minimum-area horizontal search supplies oriented axes without
+   weighting over-scanned faces more heavily. Interpolated 1st/99th percentiles
    produce robust extents, and the support plane supplies the lower height.
 9. Three consistent live estimates are required. A dimension increase above
    25% freezes the last stable value and displays the nearby-object warning.

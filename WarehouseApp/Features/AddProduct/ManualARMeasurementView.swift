@@ -215,12 +215,13 @@ struct ManualARMeasurementView: View {
             }
             if state.productScanStatus.touchesBoundary {
                 Label(
-                    "Product reaches the scan boundary. Enlarge the region and rescan.",
+                    "Product reaches the scan boundary. You can finish, but enlarging the region and rescanning will be more accurate.",
                     systemImage: "exclamationmark.triangle.fill"
                 )
                 .font(.caption)
                 .foregroundStyle(.orange)
-            } else if state.productScanStatus.canFinish {
+            }
+            if state.productScanStatus.canFinish {
                 Label(
                     state.productScanStatus.dimensionsAreStable
                         ? "Scan is stable. Finish Product Scan is ready."

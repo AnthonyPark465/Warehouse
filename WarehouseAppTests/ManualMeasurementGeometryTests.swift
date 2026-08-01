@@ -9,21 +9,39 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         XCTAssertTrue(ManualProductScanStatus.finishIsAvailable(
             dimensions: dimensions,
             stablePointCount: ObjectScanValidation.minimumPointCount,
-            boundingBoxCornersWorld: corners,
-            touchesBoundary: false
+            boundingBoxCornersWorld: corners
         ))
     }
 
-    func testClippedOrangeBoxDoesNotAllowFinish() {
+    func testIncompleteOrangeBoxCannotFinish() {
         let dimensions = ObjectDimensions(length: 20, width: 10, height: 15)
-        let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 8)
+        let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 7)
 
         XCTAssertFalse(ManualProductScanStatus.finishIsAvailable(
             dimensions: dimensions,
             stablePointCount: ObjectScanValidation.minimumPointCount,
+            boundingBoxCornersWorld: corners
+        ))
+    }
+
+    @MainActor
+    func testFinishProductScanTransitionsToReview() {
+        let dimensions = ObjectDimensions(length: 20, width: 10, height: 15)
+        let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 8)
+        var status = ManualProductScanStatus(
+            stablePointCount: ObjectScanValidation.minimumPointCount,
+            detectedDimensionsCM: dimensions,
             boundingBoxCornersWorld: corners,
             touchesBoundary: true
-        ))
+        )
+        status.canFinish = true
+
+        let state = ManualARMeasurementState()
+        state.updateProductScan(status)
+        state.finishProductScan()
+
+        XCTAssertEqual(state.stage, .review)
+        XCTAssertNil(state.errorMessage)
     }
 
     func testCaptureProgressPreservesLatestDetectedGeometry() {

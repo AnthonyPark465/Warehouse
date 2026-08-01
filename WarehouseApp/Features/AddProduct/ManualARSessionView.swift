@@ -300,8 +300,7 @@ struct ManualARSessionView: UIViewRepresentable {
             let canFinish = ManualProductScanStatus.finishIsAvailable(
                 dimensions: dimensions,
                 stablePointCount: displayMeasurement.fusedVoxelCount,
-                boundingBoxCornersWorld: displayMeasurement.boundingBoxCornersWorld,
-                touchesBoundary: displayMeasurement.touchesRegionBoundary
+                boundingBoxCornersWorld: displayMeasurement.boundingBoxCornersWorld
             )
             publishProductStatus(ManualProductScanStatus(
                 message: message,

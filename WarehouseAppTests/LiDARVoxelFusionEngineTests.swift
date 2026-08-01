@@ -165,6 +165,30 @@ final class LiDARVoxelFusionEngineTests: XCTestCase {
         XCTAssertEqual(measurement.dimensionsCM.height, 6, accuracy: voxelToleranceCM)
     }
 
+    func testUnevenFaceCoverageDoesNotRotateBoxAwayFromProductEdges() throws {
+        let fullObject = boxSurfacePoints(
+            size: SIMD3<Float>(0.08, 0.06, 0.04),
+            centre: SIMD3<Float>(0, 0.03, 0),
+            yaw: 0
+        )
+        // Mimic a scan that sees the front and right faces much more clearly
+        // than the back and left. Density-weighted PCA rotates toward this L.
+        let partialObject = fullObject.filter {
+            abs($0.z + 0.02) < 0.001 || abs($0.x - 0.04) < 0.001
+        }
+        let measurement = try measure(
+            frames: repeatedFrames(partialObject + tablePoints())
+        )
+
+        XCTAssertEqual(measurement.dimensionsCM.length, 8, accuracy: voxelToleranceCM)
+        XCTAssertEqual(measurement.dimensionsCM.width, 4, accuracy: voxelToleranceCM)
+        let firstEdge = measurement.boundingBoxCornersWorld[1]
+            - measurement.boundingBoxCornersWorld[0]
+        let yaw = abs(atan2(firstEdge.z, firstEdge.x))
+            .truncatingRemainder(dividingBy: .pi / 2)
+        XCTAssertLessThan(min(yaw, .pi / 2 - yaw), .pi / 180)
+    }
+
     func testSuddenDimensionJumpIsFrozenThenRecoveryKeepsStableResult() throws {
         var stabilizer = LiDARMeasurementStabilizer(configuration: configuration)
         let cylinder = ObjectDimensions(length: 6, width: 6, height: 8)
