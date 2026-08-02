@@ -11,6 +11,13 @@ struct AddProductView: View {
         var id: String { rawValue }
     }
 
+    private enum RestingSurfaceAnswer: String, CaseIterable, Identifiable {
+        case yes = "Yes"
+        case no = "No"
+        case selected = "Only selected orientations"
+        var id: String { rawValue }
+    }
+
     @State private var name = ""
     @State private var productCode = ""
     @State private var type = ""
@@ -32,6 +39,19 @@ struct AddProductView: View {
     @State private var useAdjustedDimensions = true
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @State private var placementWeight = ""
+    @State private var retrievalPriority: RetrievalPriority = .normal
+    @State private var retrievalFrequency = 0.5
+    @State private var fragilityKnown = false
+    @State private var isFragile = false
+    @State private var restingSurface: RestingSurfaceAnswer = .yes
+    @State private var mustRemainUpright = true
+    @State private var canSupportAbove = false
+    @State private var canRestOnProduct = false
+    @State private var maximumSupportedWeight = ""
+    @State private var requiredClearance = "2"
+    @State private var selectedRestingFaces: Set<RestingFace> = [.bottom]
+    @State private var quantityArrangement: QuantityArrangement = .singleUnit
 
     /// Pass a barcode (e.g. from the Scan tab) to pre-fill registration.
     init(initialBarcode: String? = nil) {
@@ -45,6 +65,7 @@ struct AddProductView: View {
                 photoSection
                 detailsSection
                 objectScanSection
+                placementRulesSection
                 barcodeSection
             }
             .navigationTitle("New Product")
@@ -193,6 +214,56 @@ struct AddProductView: View {
         }
     }
 
+    private var placementRulesSection: some View {
+        Section("Placement & Handling") {
+            TextField("Weight in kg (recommended)", text: $placementWeight)
+                .keyboardType(.decimalPad)
+            Picker("Retrieval priority", selection: $retrievalPriority) {
+                ForEach(RetrievalPriority.allCases) { priority in
+                    Text(String(describing: priority).capitalized).tag(priority)
+                }
+            }
+            VStack(alignment: .leading) {
+                Text("Expected retrieval frequency")
+                Slider(value: $retrievalFrequency, in: 0...1)
+            }
+            Toggle("Fragility information is known", isOn: $fragilityKnown)
+            if fragilityKnown { Toggle("Fragile", isOn: $isFragile) }
+            Picker("Can this product rest directly on its current bottom surface?", selection: $restingSurface) {
+                ForEach(RestingSurfaceAnswer.allCases) { Text($0.rawValue).tag($0) }
+            }
+            if restingSurface == .selected {
+                ForEach(RestingFace.allCases) { face in
+                    Toggle(face.rawValue.capitalized, isOn: Binding(
+                        get: { selectedRestingFaces.contains(face) },
+                        set: { enabled in
+                            if enabled { selectedRestingFaces.insert(face) }
+                            else { selectedRestingFaces.remove(face) }
+                        }
+                    ))
+                }
+            }
+            Toggle("Must remain upright", isOn: $mustRemainUpright)
+            Toggle("May rotate automatically", isOn: $canBeRotated)
+            Toggle("Can support products above", isOn: $canSupportAbove)
+            Toggle("Can be placed on another product", isOn: $canRestOnProduct)
+            if canSupportAbove {
+                TextField("Maximum supported weight (kg)", text: $maximumSupportedWeight)
+                    .keyboardType(.decimalPad)
+            }
+            TextField("Required handling clearance (cm)", text: $requiredClearance)
+                .keyboardType(.decimalPad)
+            Picker("Quantity represents", selection: $quantityArrangement) {
+                Text("One physical unit").tag(QuantityArrangement.singleUnit)
+                Text("One grouped case").tag(QuantityArrangement.groupedCase)
+                Text("Separate units").tag(QuantityArrangement.separateUnits)
+            }
+            Text("Unknown weight, fragility, or load limits use conservative direct-shelf-only placement.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var barcodeSection: some View {
         Section("Barcode") {
             Picker("Barcode", selection: $barcodeMode) {
@@ -256,7 +327,34 @@ struct AddProductView: View {
                                 storageClearanceCM: 0
                             )
                         )
-                    }
+                    },
+                    placementMetadata: ProductPlacementMetadata(
+                        weightKG: Double(placementWeight),
+                        retrievalPriority: retrievalPriority,
+                        expectedRetrievalFrequency: retrievalFrequency,
+                        expirationUrgency: 0,
+                        isFragile: fragilityKnown ? isFragile : nil,
+                        permittedRestingFaces: restingSurface == .no ? [] :
+                            (restingSurface == .selected ? selectedRestingFaces : [.bottom]),
+                        mustRemainUpright: mustRemainUpright,
+                        mayRotateAutomatically: canBeRotated,
+                        requiredClearanceCM: max(Double(requiredClearance) ?? 2, 0),
+                        stacking: StackingRules(
+                            canSupportProductsAbove: canSupportAbove,
+                            canBePlacedOnAnotherProduct: canRestOnProduct,
+                            maximumSupportedWeight: Double(maximumSupportedWeight),
+                            maximumTotalStackHeight: nil,
+                            maximumItemsAbove: nil,
+                            maximumIdenticalStackCount: nil,
+                            allowedProductTypesAbove: nil,
+                            prohibitedProductTypesAbove: nil,
+                            requiresFullBaseSupport: true,
+                            minimumSupportRatio: 0.95,
+                            fragileTopSurface: fragilityKnown ? isFragile : true,
+                            notes: nil
+                        ),
+                        quantityArrangement: quantityArrangement
+                    )
                 )
                 let productId = try await ProductRepository.create(draft)
 

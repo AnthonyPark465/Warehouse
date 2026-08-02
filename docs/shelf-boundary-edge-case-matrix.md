@@ -1,0 +1,30 @@
+# Shelf boundary edge-case matrix
+
+Status meanings: **Automated** is covered by deterministic simulator tests;
+**Guarded** is handled in code/UI but still needs physical-device validation;
+**Unsupported-safe** is rejected or requires a different model rather than being
+silently approximated.
+
+| Area | Automated coverage | Guarded device cases | Unsupported-safe / follow-up |
+|---|---|---|---|
+| Coordinates | world-axis and rotated rectangles; translations; reversed winding; deterministic results | portrait/landscape; orientation changes; backgrounding; relocalization epoch; reversed normal; invalid front direction; finite values | mixing world/local points cannot be inferred from untagged legacy arrays; extreme AR-origin drift requires rescan |
+| Point mistakes | duplicate/near duplicate; short edge; zero area; four-point bow-tie repair; other crossings rejected | skipped/extra/arbitrary corners; moving backward; wrong surface; repeated taps; corner replacement; exit before approval | holes and disconnected regions need separate compartments; edge rescan is performed as two corner rescans |
+| Sensor noise | extreme outlier; bimodal foreground/background depth; insufficient samples; NaN/range rejection | gradual drift; sudden jump; intermittent misses; LiDAR/raycast disagreement; sparse features; low FPS; out-of-order timestamps; reflections | mesh/plane semantic disagreement and image-edge confidence are not independently classified |
+| Materials | none can be truthfully simulated as optical sensor behavior | matte, glossy, metal, glass, plastic, dark/light, mirror, wire/mesh/perforated, rounded/beveled/trimmed, covered/flexible surfaces all receive stability/confidence gating | curved, moving, transparent, or reflective surfaces may remain unmeasurable and require manual dimensions |
+| Rectangle classification | perfect/rotated/noisy rectangles; small corner error; trapezoids; forced-rectangle rejection; expected-dimension conflict; 100 seeded random transforms | narrow/near-square shapes use the same multi-metric score | rounded multi-point outlines and compartment divisions remain irregular/multi-compartment, never silently rectangularized |
+| Irregular polygons | trapezoid; concave L; concave placement cutout; duplicate, short, zero-area, crossing, planarity checks | convex, concave, U/notch/corridor and high-point-count simple polygons use unchanged topology | holes, disconnected regions, intentional non-planarity |
+| Plane fitting | exact, tilted exact, noisy residual and poor-planarity rejection | slightly warped shelf accepted only within 1.5 cm maximum residual; replacement recomputes synchronously | intentionally non-planar surface; mixed floor/wall plane; near-sideways normal |
+| Dimensions/units | 80 × 40 cm; rotated dimensions; expected-dimension conflict; metre-to-centimetre placement conversion; separate safety margin; 5 cm height | one-decimal display; very large finite shelves have no arbitrary room-size cap | edges below 1 cm are rejected as below reliable resolution; implausible manual expected values are rejected |
+| Correction | deterministic fit; bounded movement; bounded dimension change; concavity preservation; no unapproved use | raw/suggested comparison; keep/accept/rescan; intent and expected values recompute from the same revision | freehand drag handles and inferred common-size snapping are intentionally absent |
+| Approval | version-2 draft rejected; raw and correction approval states | double approval resolves synchronously; shape/expected changes create a new analysis revision; cancel leaves no approved scan | remote simultaneous approval requires the repository transaction and backend integration test |
+| Existing inventory | approved polygon containment; concave cutout excluded; physical boundary not mutated | repository revalidates all stored products and rejects an incompatible update | automatic relocation/splitting of products is not attempted |
+| Lifecycle/concurrency | deterministic synchronous analysis avoids stale worker results | background/resume and relocalization invalidate unfinished capture; rapid taps consume only a ready estimate | camera revocation, low-memory termination, process kill, and multi-device Firestore conflicts require device/backend fault-injection tests |
+| Sectioned edges | robust line/outlier fit; correlated-frame rejection; one-frame turn suppression; propagated corner uncertainty; near-parallel rejection; section undo/rescan | confirm/same-edge/rescan controls and per-edge diagnostics need LiDAR device validation | image-edge refinement and automatic semantic edge classification |
+| Circular/rounded | perfect/noisy circle acceptance; oval and incomplete-arc rejection | none—the robust fitter is not wired to live AR capture | shipping workflow remains a polygon; do not label it a measured circle |
+| Compartments | robust plane fit; missing/contradictory planes; taper, warp, lip and divider evaluation | none—the evaluator is not wired to guided surface-by-surface AR capture | hidden-corner inference cannot be used without sufficient reviewed plane evidence |
+| Uncertainty | distance tiers; 5 cm approximate-only rule; 5% manual rule; conservative dimensions; no clearance double count; 2× uncertainty fit gate | review display and calibration across distance, material and device | approximate global geometry cannot authorize close-fit placement |
+| Large zones | checkpoint agreement/disagreement and local close-fit gate | overlapping-zone acquisition and drift/relocalization need device testing | no live alignment UI; global approximate scan is planning-only |
+
+This matrix does not label hardware-only scenarios as passed. The full simulator
+suite validates pure geometry and state invariants; optical behavior must be
+measured on representative devices and shelf materials.

@@ -67,3 +67,7 @@ falls back to manual barcode entry everywhere scanning is offered.
 Object measurement also requires a physical ARKit-capable device. LiDAR is
 used when available; see [docs/object-scanning.md](docs/object-scanning.md) for
 architecture, calibration limits, and physical-device testing.
+
+Shelf-aware placement, explicit shelf-front capture, constraint ordering,
+guidance, concurrency, limitations, and device testing are documented in
+[docs/shelf-aware-placement.md](docs/shelf-aware-placement.md).

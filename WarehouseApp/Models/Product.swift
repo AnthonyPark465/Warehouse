@@ -14,4 +14,7 @@ struct Product: Identifiable, Codable, Equatable {
     let lastReceivedAt: Date?
     /// Optional for backward compatibility with products created before object scanning.
     let objectScan: ProductObjectScan?
+    /// Optional for backward compatibility. Missing metadata is interpreted
+    /// conservatively by the placement engine, never as permission to stack.
+    let placementMetadata: ProductPlacementMetadata?
 }

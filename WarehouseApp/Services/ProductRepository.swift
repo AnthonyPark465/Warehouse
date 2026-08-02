@@ -9,6 +9,7 @@ struct ProductDraft {
     let shelfLifeDays: Int?
     let photoJpeg: Data?
     let objectScan: ProductObjectScan?
+    let placementMetadata: ProductPlacementMetadata?
 }
 
 enum ProductRepository {
@@ -27,7 +28,8 @@ enum ProductRepository {
             totalStock: 0,
             createdAt: .now,
             lastReceivedAt: nil,
-            objectScan: draft.objectScan
+            objectScan: draft.objectScan,
+            placementMetadata: draft.placementMetadata
         )
         // The Codable setData(from:) has no async overload; without awaiting
         // the completion, a rejected write would be silently swallowed and

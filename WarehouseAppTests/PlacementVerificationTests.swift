@@ -39,3 +39,34 @@ final class PlacementVerificationTests: XCTestCase {
     }
 }
 
+final class ARPlacementVerifierTests: XCTestCase {
+    func testPlacementWithinToleranceVerifies() {
+        let result = ARPlacementVerifier.verify(
+            expectedPosition: Vector3D(10, 20, 30), expectedQuarterTurns: 1,
+            actualPosition: Vector3D(12, 20, 31), actualYawDegrees: 87,
+            trackingAvailable: true
+        )
+        guard case .verified = result else { return XCTFail("Expected verified, got \(result)") }
+    }
+
+    func testPlacementOutsideToleranceReturnsActionableCorrection() {
+        let result = ARPlacementVerifier.verify(
+            expectedPosition: Vector3D(10, 20, 30), expectedQuarterTurns: 1,
+            actualPosition: Vector3D(4, 20, 25), actualYawDegrees: 60,
+            trackingAvailable: true
+        )
+        guard case .correction(let message, _, _) = result else {
+            return XCTFail("Expected correction, got \(result)")
+        }
+        XCTAssertTrue(message.contains("Move"))
+        XCTAssertTrue(message.contains("rotate"))
+    }
+
+    func testUnavailableTrackingDoesNotClaimVerification() {
+        let result = ARPlacementVerifier.verify(
+            expectedPosition: Vector3D(0, 0, 0), expectedQuarterTurns: 0,
+            actualPosition: nil, actualYawDegrees: nil, trackingAvailable: false
+        )
+        guard case .unavailable = result else { return XCTFail("Expected unavailable") }
+    }
+}
