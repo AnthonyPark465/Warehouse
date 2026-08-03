@@ -51,6 +51,10 @@ struct LiDARPolygonalPrism: Equatable {
     let polygon: [SIMD2<Float>]
     let lowerOffset: Float
     let upperOffset: Float
+    /// Horizontal bounding box of the polygon for cheap rejection before the
+    /// exact per-edge tests; computed once at init, not per point.
+    let polygonMin: SIMD2<Float>
+    let polygonMax: SIMD2<Float>
 
     init(
         origin: SIMD3<Float>,
@@ -68,27 +72,48 @@ struct LiDARPolygonalPrism: Equatable {
         self.polygon = polygon
         self.lowerOffset = min(lowerOffset, upperOffset)
         self.upperOffset = max(lowerOffset, upperOffset)
+        var low = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
+        var high = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
+        for vertex in polygon {
+            low = simd_min(low, vertex)
+            high = simd_max(high, vertex)
+        }
+        self.polygonMin = low
+        self.polygonMax = high
     }
 
     func contains(_ point: SIMD3<Float>, margin: Float = 0) -> Bool {
         let local = coordinates(of: point)
-        return local.y >= lowerOffset - margin
-            && local.y <= upperOffset + margin
-            && Self.pointInPolygon(SIMD2(local.x, local.z), polygon: polygon, margin: margin)
+        guard local.y >= lowerOffset - margin, local.y <= upperOffset + margin else {
+            return false
+        }
+        let horizontal = SIMD2(local.x, local.z)
+        guard horizontal.x >= polygonMin.x - margin,
+              horizontal.x <= polygonMax.x + margin,
+              horizontal.y >= polygonMin.y - margin,
+              horizontal.y <= polygonMax.y + margin
+        else { return false }
+        return Self.pointInPolygon(horizontal, polygon: polygon, margin: margin)
     }
 
     func isNearBoundary(_ point: SIMD3<Float>, distance: Float) -> Bool {
         let local = coordinates(of: point)
+        if abs(local.y - upperOffset) <= distance { return true }
         let horizontal = SIMD2(local.x, local.z)
-        let nearSide = polygon.indices.contains {
-            Self.distance(
+        // Beyond the expanded bounding box nothing can be near an edge.
+        guard horizontal.x >= polygonMin.x - distance,
+              horizontal.x <= polygonMax.x + distance,
+              horizontal.y >= polygonMin.y - distance,
+              horizontal.y <= polygonMax.y + distance
+        else { return false }
+        let distanceSquared = distance * distance
+        return polygon.indices.contains {
+            Self.distanceSquared(
                 from: horizontal,
                 toSegmentFrom: polygon[$0],
                 to: polygon[($0 + 1) % polygon.count]
-            ) <= distance
+            ) <= distanceSquared
         }
-        return nearSide
-            || abs(local.y - upperOffset) <= distance
     }
 
     func coordinates(of point: SIMD3<Float>) -> SIMD3<Float> {
@@ -106,15 +131,8 @@ struct LiDARPolygonalPrism: Equatable {
         margin: Float
     ) -> Bool {
         guard polygon.count >= 3 else { return false }
-        if polygon.indices.contains(where: {
-            distance(
-                from: point,
-                toSegmentFrom: polygon[$0],
-                to: polygon[($0 + 1) % polygon.count]
-            ) <= margin
-        }) {
-            return true
-        }
+        // Even-odd first: it is branch-cheap and settles the common case
+        // (clearly inside / clearly outside) without any square roots.
         var inside = false
         var previous = polygon.count - 1
         for current in polygon.indices {
@@ -127,19 +145,29 @@ struct LiDARPolygonalPrism: Equatable {
             }
             previous = current
         }
-        return inside
+        if inside { return true }
+        guard margin > 0 else { return false }
+        // Outside the polygon: accept only points within the margin band.
+        let marginSquared = margin * margin
+        return polygon.indices.contains {
+            distanceSquared(
+                from: point,
+                toSegmentFrom: polygon[$0],
+                to: polygon[($0 + 1) % polygon.count]
+            ) <= marginSquared
+        }
     }
 
-    private static func distance(
+    private static func distanceSquared(
         from point: SIMD2<Float>,
         toSegmentFrom start: SIMD2<Float>,
         to end: SIMD2<Float>
     ) -> Float {
         let segment = end - start
         let lengthSquared = simd_length_squared(segment)
-        guard lengthSquared > 0 else { return simd_distance(point, start) }
+        guard lengthSquared > 0 else { return simd_distance_squared(point, start) }
         let t = min(max(simd_dot(point - start, segment) / lengthSquared, 0), 1)
-        return simd_distance(point, start + segment * t)
+        return simd_distance_squared(point, start + segment * t)
     }
 }
 
@@ -308,11 +336,10 @@ final class LiDARVoxelFusionEngine {
             )
         }
 
-        var sums: [VoxelKey: SIMD3<Float>] = [:]
-        var counts: [VoxelKey: Int] = [:]
+        var frameBins: [VoxelKey: (sum: SIMD3<Float>, count: Int)] = [:]
         var rejected = 0
         var nearBoundary = 0
-        sums.reserveCapacity(framePoints.count)
+        frameBins.reserveCapacity(min(framePoints.count, 4_096))
 
         for point in framePoints where point.x.isFinite && point.y.isFinite && point.z.isFinite {
             guard selection.region.contains(point, margin: configuration.cropMargin) else {
@@ -326,13 +353,15 @@ final class LiDARVoxelFusionEngine {
                 nearBoundary += 1
             }
             let key = voxelKey(for: point)
-            sums[key, default: .zero] += point
-            counts[key, default: 0] += 1
+            if let existing = frameBins[key] {
+                frameBins[key] = (existing.sum + point, existing.count + 1)
+            } else {
+                frameBins[key] = (point, 1)
+            }
         }
 
-        for (key, sum) in sums {
-            guard let count = counts[key], count > 0 else { continue }
-            let frameAverage = sum / Float(count)
+        for (key, bin) in frameBins {
+            let frameAverage = bin.sum / Float(bin.count)
             if var voxel = voxels[key] {
                 voxel.positionSum += frameAverage
                 voxel.frameObservations += 1
@@ -343,7 +372,7 @@ final class LiDARVoxelFusionEngine {
         }
 
         return LiDARFusionIntegrationResult(
-            acceptedPointCount: counts.count,
+            acceptedPointCount: frameBins.count,
             rejectedOutsideVolumeCount: rejected,
             nearBoundaryCount: nearBoundary
         )
@@ -484,18 +513,15 @@ final class LiDARVoxelFusionEngine {
         radius: Int,
         seed: SIMD3<Float>
     ) -> Set<VoxelKey>? {
-        let components = connectedComponents(in: points, radius: radius).filter {
-            $0.count >= configuration.minimumStableVoxelCount
-        }
-        guard let component = components.min(by: {
-            componentDistanceSquared($0, points: points, seed: seed)
-                < componentDistanceSquared($1, points: points, seed: seed)
-        }) else { return nil }
-        let distance = sqrt(
-            componentDistanceSquared(component, points: points, seed: seed)
-        )
-        guard distance <= configuration.maximumSeedDistance else { return nil }
-        return component
+        // Score each qualifying component once; recomputing distances inside
+        // a min(by:) comparator is quadratic in component size.
+        let scored = connectedComponents(in: points, radius: radius)
+            .filter { $0.count >= configuration.minimumStableVoxelCount }
+            .map { ($0, componentDistanceSquared($0, points: points, seed: seed)) }
+        guard let best = scored.min(by: { $0.1 < $1.1 }),
+              sqrt(best.1) <= configuration.maximumSeedDistance
+        else { return nil }
+        return best.0
     }
 
     private func connectedComponents(
@@ -506,6 +532,17 @@ final class LiDARVoxelFusionEngine {
         var components: [Set<VoxelKey>] = []
         let radius = Int32(radiusInVoxels)
 
+        // Flat offset table beats three nested ranges in the BFS inner loop.
+        var offsets: [(Int32, Int32, Int32)] = []
+        offsets.reserveCapacity((2 * radiusInVoxels + 1) * (2 * radiusInVoxels + 1) * (2 * radiusInVoxels + 1) - 1)
+        for dx in -radius...radius {
+            for dy in -radius...radius {
+                for dz in -radius...radius where dx != 0 || dy != 0 || dz != 0 {
+                    offsets.append((dx, dy, dz))
+                }
+            }
+        }
+
         while let seed = unvisited.first {
             unvisited.remove(seed)
             var queue = [seed]
@@ -514,20 +551,15 @@ final class LiDARVoxelFusionEngine {
             while cursor < queue.count {
                 let key = queue[cursor]
                 cursor += 1
-                for dx in -radius...radius {
-                    for dy in -radius...radius {
-                        for dz in -radius...radius
-                        where dx != 0 || dy != 0 || dz != 0 {
-                            let neighbour = VoxelKey(
-                                x: key.x + dx,
-                                y: key.y + dy,
-                                z: key.z + dz
-                            )
-                            if unvisited.remove(neighbour) != nil {
-                                component.insert(neighbour)
-                                queue.append(neighbour)
-                            }
-                        }
+                for (dx, dy, dz) in offsets {
+                    let neighbour = VoxelKey(
+                        x: key.x + dx,
+                        y: key.y + dy,
+                        z: key.z + dz
+                    )
+                    if unvisited.remove(neighbour) != nil {
+                        component.insert(neighbour)
+                        queue.append(neighbour)
                     }
                 }
             }
@@ -649,25 +681,35 @@ final class LiDARVoxelFusionEngine {
             highV: Float
         )
 
+        // Each candidate sorts once per axis and reads both percentiles from
+        // the same sorted array, instead of the four full sorts the previous
+        // per-percentile calls performed.
         func candidate(at angle: Float, using samples: [SIMD2<Float>]) -> Candidate? {
             let axisU = SIMD2<Float>(cos(angle), sin(angle))
             let axisV = SIMD2<Float>(-sin(angle), cos(angle))
-            let u = samples.map { simd_dot($0, axisU) }
-            let v = samples.map { simd_dot($0, axisV) }
-            guard let lowU = percentile(u, fraction: configuration.lowerPercentile),
-                  let highU = percentile(u, fraction: configuration.upperPercentile),
-                  let lowV = percentile(v, fraction: configuration.lowerPercentile),
-                  let highV = percentile(v, fraction: configuration.upperPercentile)
+            var u = [Float](repeating: 0, count: samples.count)
+            var v = [Float](repeating: 0, count: samples.count)
+            for index in samples.indices {
+                let sample = samples[index]
+                u[index] = simd_dot(sample, axisU)
+                v[index] = simd_dot(sample, axisV)
+            }
+            u.sort()
+            v.sort()
+            guard let uBounds = sortedPercentileBounds(u),
+                  let vBounds = sortedPercentileBounds(v)
             else { return nil }
-            let area = (highU - lowU) * (highV - lowV)
+            let area = (uBounds.high - uBounds.low) * (vBounds.high - vBounds.low)
             guard area.isFinite, area > 0 else { return nil }
-            return (angle, area, lowU, highU, lowV, highV)
+            return (angle, area, uBounds.low, uBounds.high, vBounds.low, vBounds.high)
         }
 
         // Searching every angle does not require every fused voxel. Use an
         // evenly distributed subset for yaw, then recompute the final robust
-        // bounds from the complete point set at the selected angle.
-        let maximumSearchPointCount = 512
+        // bounds from the complete point set at the selected angle. 256 is
+        // ample for picking a yaw on a 0.25° grid; the extents themselves
+        // come from the full set below.
+        let maximumSearchPointCount = 256
         let searchPoints: [SIMD2<Float>]
         if points.count > maximumSearchPointCount {
             let stride = max(1, points.count / maximumSearchPointCount)
@@ -721,6 +763,25 @@ final class LiDARVoxelFusionEngine {
             + region.axisX * horizontal.x
             + region.axisY * height
             + region.axisZ * horizontal.y
+    }
+
+    /// Lower/upper robust bounds from an already-sorted array in one pass.
+    private func sortedPercentileBounds(
+        _ sorted: [Float]
+    ) -> (low: Float, high: Float)? {
+        guard !sorted.isEmpty else { return nil }
+        func value(at fraction: Double) -> Float {
+            let position = Double(sorted.count - 1) * fraction
+            let lower = Int(position.rounded(.down))
+            let upper = Int(position.rounded(.up))
+            guard lower != upper else { return sorted[lower] }
+            let weight = Float(position - Double(lower))
+            return sorted[lower] * (1 - weight) + sorted[upper] * weight
+        }
+        return (
+            value(at: configuration.lowerPercentile),
+            value(at: configuration.upperPercentile)
+        )
     }
 
     private func percentile(_ values: [Float], fraction: Double) -> Float? {

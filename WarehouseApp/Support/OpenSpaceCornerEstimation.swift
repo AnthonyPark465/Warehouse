@@ -249,8 +249,23 @@ private func candidateLines(
     let positions = points.map { SIMD2($0.localPosition.x, $0.localPosition.z) }
     var candidates: [CandidateLine] = []
     guard positions.count >= configuration.minimumLineSupport else { return [] }
-    for first in positions.indices {
-        for second in positions.indices where second > first {
+    // Hypothesis lines come from a spatially ordered, strided anchor subset:
+    // O(anchors² · n) instead of the previous all-pairs O(n³). Anchors are
+    // selected by position (not input order), so evidence ordering still
+    // cannot affect the fit. Residuals are always scored over every point.
+    let anchorLimit = 64
+    let spatiallyOrdered = positions.indices.sorted {
+        if positions[$0].x != positions[$1].x {
+            return positions[$0].x < positions[$1].x
+        }
+        return positions[$0].y < positions[$1].y
+    }
+    let anchorStride = max(1, spatiallyOrdered.count / anchorLimit)
+    let anchors = spatiallyOrdered.enumerated().compactMap {
+        $0.offset.isMultiple(of: anchorStride) ? $0.element : nil
+    }
+    for (anchorIndex, first) in anchors.enumerated() {
+        for second in anchors.dropFirst(anchorIndex + 1) {
             let delta = positions[second] - positions[first]
             let length = simd_length(delta)
             guard length >= configuration.minimumCoverageMetres * 0.65 else { continue }
@@ -325,10 +340,26 @@ private func bestVerticalPlane(
 ) -> PlaneCandidate? {
     let points = samples.map(\.localPosition.simd)
     guard points.count >= minimumSupport else { return nil }
+    // Plane hypotheses from a spatially ordered, strided anchor subset:
+    // O(anchors³ · n) instead of all-triples O(n⁴). Anchor choice depends on
+    // position only, so evidence ordering cannot affect the fit; residual
+    // scoring still uses every point.
+    let anchorLimit = 32
+    let spatiallyOrdered = points.indices.sorted {
+        let p = points[$0]
+        let q = points[$1]
+        if p.x != q.x { return p.x < q.x }
+        if p.z != q.z { return p.z < q.z }
+        return p.y < q.y
+    }
+    let anchorStride = max(1, spatiallyOrdered.count / anchorLimit)
+    let anchors = spatiallyOrdered.enumerated().compactMap {
+        $0.offset.isMultiple(of: anchorStride) ? $0.element : nil
+    }
     var best: PlaneCandidate?
-    for a in 0..<(points.count - 2) {
-        for b in (a + 1)..<(points.count - 1) {
-            for c in (b + 1)..<points.count {
+    for (firstIndex, a) in anchors.enumerated() {
+        for (secondIndex, b) in anchors.enumerated() where secondIndex > firstIndex {
+            for c in anchors.dropFirst(secondIndex + 1) {
                 let cross = simd_cross(points[b] - points[a], points[c] - points[a])
                 guard simd_length(cross) > 1e-8 else { continue }
                 let normal = simd_normalize(cross)

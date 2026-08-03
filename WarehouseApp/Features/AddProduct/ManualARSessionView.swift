@@ -56,6 +56,11 @@ struct ManualARSessionView: UIViewRepresentable {
         // Read on the ARKit delegate thread and the fusion queue, written on
         // the main actor — must be lock-protected, not a plain Bool.
         private let productScanIsActive = OSAllocatedUnfairLock(initialState: false)
+        // Corner recognition: rolling reticle patch + current lock (main actor).
+        private var cornerLockWindow = ObjectCornerLockWindow()
+        private var lockedCorner: ObjectCornerLockWindow.Lock?
+        private var lastCornerRecognitionAt: TimeInterval = 0
+        private var previewIsLockedOnCorner = false
         private let fusionQueue = DispatchQueue(
             label: "com.tetris.warehouse.manual-region-fusion",
             qos: .userInitiated
@@ -128,7 +133,7 @@ struct ManualARSessionView: UIViewRepresentable {
                 // fresh surface query rather than promoting the preview.
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    self.state.place(self.raycastAtCentre())
+                    self.state.place(self.placementSample())
                 }
             }
             if renderRevision != renderedRevision {
@@ -161,11 +166,13 @@ struct ManualARSessionView: UIViewRepresentable {
                 shouldIntegrate = false
             }
             let scanPoints = shouldIntegrate ? extractMeasurementPoints(from: frame) : []
+            let cornerPatch = extractCornerPatch(from: frame)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 state.updateTracking(trackingState)
                 let sample = raycastAtCentre()
                 state.updatePreview(sample)
+                updateCornerLock(sample: sample, patch: cornerPatch, timestamp: now)
                 updatePreview(sample)
             }
             guard !scanPoints.isEmpty else { return }
@@ -360,6 +367,112 @@ struct ManualARSessionView: UIViewRepresentable {
                 configuration.frameSemantics.insert(.sceneDepth)
             }
             return configuration
+        }
+
+        private struct CornerPatch {
+            let points: [SIMD3<Float>]
+            let cameraWorld: SIMD3<Float>
+            let depthConfidence: Double
+        }
+
+        /// Depth points in a small patch around the screen centre, used to
+        /// recognise an object corner near the reticle. Nil without LiDAR.
+        private func extractCornerPatch(from frame: ARFrame) -> CornerPatch? {
+            guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
+                return nil
+            }
+            let depthMap = depthData.depthMap
+            CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+            guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+            let width = CVPixelBufferGetWidth(depthMap)
+            let height = CVPixelBufferGetHeight(depthMap)
+            let rowStride = CVPixelBufferGetBytesPerRow(depthMap)
+                / MemoryLayout<Float32>.size
+            let depths = base.assumingMemoryBound(to: Float32.self)
+            let centreX = width / 2
+            let centreY = height / 2
+            var points: [SIMD3<Float>] = []
+            points.reserveCapacity(240)
+            for y in stride(from: centreY - 14, through: centreY + 14, by: 2) {
+                for x in stride(from: centreX - 14, through: centreX + 14, by: 2) {
+                    guard x >= 0, x < width, y >= 0, y < height else { continue }
+                    let depth = depths[y * rowStride + x]
+                    guard depth.isFinite, depth >= 0.10, depth <= 3 else { continue }
+                    points.append(worldPoint(
+                        x: x,
+                        y: y,
+                        depth: depth,
+                        depthWidth: width,
+                        depthHeight: height,
+                        frame: frame
+                    ))
+                }
+            }
+            guard !points.isEmpty else { return nil }
+            let camera = frame.camera.transform.columns.3
+            return CornerPatch(
+                points: points,
+                cameraWorld: SIMD3<Float>(camera.x, camera.y, camera.z),
+                depthConfidence: frame.smoothedSceneDepth == nil ? 0.85 : 0.95
+            )
+        }
+
+        @MainActor
+        private func updateCornerLock(
+            sample: CentreRaycastSample?,
+            patch: CornerPatch?,
+            timestamp: TimeInterval
+        ) {
+            guard state.stage == .boundary, let sample, let patch else {
+                if lockedCorner != nil || state.stage != .boundary {
+                    cornerLockWindow.reset()
+                    lockedCorner = nil
+                }
+                return
+            }
+            cornerLockWindow.integrate(
+                reticleWorld: sample.position,
+                patchWorldPoints: patch.points,
+                cameraWorld: patch.cameraWorld,
+                timestamp: timestamp,
+                depthConfidence: patch.depthConfidence
+            )
+            guard timestamp - lastCornerRecognitionAt >= 0.3 else { return }
+            lastCornerRecognitionAt = timestamp
+            // Recognition runs on the fusion queue (the window is a value
+            // copy) so estimator cost never blocks the main thread.
+            let window = cornerLockWindow
+            let reticleWorld = sample.position
+            fusionQueue.async { [weak self] in
+                let lock = window.recognisedCorner(
+                    reticleWorld: reticleWorld,
+                    at: timestamp
+                )
+                DispatchQueue.main.async { self?.lockedCorner = lock }
+            }
+        }
+
+        /// The sample used for Place: the recognised corner when one is
+        /// locked, otherwise the raw centre raycast.
+        @MainActor
+        private func placementSample() -> CentreRaycastSample? {
+            let raw = raycastAtCentre()
+            guard state.stage == .boundary, let lockedCorner, let raw else {
+                return raw
+            }
+            cornerLockWindow.reset()
+            self.lockedCorner = nil
+            return CentreRaycastSample(
+                position: lockedCorner.worldPosition,
+                raycastType: "recognisedCorner",
+                surfaceAlignment: raw.surfaceAlignment,
+                confidence: max(
+                    raw.confidence,
+                    min(1, 1 - lockedCorner.uncertaintyMetres / 0.05)
+                ),
+                cameraDistanceMetres: raw.cameraDistanceMetres
+            )
         }
 
         private func extractMeasurementPoints(from frame: ARFrame) -> [SIMD3<Float>] {
@@ -677,8 +790,21 @@ struct ManualARSessionView: UIViewRepresentable {
                 previewNode.isHidden = true
                 return
             }
-            previewNode.simdWorldPosition = sample.position
+            // Snap onto a recognised corner; fall back to the raw raycast.
+            previewNode.simdWorldPosition = lockedCorner?.worldPosition ?? sample.position
+            setPreviewLocked(lockedCorner != nil)
             previewNode.isHidden = false
+        }
+
+        @MainActor
+        private func setPreviewLocked(_ isLocked: Bool) {
+            guard isLocked != previewIsLockedOnCorner else { return }
+            previewIsLockedOnCorner = isLocked
+            previewNode.geometry?.firstMaterial = material(
+                color: isLocked
+                    ? UIColor.systemGreen.withAlphaComponent(0.9)
+                    : UIColor.systemYellow.withAlphaComponent(0.65)
+            )
         }
 
         @MainActor
