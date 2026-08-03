@@ -1,28 +1,31 @@
 # Space Scan
 
 Space Scan is selected independently from **Scan shelf with AR** in the Place
-workflow. Active acquisition is guided corner-by-corner. The camera path and raw
-frame stream never become the storage boundary. The obsolete continuous and
-sectioned trace models remain decodable only for legacy records.
+workflow. The active LiDAR path for a box, cabinet, shelf bay, or other constrained
+compartment is surface-first. A screen point never becomes a final corner. Legacy
+corner and border records remain decodable, but do not satisfy schema-v7 accuracy.
 
 ## Workflow
 
-1. Select **Scan open space** and classify the base as floor, tabletop,
-   workbench, raised platform, counter, custom horizontal surface, or unknown.
-2. Lock the base plane, aim at one physical corner, and press **Scan Corner**.
-   A bounded depth patch is accumulated for 1–2 seconds across independent frames.
-3. Review the fixed candidate, uncertainty, method, and direct/inferred provenance.
-   Accept it or rescan it. Inferred plane-intersection corners always require an
-   explicit acceptance.
-4. Continue in boundary order without declaring a corner count. After three
-   accepted corners, use **Add Corner**, **Undo Last Corner**, **Close Shape**, or
-   **Rescan Selected Corner**. Accepted points remain frozen in the locked plane.
-5. Review the raw straight-segment polygon and any optional rectangle correction,
-   then explicitly approve one. Corrections are never silently applied.
-6. Either measure bottom/top with AR or enter a validated height in centimetres.
-7. Set the main approach direction and approve the scan.
-8. Review the extruded bottom/top/wall outline, height, surface type, and separate
-   geometry confidence. Save the approved record or calculate placement.
+1. Find the compartment, point broadly at its middle, and confirm the cyan local
+   target volume.
+2. Point at the middle of the requested surface and scan exactly one label at a
+   time: bottom, back, left, right, top, then front opening/frame.
+3. Move slowly between meaningfully different camera positions or view angles.
+   Elapsed time and raw frame/point totals do not count as independent evidence.
+4. Review accepted points, ignored points, the translucent fitted plane, coverage,
+   residuals, view diversity, and uncertainty. Accept or rescan that surface.
+5. After the required planes are accepted, review the eight calculated plane
+   intersections and their supporting-surface provenance.
+6. Review maximum interior dimensions separately from the smallest verified
+   usable opening. If a lip, frame, track, trim, taper, or overhang is not measured,
+   automatic placement remains blocked rather than using the larger interior.
+   The interior may be reused as the opening only after the user explicitly confirms
+   that no lip, track, trim, or smaller frame exists.
+7. Approve raw geometry. A proposed rectangular correction is a separate,
+   explicitly approved operation and may not hide measured taper.
+8. Continue to access direction and conservative placement review only after the
+   usable opening and uncertainty gates pass.
 
 Open spaces are stored in shelf-local centimetres with an origin on the base,
 orthogonal in-plane axes, a positive vertical axis, explicit top definition, and
@@ -35,13 +38,35 @@ existing-object collision rules, access/insertion rules, and every excluded
 polygon. An exclusion is tested for corner containment, edge intersection, and
 full enclosure, so a small hole underneath a large product is not missed.
 
+## Target volume and evidence
+
+The initial seed uses valid scene depth within the configurable 0.15–5 m operating
+range; 15 cm is a minimum, not a maximum. The initial volume is locked to one
+coordinate epoch. Observations outside it are ignored. The depth-pixel radius is
+calculated from focal length and seed depth to preserve physical coverage: close
+targets use more pixels, while distant targets use fewer pixels within configured
+bounds.
+
+The active capture reads ARKit's per-pixel confidence map, requires normal
+tracking, rejects mixed epochs, requires at least 1.5 cm camera translation or a
+4° view change, deduplicates 1.2 cm voxels, selects connected evidence near the
+surface seed, and robustly fits/refines one plane. Validation requires two-axis
+coverage, inlier support, view diversity, plausible orientation/location,
+residual limits, uncertainty, and consistency with already accepted planes.
+
+Floor rejection is layered: volume containment, the selected label, orientation,
+height relative to accepted bottom/top, connected components, seed proximity, and
+relationships to accepted planes. Equal plausible components produce an ambiguity
+and require selection/rescan. Flatness alone is never sufficient.
+
 ## Accuracy and conservative dimensions
 
-Schema version 6 records bounded local depth evidence, fitted edges or planes,
-original and accepted candidates, residual, coverage, independent frame count,
-view diversity, uncertainty, tracking, coordinate epoch, provenance, approval,
-and coordinate space. Repeated nearby frames do not count as independent evidence.
-Nearly parallel edges or planes cannot manufacture an intersection.
+Schema version 7 records target volume, label, bounded observations, accepted
+inlier IDs, fitted plane, residuals, two-axis coverage, independent views,
+uncertainty, coordinate epoch, approval, calculated corners, supporting planes,
+opening/interior dimensions, and schema version. Nearly parallel planes and
+intersections outside the target volume are rejected. Plane uncertainty is
+propagated through the three-plane solve and into dimensions.
 
 The acceptance policy allows up to 2 cm uncertainty at 1 m, 4 cm at 3 m, 5 cm
 at 5 m, 8 cm at 8 m and 10 cm at 20 m. Above 5 cm is approximate-planning-only,
@@ -54,19 +79,20 @@ or manual verification.
 Global approximate geometry cannot authorize close-fit placement. The large-zone
 model requires an accepted local measurement at the placement site.
 
-## Conservative limits and implementation status
+## Fallbacks and safe rejection
 
-The active LiDAR implementation supports tabletop/platform termination-edge
-intersections and inside shelf/box supporting-plane intersections. If neither is
-reliable it asks for a rescan or lower-confidence manual dimensions. It does not
-claim automatic semantic room reconstruction. ARPlane classification,
-mesh/depth agreement and stability contribute to capture, but automatic wall
-intersection, image-edge extraction, automatic table-leg/column detection,
-RoomPlan, variable-height ceilings, multiple disconnected regions, and automatic
-corridor/regulatory exclusions remain future work. Excluded-region geometry is
-fully modeled, persisted, visualized and honored by placement, but its current UI
-must be populated by an importing/onboarding workflow rather than automatic mesh
-segmentation.
+The compartment workflow does not solve every open shape. A tabletop requires
+multi-view tabletop evidence followed by true termination-edge evidence; filled
+interior points may not be used as arbitrary boundary lines. An imaginary region
+in a continuous floor has no LiDAR boundary and requires physical markers,
+detectable walls/structures, manual dimensions, or explicitly lower-confidence
+user points. These provenance types remain separate.
+
+Curved, warped, reflective, perforated, transparent, contradictory, poorly
+covered, or disconnected surfaces are rejected. A shelf lip or door track without
+a separately verified passage measurement blocks automatic fit authorization.
+Hidden corners are permitted only when three accepted planes constrain them and
+the inferred result is explicitly approved.
 
 Circle acquisition is explicitly follow-up work; the app does not approximate a
 circle with noisy corner detection. Robust circle fitting and overlapping-zone
@@ -77,23 +103,21 @@ Glass, mirrors, thin edges, featureless surfaces, moving obstacles and incomplet
 viewpoints must be manually confirmed or rejected; simulator tests cannot validate
 their optical behavior.
 
-## Device test
+## Physical-device validation
 
-1. Scan a known rectangular floor zone and a tabletop, including one rotated
-   relative to the room axes.
-2. Confirm the point button is disabled during motion/tracking loss and that
-   relocalization invalidates unfinished points.
-3. Keep a concave raw boundary, then repeat with a near-rectangle correction.
-4. Enter `120`, `75.5`, `0`, a negative value and an extremely large height;
-   only the first two should proceed.
-5. Measure a physical top and verify the displayed height against a tape measure.
-6. Confirm the access arrow points from the approach side into the space.
-7. Save, reload, and verify centimetre scale, surface type, boundary, exclusions,
-   height, approval and geometry version.
-8. Attempt placement crossing the outer edge, an exclusion, and the top. Each
-   must be rejected. Repeat on non-LiDAR hardware if that deployment is required.
-9. Move the camera without pressing **Scan Corner** and verify no boundary point
-   appears. Scan one corner, move elsewhere, and verify the accepted marker does
-   not move. Exercise accept, rescan, undo, selected-corner replacement, and close.
-10. Verify review shows each corner's provenance, RMS residual and uncertainty,
-    plus conservative dimensions and the separate 0.5 cm-per-side clearance.
+Use a tape/fixture reference and record signed error, absolute error, repeatability,
+rejection rate, and dangerous overestimation separately for every case:
+
+1. Empty rectangular box and empty shelf.
+2. Elevated shelf with the floor visible below.
+3. Deep shelf with partially hidden rear corners.
+4. Shelf with a front lip or track; verify opening is smaller than interior.
+5. Shelf containing one box/laptop/cable contaminant.
+6. Dark, glossy, wire/perforated, and matte reference materials.
+7. Repeat at several phone distances across the configured range.
+8. Repeat with several approach and viewing angles.
+9. Force tracking limitation and relocalization; no mixed-epoch surface may pass.
+10. Save/reload schema-v7 evidence and confirm legacy records remain accuracy-unknown.
+
+Simulator geometry tests are necessary but cannot establish centimetre accuracy.
+Configuration thresholds must be tuned only from the recorded device results.

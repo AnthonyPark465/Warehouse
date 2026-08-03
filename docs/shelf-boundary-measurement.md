@@ -1,52 +1,59 @@
 # Shelf boundary measurement
 
-## Coordinate and data flow
+## Active constrained-compartment flow
 
-The old scanner committed one centre-screen raycast immediately, flattened every
-point to `y = 0.006` in the selected AR plane anchor, and calculated width and
-depth from world-aligned X/Z extrema. This amplified hand motion and foreground
-hits, discarded measured elevation, and made rotated or irregular shelves look
-larger than their usable surface.
+The retired automatic path captured a fixed centre-pixel patch, mixed multiple
+visible surfaces, and selected line/plane intersections near the reticle. At close
+range the patch covered too little physical area; hard-coded depth confidence and
+nearly stationary frames could still inflate evidence. The resulting corner was
+therefore vulnerable to foreground objects and crosshair bias.
 
-The replacement keeps one coordinate system through review:
+The replacement keeps one locked world coordinate epoch through review:
 
-1. ARKit raycasts and, when present, scene depth produce world-space samples.
-2. Samples are transformed once into the selected `ARPlaneAnchor` local space.
-3. A rolling 0.8 second window is depth-clustered and robustly filtered before a
-   corner can be placed.
-4. A least-squares plane is fitted to all accepted corners. Polygon analysis is
-   performed in anchor-local X/Z; small Y residuals are projected to that plane.
-5. Raw, suggested, and explicitly approved boundaries remain in metres and are
-   tagged `planeAnchorLocal` while scanning.
-6. After the user confirms the shelf front, the approved boundary is transformed
-   once into shelf-local centimetres (`x=width`, `y=up`, `z=opening-to-back`).
+1. Valid depth under the broad region cue creates a local 3D target volume.
+2. Sampling radius is derived from focal length and depth, so physical coverage
+   does not collapse close to the shelf.
+3. Bottom, back, left, right, top, and front-opening evidence are collected in
+   separate labeled buffers. Evidence is never pooled across labels.
+4. Confidence, tracking, coordinate epoch, target containment, connectedness,
+   orientation, height, and accepted-plane relationships filter each buffer.
+5. Robust plane fitting is refined with inliers and reports RMS/max residual,
+   two-axis coverage, independent views, and uncertainty.
+6. Three accepted planes define each corner. Width, height, and depth come from
+   opposing planes, never a tap, the reticle, or camera trajectory.
+7. The approved result is transformed once into shelf-local metres/centimetres
+   (`x=width`, `y=up`, `z=opening-to-back`) for placement.
 
 Relocalization, app backgrounding, or a coordinate-epoch change invalidates an
 unfinished scan. Points from different epochs are never combined.
 
 ## Capture and correction
 
-Open straight-sided boundaries use an explicit guided state machine: find and
-lock the base plane, aim, scan one local patch, review a corner candidate, accept
-or rescan it, add more corners, close, and review geometry. A selected accepted
-corner can be rescanned without rebuilding unrelated corners. Accepted positions
-are frozen in the locked plane and only straight segments join them. Camera motion
-between button presses produces no boundary geometry.
+Constrained compartments use an explicit guided state machine: find compartment,
+confirm target, scan one labeled surface, review/accept or rescan, calculate
+intersections, review geometry, verify the usable opening, and then select access
+direction. Rescanning one surface invalidates and recomputes only corners and
+dimensions supported by that plane.
 
-The LiDAR estimator first tries two robust termination-edge fits on base-plane
-points (tabletops/platforms). It then tries two adequately supported adjacent
-planes (inside shelves/boxes). Both reject poor coverage, correlated frames,
-large residuals, nearly parallel supports, and remote intersections. Plane-derived
-corners are marked inferred and require explicit approval. Glass, mirrors, wire,
-reflective metal, dark featureless material, occlusion, and very small spaces must
-fail safely or use the labelled lower-confidence manual path.
+The active compartment estimator fits only the surface the user is currently
+scanning. It requires meaningful camera translation/view-angle change and
+deduplicates correlated spatial samples. Connected-component selection prefers
+the component near the selected surface seed. A second similarly supported
+component is reported as ambiguous rather than silently chosen.
 
-LiDAR devices require at least 7 stable samples per corner; standard world
-tracking requires 11. Invalid ranges and non-finite values are removed, samples
-are split at 3 cm depth gaps, and the largest depth cluster wins (nearest breaks
-ties). Coordinate medians and median absolute deviation reject spatial outliers.
-The placement button remains disabled until RMS spread is at most 0.8 cm on
-LiDAR or 1.2 cm without LiDAR.
+The default device operating range is configurable (currently 0.15–5 m). A frame
+needs at least 1.5 cm camera translation or 4° viewing change to add independent
+evidence. Plane acceptance currently requires at least 24 deduplicated inliers,
+7 cm physical coverage on both fitted axes, at least four independent views,
+RMS at most 8 mm, maximum residual at most 25 mm, plausible orientation/location,
+and uncertainty within the centralized accuracy policy. These are initial safety
+limits pending device validation, not accuracy claims.
+
+The floor is rejected during bottom capture when it is below/disconnected from
+the selected shelf region. During back/side capture, horizontal components and
+planes geometrically incompatible with accepted bottom/back evidence are rejected.
+Products and cables must be disconnected, smaller/inconsistent, or incompatible;
+when ambiguity remains, the scan fails for user choice/rescan.
 
 Rectangle likelihood is not based on four points alone. It combines corner-angle
 error, opposite-side parallelism, diagonal lengths and midpoint agreement,
@@ -72,7 +79,11 @@ suggestion, or rescan a selected corner. A draft can never be used for placement
 
 `ShelfGeometryRecord` stores immutable raw input, optional suggestion, approved
 geometry, intent, boundary meaning, confidence, reason codes, units, coordinate
-space, device/corner metadata, approval, and revision. `PlacementRepository`
+space, device/corner metadata, approval, and revision. Schema-v7 scanned boundary
+evidence additionally stores target volume, labeled captures, bounded observations,
+inlier IDs, planes, residual/coverage/view metrics, uncertainties, coordinate
+epoch, corner provenance/supports, opening/interior dimensions, and approvals.
+`PlacementRepository`
 archives the previous record and uses a Firestore transaction/version check.
 Existing products are revalidated; an incompatible correction is rejected instead
 of silently moving products.
@@ -101,20 +112,16 @@ both LiDAR and non-LiDAR devices.
 
 ## Manual device test
 
-1. Use a known 80 × 40 cm shelf. Start a shelf scan and move slowly until tracking
-   is normal.
-2. Aim at each inner usable corner clockwise. Confirm the button stays disabled
-   until the status says **Ready to place**.
-3. Create one deliberately unstable corner, then select and rescan only that corner.
-4. Review automatic, rectangular, and irregular intent. Verify no suggestion is
-   applied until **Accept Suggested Correction** is pressed.
-5. Enter matching expected dimensions, then dimensions over 15% different; the
-   latter must require verification/rescan.
-6. Keep the raw shape once and accept the correction once. Confirm the chosen
-   geometry, confidence, units, and revision are preserved.
-7. Measure a 5 cm clear height. It must be accepted and displayed as 5.0 cm.
-8. Confirm the opening-to-back arrow, finish, and verify every proposed product
-   corner stays inside the approved outline plus its separate safety margin.
-9. Repeat rotated, in landscape, after background/resume, and on a non-LiDAR
-   device. Backgrounding or relocalization during an unfinished scan must require
-   a fresh coordinate-consistent scan.
+1. Use a known 80 × 40 × 50 cm empty shelf and confirm a broad target volume.
+2. Scan bottom/back/left/right/top/front separately without aiming at corners.
+3. Verify accepted/ignored points and the fitted translucent plane before each
+   acceptance; deliberately include the floor below and one foreground box.
+4. Rescan only left; only corners/dimensions supported by left may change.
+5. Add a front lip and verify automatic fit is blocked until the smaller opening
+   is independently verified.
+6. Test taper and warp; neither may be silently rectangularized.
+7. Repeat across phone distance/view angle, dark/glossy/wire materials, and after
+   tracking loss/relocalization. Record signed error, repeatability, rejection,
+   and overestimation for each condition.
+8. Confirm uncertainty and operational clearance are shown/subtracted separately,
+   and a remaining fit margin below twice uncertainty requires manual verification.

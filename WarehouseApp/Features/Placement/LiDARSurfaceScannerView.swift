@@ -140,15 +140,15 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
             coaching.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
-        // Keep the visible reticle inside ARView so it uses the exact same
-        // bounds and centre pixel as `centreRaycast()`.
+        // This is a broad region cue, not a corner-placement crosshair. The active
+        // surface-first workflow adapts its depth footprint to physical distance.
         let target = UIView()
         target.translatesAutoresizingMaskIntoConstraints = false
         target.isUserInteractionEnabled = false
         target.isAccessibilityElement = true
-        target.accessibilityLabel = "No shelf surface detected"
-        target.layer.cornerRadius = 14
-        target.layer.borderWidth = 3
+        target.accessibilityLabel = "Point broadly at the requested shelf surface"
+        target.layer.cornerRadius = geometryType == .openSpace ? 24 : 14
+        target.layer.borderWidth = 2
         target.layer.borderColor = UIColor.white.cgColor
         target.layer.shadowColor = UIColor.black.cgColor
         target.layer.shadowOpacity = 0.45
@@ -165,12 +165,12 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
         NSLayoutConstraint.activate([
             target.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             target.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            target.widthAnchor.constraint(equalToConstant: 28),
-            target.heightAnchor.constraint(equalToConstant: 28),
+            target.widthAnchor.constraint(equalToConstant: geometryType == .openSpace ? 96 : 28),
+            target.heightAnchor.constraint(equalToConstant: geometryType == .openSpace ? 64 : 28),
             dot.centerXAnchor.constraint(equalTo: target.centerXAnchor),
             dot.centerYAnchor.constraint(equalTo: target.centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: 6),
-            dot.heightAnchor.constraint(equalToConstant: 6)
+            dot.widthAnchor.constraint(equalToConstant: geometryType == .openSpace ? 0 : 6),
+            dot.heightAnchor.constraint(equalToConstant: geometryType == .openSpace ? 0 : 6)
         ])
         context.coordinator.attachTarget(target, dot: dot)
         return view
@@ -259,6 +259,20 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
         private var guidedLastAcceptedCameraTransform: simd_float4x4?
         private var guidedLastAcceptedFrameTimestamp: TimeInterval = 0
         private var guidedCandidate: GuidedCornerMeasurement?
+        private var targetVolume: LocalTargetVolume?
+        private var surfaceCaptures: [CompartmentSurface: SurfaceCaptureRecord] = [:]
+        private var surfaceObservations: [SurfaceCaptureObservation] = []
+        private var surfaceCaptureStartedAt: TimeInterval?
+        private var surfaceFrameSequence = 0
+        private var surfaceLastAcceptedCameraTransform: simd_float4x4?
+        private var surfaceLastAcceptedFrameTimestamp: TimeInterval = 0
+        private var surfaceSelectedRegionSeed: Vector3D?
+        private var surfaceCandidate: SurfaceCaptureRecord?
+        private var surfaceEvidenceAnchor: AnchorEntity?
+
+        private let surfaceSequence: [CompartmentSurface] = [
+            .bottom, .back, .left, .right, .top, .frontOpening
+        ]
 
         init(
             measuredSurfaces: Binding<[MeasuredShelfSurface]>,
@@ -345,7 +359,7 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
                     if self.geometryType == .openSpace,
                        !self.manualBorderCorrection.wrappedValue,
                        self.measurementStage.wrappedValue == .boundary {
-                        self.startGuidedCornerScan()
+                        self.advanceSurfaceFirstWorkflow()
                     } else {
                         self.performPlacementAtCentre()
                     }
@@ -385,19 +399,19 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
             }
             if borderFinishRequestID != handledBorderFinishRequestID {
                 handledBorderFinishRequestID = borderFinishRequestID
-                DispatchQueue.main.async { [weak self] in self?.closeGuidedShape() }
+                DispatchQueue.main.async { [weak self] in self?.finalizeSurfaceFirstCompartment() }
             }
             if borderConfirmCornerRequestID != handledBorderConfirmCornerRequestID {
                 handledBorderConfirmCornerRequestID = borderConfirmCornerRequestID
-                DispatchQueue.main.async { [weak self] in self?.acceptGuidedCandidate() }
+                DispatchQueue.main.async { [weak self] in self?.acceptSurfaceCandidate() }
             }
             if borderContinueEdgeRequestID != handledBorderContinueEdgeRequestID {
                 handledBorderContinueEdgeRequestID = borderContinueEdgeRequestID
-                // No-op: continuous edge tracing is not part of active acquisition.
+                DispatchQueue.main.async { [weak self] in self?.confirmUsableOpening() }
             }
             if borderRescanEdgeRequestID != handledBorderRescanEdgeRequestID {
                 handledBorderRescanEdgeRequestID = borderRescanEdgeRequestID
-                DispatchQueue.main.async { [weak self] in self?.discardGuidedCandidate() }
+                DispatchQueue.main.async { [weak self] in self?.discardSurfaceCandidate() }
             }
             if guidanceResult?.id != handledGuidanceID {
                 handledGuidanceID = guidanceResult?.id
@@ -432,6 +446,17 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
             guidedLastAcceptedCameraTransform = nil
             guidedLastAcceptedFrameTimestamp = 0
             guidedCandidate = nil
+            targetVolume = nil
+            surfaceCaptures.removeAll()
+            surfaceObservations.removeAll()
+            surfaceCaptureStartedAt = nil
+            surfaceFrameSequence = 0
+            surfaceLastAcceptedCameraTransform = nil
+            surfaceLastAcceptedFrameTimestamp = 0
+            surfaceSelectedRegionSeed = nil
+            surfaceCandidate = nil
+            surfaceEvidenceAnchor?.removeFromParent()
+            surfaceEvidenceAnchor = nil
             coordinateEpoch = UUID()
             borderTraceBuilder.reset()
             sectionedBoundary.reset()
@@ -447,14 +472,15 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
             measurementStage.wrappedValue = .boundary
             pointStability.wrappedValue = .searching
             pointGuidance.wrappedValue = geometryType == .openSpace
-                ? "Find the base plane, then aim at the first physical corner."
+                ? "Point broadly at the middle of the storage compartment."
                 : "Move the reticle onto a visible shelf corner."
             cornerTelemetry.wrappedValue = .init()
             borderScanSnapshot.wrappedValue = BorderScanSnapshot(
                 state: hasLiDAR ? .findingBaseSurface : .failed(.lidarUnavailable),
                 status: hasLiDAR ? "Finding base surface" : "LiDAR unavailable",
                 lastError: hasLiDAR ? nil : .lidarUnavailable,
-                guidedState: hasLiDAR ? .findingBasePlane : .failed(.lidarUnavailable)
+                guidedState: hasLiDAR ? .findingBasePlane : .failed(.lidarUnavailable),
+                surfaceFirstState: hasLiDAR ? .findingCompartment : .failed
             )
             updateTargetAvailability()
         }
@@ -701,7 +727,7 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
                 if self.geometryType == .openSpace,
                    !self.manualBorderCorrection.wrappedValue,
                    self.measurementStage.wrappedValue == .boundary {
-                    self.collectGuidedCornerFrame(frame, trackingState: trackingState)
+                    self.collectSurfaceFirstFrame(frame, trackingState: trackingState)
                 } else {
                     self.collectReticleSample(
                         timestamp: timestamp,
@@ -709,6 +735,621 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
                     )
                 }
             }
+        }
+
+        @MainActor
+        private func advanceSurfaceFirstWorkflow() {
+            guard hasLiDAR, !coordinateEpochInvalid, surfaceCaptureStartedAt == nil,
+                  surfaceCandidate == nil else { return }
+            if targetVolume == nil {
+                guard let frame = arView?.session.currentFrame,
+                      let seed = depthPointAtCentre(frame: frame) else {
+                    borderScanSnapshot.wrappedValue.status = "Point broadly at the middle of the compartment"
+                    return
+                }
+                let camera = SIMD3<Float>(frame.camera.transform.columns.3.x,
+                                          frame.camera.transform.columns.3.y,
+                                          frame.camera.transform.columns.3.z)
+                let distance = Double(simd_distance(camera, seed))
+                let configuration = SurfaceCaptureConfiguration.standard
+                guard distance >= configuration.minimumDepthMetres,
+                      distance <= configuration.maximumDepthMetres else {
+                    borderScanSnapshot.wrappedValue.status = "The target is outside the validated operating range"
+                    borderScanSnapshot.wrappedValue.lastError = .pointOutOfRange
+                    return
+                }
+                coordinateEpoch = UUID()
+                let volume = LocalTargetVolume(
+                    centre: Vector3D(SIMD3<Double>(seed)),
+                    halfExtents: Vector3D(configuration.targetHalfExtentsMetres),
+                    coordinateEpoch: coordinateEpoch, seedDepthMetres: distance
+                )
+                targetVolume = volume
+                borderScanSnapshot.wrappedValue.targetVolume = volume
+                borderScanSnapshot.wrappedValue.surfaceFirstState = .confirmingTarget
+                borderScanSnapshot.wrappedValue.activeSurface = .bottom
+                borderScanSnapshot.wrappedValue.status = "Target region confirmed — point at the middle of the shelf bottom"
+                pointGuidance.wrappedValue = "Point at the middle of the shelf bottom. Precise corner aiming is not required."
+                renderTargetVolume(volume)
+                canPlacePoint.wrappedValue = true
+                return
+            }
+            guard let surface = nextSurface else {
+                finalizeSurfaceFirstCompartment()
+                return
+            }
+            guard let frame = arView?.session.currentFrame,
+                  let selectedSeed = depthPointAtCentre(frame: frame) else {
+                borderScanSnapshot.wrappedValue.status = "Point at the middle of the \(surface.scanTitle)"
+                return
+            }
+            surfaceSelectedRegionSeed = Vector3D(SIMD3<Double>(selectedSeed))
+            surfaceObservations.removeAll()
+            surfaceFrameSequence = 0
+            surfaceLastAcceptedCameraTransform = nil
+            surfaceLastAcceptedFrameTimestamp = 0
+            surfaceCaptureStartedAt = frame.timestamp
+            borderScanSnapshot.wrappedValue.surfaceFirstState = .scanningSurface
+            borderScanSnapshot.wrappedValue.activeSurface = surface
+            borderScanSnapshot.wrappedValue.scanProgress = 0
+            borderScanSnapshot.wrappedValue.status = "Scanning \(surface.scanTitle) — move slowly across this surface"
+            pointGuidance.wrappedValue = "Move slowly to capture the \(surface.scanTitle) from meaningfully different viewpoints."
+            canPlacePoint.wrappedValue = false
+        }
+
+        private var nextSurface: CompartmentSurface? {
+            surfaceSequence.first { surfaceCaptures[$0] == nil }
+        }
+
+        @MainActor
+        private func collectSurfaceFirstFrame(
+            _ frame: ARFrame, trackingState: ARCamera.TrackingState
+        ) {
+            guard hasLiDAR else {
+                borderScanSnapshot.wrappedValue.surfaceFirstState = .failed
+                borderScanSnapshot.wrappedValue.lastError = .lidarUnavailable
+                return
+            }
+            guard case .normal = trackingState else {
+                if case .limited(.relocalizing) = trackingState, targetVolume != nil {
+                    coordinateEpochInvalid = true
+                    surfaceCaptureStartedAt = nil
+                    surfaceObservations.removeAll()
+                    borderScanSnapshot.wrappedValue.surfaceFirstState = .failed
+                    borderScanSnapshot.wrappedValue.lastError = .inconsistentCoordinateSystem
+                    borderScanSnapshot.wrappedValue.status = "Tracking origin changed — restart the compartment scan"
+                } else {
+                    borderScanSnapshot.wrappedValue.status = "Tracking is limited — keep observed surfaces visible"
+                    borderScanSnapshot.wrappedValue.lastError = .trackingUnavailable
+                }
+                canPlacePoint.wrappedValue = false
+                return
+            }
+            guard !coordinateEpochInvalid else { return }
+            guard let started = surfaceCaptureStartedAt,
+                  let volume = targetVolume,
+                  let active = nextSurface,
+                  let selectedSeed = surfaceSelectedRegionSeed else {
+                canPlacePoint.wrappedValue = true
+                updateTargetAppearance(isValid: true)
+                return
+            }
+            let elapsed = frame.timestamp - started
+            borderScanSnapshot.wrappedValue.scanProgress = min(elapsed / 3.2, 1)
+            guard isIndependentSurfaceFrame(frame) else {
+                if elapsed >= 4.5 { finishSurfaceCapture(active, volume: volume, seed: selectedSeed) }
+                return
+            }
+            surfaceFrameSequence += 1
+            surfaceObservations.append(contentsOf: depthSurfaceObservations(
+                frame: frame, volume: volume, sequence: surfaceFrameSequence
+            ))
+            surfaceLastAcceptedCameraTransform = frame.camera.transform
+            surfaceLastAcceptedFrameTimestamp = frame.timestamp
+            cornerTelemetry.wrappedValue = CornerMeasurementTelemetry(
+                source: frame.smoothedSceneDepth == nil ? .sceneDepth : .smoothedSceneDepth,
+                tracking: .normal, distanceMetres: volume.seedDepthMetres,
+                surfaceHeightDifferenceMetres: nil, sampleCount: surfaceObservations.count,
+                confidence: surfaceObservations.map(\.depthConfidence).max()
+            )
+            if elapsed >= 2.4, surfaceFrameSequence >= SurfaceCaptureConfiguration.standard.minimumIndependentViews {
+                finishSurfaceCapture(active, volume: volume, seed: selectedSeed, allowMoreEvidence: elapsed < 3.8)
+            } else if elapsed >= 4.5 {
+                finishSurfaceCapture(active, volume: volume, seed: selectedSeed)
+            }
+        }
+
+        private func isIndependentSurfaceFrame(_ frame: ARFrame) -> Bool {
+            guard let previous = surfaceLastAcceptedCameraTransform else { return true }
+            let configuration = SurfaceCaptureConfiguration.standard
+            let oldPosition = SIMD3<Float>(previous.columns.3.x, previous.columns.3.y, previous.columns.3.z)
+            let newPosition = SIMD3<Float>(frame.camera.transform.columns.3.x,
+                                           frame.camera.transform.columns.3.y,
+                                           frame.camera.transform.columns.3.z)
+            let oldForward = -SIMD3<Float>(previous.columns.2.x, previous.columns.2.y, previous.columns.2.z)
+            let newForward = -SIMD3<Float>(frame.camera.transform.columns.2.x,
+                                           frame.camera.transform.columns.2.y, frame.camera.transform.columns.2.z)
+            let angle = acos(max(-1, min(1, simd_dot(simd_normalize(oldForward), simd_normalize(newForward)))))
+            return Double(simd_distance(oldPosition, newPosition)) >= configuration.minimumCameraTranslationMetres
+                || Double(angle) >= configuration.minimumViewingAngleRadians
+        }
+
+        private func depthSurfaceObservations(
+            frame: ARFrame, volume: LocalTargetVolume, sequence: Int
+        ) -> [SurfaceCaptureObservation] {
+            guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return [] }
+            let depthMap = depthData.depthMap, confidenceMap = depthData.confidenceMap
+            CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+            if let confidenceMap { CVPixelBufferLockBaseAddress(confidenceMap, .readOnly) }
+            defer {
+                CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+                if let confidenceMap { CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly) }
+            }
+            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return [] }
+            let width = CVPixelBufferGetWidth(depthMap), height = CVPixelBufferGetHeight(depthMap)
+            let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+            let depths = depthBase.assumingMemoryBound(to: Float32.self)
+            let confidences = confidenceMap.flatMap(CVPixelBufferGetBaseAddress)?.assumingMemoryBound(to: UInt8.self)
+            let confidenceStride = confidenceMap.map(CVPixelBufferGetBytesPerRow) ?? 0
+            let scaleX = Double(width) / Double(frame.camera.imageResolution.width)
+            let focal = Double(frame.camera.intrinsics.columns.0.x) * scaleX
+            let radius = AdaptiveDepthSampling.pixelRadius(
+                seedDepthMetres: volume.seedDepthMetres, focalLengthPixels: focal
+            )
+            let pixelStep = max(2, radius / 14)
+            let centreX = width / 2, centreY = height / 2
+            let camera = SIMD3<Double>(Double(frame.camera.transform.columns.3.x),
+                                       Double(frame.camera.transform.columns.3.y),
+                                       Double(frame.camera.transform.columns.3.z))
+            var result: [SurfaceCaptureObservation] = []
+            for y in stride(from: max(0, centreY - radius), through: min(height - 1, centreY + radius), by: pixelStep) {
+                for x in stride(from: max(0, centreX - radius), through: min(width - 1, centreX + radius), by: pixelStep) {
+                    let depth = depths[y * depthStride + x]
+                    let level = confidences.map { $0[y * confidenceStride + x] }
+                        ?? UInt8(ARConfidenceLevel.medium.rawValue)
+                    let confidence = Double(level) / Double(ARConfidenceLevel.high.rawValue)
+                    guard depth.isFinite,
+                          Double(depth) >= SurfaceCaptureConfiguration.standard.minimumDepthMetres,
+                          Double(depth) <= SurfaceCaptureConfiguration.standard.maximumDepthMetres,
+                          confidence >= SurfaceCaptureConfiguration.standard.minimumDepthConfidence,
+                          let world = worldPoint(depthPixelX: x, y: y, depth: depth,
+                                                 depthWidth: width, depthHeight: height, frame: frame)
+                    else { continue }
+                    let point = Vector3D(SIMD3<Double>(world))
+                    guard volume.contains(point) else { continue }
+                    var normal: Vector3D?
+                    if x + pixelStep < width, y + pixelStep < height {
+                        let dx = depths[y * depthStride + x + pixelStep]
+                        let dy = depths[(y + pixelStep) * depthStride + x]
+                        if dx.isFinite, dy.isFinite,
+                           let wx = worldPoint(depthPixelX: x + pixelStep, y: y, depth: dx,
+                                               depthWidth: width, depthHeight: height, frame: frame),
+                           let wy = worldPoint(depthPixelX: x, y: y + pixelStep, depth: dy,
+                                               depthWidth: width, depthHeight: height, frame: frame) {
+                            let value = simd_cross(SIMD3<Double>(wx - world), SIMD3<Double>(wy - world))
+                            if simd_length(value) > 1e-8 { normal = Vector3D(simd_normalize(value)) }
+                        }
+                    }
+                    let direction = simd_normalize(point.simd - camera)
+                    result.append(SurfaceCaptureObservation(
+                        id: UUID(), position: point, normal: normal,
+                        cameraPosition: Vector3D(camera), viewingDirection: Vector3D(direction),
+                        depthConfidence: confidence, trackingState: .normal,
+                        frameSequence: sequence, timestamp: frame.timestamp,
+                        coordinateEpoch: coordinateEpoch
+                    ))
+                }
+            }
+            return result
+        }
+
+        @MainActor
+        private func finishSurfaceCapture(
+            _ surface: CompartmentSurface, volume: LocalTargetVolume, seed: Vector3D,
+            allowMoreEvidence: Bool = false
+        ) {
+            let accepted = surfaceCaptures.values.map(\.fittedPlane)
+            switch SurfaceFirstPlaneEstimator.fit(
+                surface: surface, observations: surfaceObservations,
+                targetVolume: volume, selectedRegionSeed: seed, acceptedSurfaces: accepted
+            ) {
+            case .success(let record):
+                surfaceCandidate = record
+                surfaceCaptureStartedAt = nil
+                borderScanSnapshot.wrappedValue.surfaceCandidate = record
+                borderScanSnapshot.wrappedValue.surfaceFirstState = .reviewingSurface
+                borderScanSnapshot.wrappedValue.scanProgress = 1
+                borderScanSnapshot.wrappedValue.confidenceLevel = record.fittedPlane.uncertaintyMetres <= 0.008 ? .high : .medium
+                borderScanSnapshot.wrappedValue.status = "\(surface.scanTitle.capitalized) surface found — inspect and accept or rescan"
+                pointGuidance.wrappedValue = "Review the fitted \(surface.scanTitle) surface."
+                renderSurfaceEvidence(record)
+            case .failure(let error):
+                if allowMoreEvidence { return }
+                renderRejectedSurfaceEvidence(
+                    surfaceObservations,
+                    conflicting: error == .ambiguousSurfaces
+                )
+                surfaceCaptureStartedAt = nil
+                surfaceObservations.removeAll()
+                borderScanSnapshot.wrappedValue.surfaceFirstState = .confirmingTarget
+                borderScanSnapshot.wrappedValue.status = error.localizedDescription
+                borderScanSnapshot.wrappedValue.lastError = .unstableMeasurement
+                canPlacePoint.wrappedValue = true
+            }
+        }
+
+        @MainActor
+        private func acceptSurfaceCandidate() {
+            guard var candidate = surfaceCandidate,
+                  candidate.coordinateEpoch == coordinateEpoch else { return }
+            candidate.approval = .accepted
+            surfaceCaptures[candidate.surface] = candidate
+            surfaceCandidate = nil
+            surfaceObservations.removeAll()
+            borderScanSnapshot.wrappedValue.surfaceCandidate = nil
+            borderScanSnapshot.wrappedValue.acceptedSurfaces = surfaceSequence.filter { surfaceCaptures[$0] != nil }
+            borderScanSnapshot.wrappedValue.acceptedCornerCount = surfaceCaptures.count
+            recomputeSurfaceCorners()
+            if let next = nextSurface {
+                borderScanSnapshot.wrappedValue.activeSurface = next
+                borderScanSnapshot.wrappedValue.surfaceFirstState = .confirmingTarget
+                borderScanSnapshot.wrappedValue.status = "\(candidate.surface.scanTitle.capitalized) accepted — point at the middle of the \(next.scanTitle)"
+                pointGuidance.wrappedValue = "Point at the middle of the \(next.scanTitle)."
+                canPlacePoint.wrappedValue = true
+            } else {
+                borderScanSnapshot.wrappedValue.surfaceFirstState = .reviewingGeometry
+                if borderScanSnapshot.wrappedValue.compartmentDimensions != nil {
+                    borderScanSnapshot.wrappedValue.status = "Supporting surfaces accepted — review calculated corners and dimensions"
+                    borderScanSnapshot.wrappedValue.canFinish = !borderScanSnapshot.wrappedValue.calculatedCorners.isEmpty
+                } else {
+                    borderScanSnapshot.wrappedValue.status = "Accepted planes contradict a rectangular compartment — rescan the highlighted surface"
+                    borderScanSnapshot.wrappedValue.canFinish = false
+                }
+                canPlacePoint.wrappedValue = false
+            }
+        }
+
+        @MainActor
+        private func discardSurfaceCandidate() {
+            surfaceCandidate = nil
+            surfaceObservations.removeAll()
+            surfaceCaptureStartedAt = nil
+            borderScanSnapshot.wrappedValue.surfaceCandidate = nil
+            borderScanSnapshot.wrappedValue.surfaceFirstState = .confirmingTarget
+            if let next = nextSurface {
+                borderScanSnapshot.wrappedValue.status = "Point at the middle of the \(next.scanTitle) and rescan"
+            }
+            canPlacePoint.wrappedValue = true
+        }
+
+        @MainActor
+        private func recomputeSurfaceCorners() {
+            guard let volume = targetVolume else { return }
+            let planes = Dictionary(uniqueKeysWithValues: surfaceCaptures.map { ($0.key, $0.value.fittedPlane) })
+            let combinations: [[CompartmentSurface]] = [
+                [.bottom, .left, .back], [.bottom, .right, .back],
+                [.top, .left, .back], [.top, .right, .back],
+                [.bottom, .left, .frontOpening], [.bottom, .right, .frontOpening],
+                [.top, .left, .frontOpening], [.top, .right, .frontOpening]
+            ]
+            let corners = combinations.compactMap { surfaces -> CompartmentCornerEvidence? in
+                guard let a = planes[surfaces[0]], let b = planes[surfaces[1]], let c = planes[surfaces[2]],
+                      case .success(let corner) = CompartmentPlaneGeometry.intersect(a, b, c, targetVolume: volume)
+                else { return nil }
+                return corner
+            }
+            let assessment = RectangularCompartmentEvaluator.evaluate(planes: Array(planes.values))
+            let dimensions = assessment.approval == .rejected
+                ? nil
+                : CompartmentPlaneGeometry.dimensions(planes: Array(planes.values))
+            borderScanSnapshot.wrappedValue.calculatedCorners = corners
+            borderScanSnapshot.wrappedValue.compartmentDimensions = dimensions
+            if let dimensions { publishSurfaceFirstDraft(corners: corners, dimensions: dimensions) }
+            if nextSurface == nil, let failure = assessment.failureReason {
+                borderScanSnapshot.wrappedValue.status = failure
+                borderScanSnapshot.wrappedValue.canFinish = false
+            }
+            renderAcceptedSurfaceGeometry(corners: corners)
+        }
+
+        private func publishSurfaceFirstDraft(
+            corners: [CompartmentCornerEvidence], dimensions: CompartmentDimensions
+        ) {
+            guard let volume = targetVolume else { return }
+            let localBoundary = [
+                Vector3D(0, 0, 0), Vector3D(dimensions.interiorWidthMetres, 0, 0),
+                Vector3D(dimensions.interiorWidthMetres, 0, dimensions.interiorDepthMetres),
+                Vector3D(0, 0, dimensions.interiorDepthMetres)
+            ]
+            let uncertainty = surfaceCaptures.values.map { $0.fittedPlane.uncertaintyMetres }.max() ?? 0.05
+            var measuredDimensions = [
+                dimensions.interiorWidthMetres, dimensions.interiorDepthMetres
+            ]
+            if let height = dimensions.interiorHeightMetres { measuredDimensions.append(height) }
+            if let openingWidth = dimensions.openingWidthMetres { measuredDimensions.append(openingWidth) }
+            if let openingHeight = dimensions.openingHeightMetres { measuredDimensions.append(openingHeight) }
+            let dimensionDiagnostics = measuredDimensions.map { measured in
+                DimensionUncertainty(
+                    measuredMetres: measured,
+                    estimatedUncertaintyMetres: dimensions.uncertaintyMetres,
+                    robustFitResidualMetres: surfaceCaptures.values.map { $0.fittedPlane.rmsResidualMetres }.max() ?? 0,
+                    repeatabilityMetres: uncertainty,
+                    spatialCoverage: surfaceCaptures.values.map { min($0.coverageFirstAxisMetres, $0.coverageSecondAxisMetres) }.min() ?? 0,
+                    viewingDiversityRadians: surfaceCaptures.values.map { $0.fittedPlane.viewingDiversityRadians }.min() ?? 0,
+                    closureErrorMetres: 0, inferencePenaltyMetres: 0,
+                    correctionDisplacementMetres: 0, correlatedSampleFraction: 0
+                )
+            }
+            let record = SurfaceFirstCompartmentRecord(
+                targetVolume: volume, surfaces: surfaceSequence.compactMap { surfaceCaptures[$0] },
+                corners: corners, dimensions: dimensions, rectangularCorrectionApproved: false,
+                approval: .proposed, schemaVersion: 1
+            )
+            let plane = surfaceCaptures[.bottom]?.fittedPlane.plane
+                ?? CodablePlane(origin: volume.centre, normal: Vector3D(0, 1, 0))
+            let polygon = localBoundary.map { Vector2D($0.x, $0.z) }
+            let boundary = ScannedStorageBoundary(
+                id: UUID(), basePlane: plane, surfaceType: surfaceType,
+                rawTrace: [], detectedSegments: [], detectedCorners: [],
+                simplifiedPolygon: polygon, approvedPolygon: [], suggestedPolygon: nil,
+                geometryConfidence: max(0, 1 - uncertainty / 0.05),
+                validationState: dimensions.hasVerifiedUsableOpening ? .valid : .draft,
+                processingMetrics: .init(maximumSimplificationDisplacementMetres: 0,
+                                         averageSimplificationDisplacementMetres: 0,
+                                         inferredGapLengthMetres: 0, manualEditCount: 0),
+                measurementMethod: .fittedCompartmentPlanes, deviceHasLiDAR: true,
+                schemaVersion: 7, createdAt: .now, updatedAt: .now,
+                shapeIntent: .rectangularCompartment, acquisitionSections: nil,
+                circleFit: nil, dimensionUncertainties: dimensionDiagnostics,
+                approvalState: .proposed,
+                globalMapUncertaintyMetres: dimensions.uncertaintyMetres,
+                localPlacementUncertaintyMetres: dimensions.uncertaintyMetres,
+                guidedCornerMeasurements: nil, surfaceFirstCompartment: record
+            )
+            let geometry = ShelfGeometryRecord(
+                version: 2, inputRevision: UUID(), rawBoundary: localBoundary,
+                correctedBoundary: nil, approvedBoundary: [], detectedShapeType: .rectangle,
+                requestedShapeIntent: .rectangular, boundaryMeaning: .innerUsable,
+                correctionConfidence: 0, scanConfidence: boundary.geometryConfidence,
+                correctionReasons: [], approval: .draft, approvedAt: nil,
+                placementSafetyMarginCM: ShelfBoundaryAnalysisConfiguration.shelf.placementSafetyMarginCM,
+                measurementMetadata: ShelfMeasurementMetadata(
+                    capturedAt: .now, deviceModel: ObjectScannerCapabilities.deviceModelIdentifier,
+                    hasLiDAR: true, coordinateSpace: .shelfLocal, unit: .metres,
+                    planeRMSResidualMetres: surfaceCaptures.values.map { $0.fittedPlane.rmsResidualMetres }.max() ?? 0,
+                    planeMaximumResidualMetres: surfaceCaptures.values.map { $0.fittedPlane.maximumResidualMetres }.max() ?? 0,
+                    cornerMeasurements: [], expectedWidthCM: nil, expectedDepthCM: nil
+                )
+            )
+            measuredSurfaces.wrappedValue = [MeasuredShelfSurface(
+                id: boundary.id, widthCM: dimensions.interiorWidthMetres * 100,
+                depthCM: dimensions.interiorDepthMetres * 100,
+                measuredFreeHeightCM: dimensions.interiorHeightMetres.map { $0 * 100 },
+                frontDirectionLocal: nil, originLocal: .init(0, 0, 0),
+                scanConfidence: boundary.geometryConfidence,
+                boundaryClosed: dimensions.hasVerifiedUsableOpening,
+                geometry: geometry, boundaryAnalysis: nil, cornerMetadata: [],
+                measuredSpaceCorners: [], scannedBoundary: boundary
+            )]
+            mappedPointCount.wrappedValue = corners.count
+        }
+
+        @MainActor
+        private func confirmUsableOpening() {
+            guard var dimensions = borderScanSnapshot.wrappedValue.compartmentDimensions,
+                  nextSurface == nil else { return }
+            // Explicitly confirming that no lip/track/trim reduces the passage is
+            // the only case where the interior cross-section may define opening.
+            dimensions.openingWidthMetres = dimensions.interiorWidthMetres
+            dimensions.openingHeightMetres = dimensions.interiorHeightMetres
+            dimensions.hasVerifiedUsableOpening = dimensions.interiorHeightMetres != nil
+            borderScanSnapshot.wrappedValue.compartmentDimensions = dimensions
+            borderScanSnapshot.wrappedValue.canFinish = dimensions.hasVerifiedUsableOpening
+            borderScanSnapshot.wrappedValue.status = dimensions.hasVerifiedUsableOpening
+                ? "Usable opening confirmed — calculate and approve geometry"
+                : "Top surface is required before the opening can be confirmed"
+            publishSurfaceFirstDraft(
+                corners: borderScanSnapshot.wrappedValue.calculatedCorners,
+                dimensions: dimensions
+            )
+        }
+
+        @MainActor
+        private func finalizeSurfaceFirstCompartment() {
+            guard nextSurface == nil, let volume = targetVolume else {
+                if let next = nextSurface {
+                    borderScanSnapshot.wrappedValue.status = "Scan and accept the \(next.scanTitle) before calculating corners"
+                }
+                return
+            }
+            recomputeSurfaceCorners()
+            let corners = borderScanSnapshot.wrappedValue.calculatedCorners
+            guard corners.count == 8, let dimensions = borderScanSnapshot.wrappedValue.compartmentDimensions else {
+                borderScanSnapshot.wrappedValue.status = "Corner uncertainty is too high—rescan the highlighted supporting surface"
+                return
+            }
+            let record = SurfaceFirstCompartmentRecord(
+                targetVolume: volume,
+                surfaces: surfaceSequence.compactMap { surfaceCaptures[$0] }, corners: corners,
+                dimensions: dimensions, rectangularCorrectionApproved: false,
+                approval: .proposed, schemaVersion: 1
+            )
+            // A fitted front plane defines depth, but a lip/track can still make the
+            // passage smaller. Keep the opening unverified and refuse fit authorization.
+            guard dimensions.hasVerifiedUsableOpening else {
+                borderScanSnapshot.wrappedValue.surfaceFirstState = .reviewingGeometry
+                borderScanSnapshot.wrappedValue.status = "Interior measured; usable opening is unverified. Measure the lip/frame or enter opening dimensions."
+                borderScanSnapshot.wrappedValue.canFinish = false
+                persistSurfaceFirstDiagnostics(record)
+                return
+            }
+            guard let measured = measuredSurfaces.wrappedValue.first,
+                  var boundary = measured.scannedBoundary,
+                  var geometry = measured.geometry else { return }
+            var approvedRecord = record
+            approvedRecord.approval = .approvedRaw
+            boundary.surfaceFirstCompartment = approvedRecord
+            boundary.validationState = .valid
+            boundary.approvedPolygon = boundary.simplifiedPolygon
+            boundary.approvalState = .approvedRaw
+            geometry.approvedBoundary = geometry.rawBoundary
+            geometry.approval = .approvedRaw
+            geometry.approvedAt = .now
+            measuredSurfaces.wrappedValue = [MeasuredShelfSurface(
+                id: measured.id, widthCM: measured.widthCM, depthCM: measured.depthCM,
+                measuredFreeHeightCM: measured.measuredFreeHeightCM,
+                frontDirectionLocal: Vector3D(0, 0, 1), originLocal: Vector3D(0, 0, 0),
+                scanConfidence: measured.scanConfidence, boundaryClosed: true,
+                geometry: geometry, boundaryAnalysis: measured.boundaryAnalysis,
+                cornerMetadata: measured.cornerMetadata,
+                measuredSpaceCorners: measured.measuredSpaceCorners,
+                scannedBoundary: boundary
+            )]
+            borderScanSnapshot.wrappedValue.surfaceFirstState = .completed
+            borderScanSnapshot.wrappedValue.status = "Compartment approved — confirm the opening-to-back access direction"
+            measurementStage.wrappedValue = .frontConfirmation
+        }
+
+        private func persistSurfaceFirstDiagnostics(_ record: SurfaceFirstCompartmentRecord) {
+            guard let surface = measuredSurfaces.wrappedValue.first,
+                  var boundary = surface.scannedBoundary else { return }
+            boundary.surfaceFirstCompartment = record
+            boundary.schemaVersion = max(boundary.schemaVersion, 7)
+            measuredSurfaces.wrappedValue = [surface.replacingScannedBoundary(boundary)]
+        }
+
+        @MainActor
+        private func renderTargetVolume(_ volume: LocalTargetVolume) {
+            guard let arView else { return }
+            surfaceEvidenceAnchor?.removeFromParent()
+            let anchor = AnchorEntity(world: matrix_identity_float4x4)
+            var material = UnlitMaterial()
+            material.color = .init(tint: UIColor.systemCyan.withAlphaComponent(0.10), texture: nil)
+            let box = ModelEntity(
+                mesh: .generateBox(width: Float(volume.halfExtents.x * 2),
+                                   height: Float(volume.halfExtents.y * 2),
+                                   depth: Float(volume.halfExtents.z * 2)), materials: [material]
+            )
+            box.position = SIMD3(Float(volume.centre.x), Float(volume.centre.y), Float(volume.centre.z))
+            anchor.addChild(box)
+            arView.scene.addAnchor(anchor)
+            surfaceEvidenceAnchor = anchor
+        }
+
+        @MainActor
+        private func renderSurfaceEvidence(_ record: SurfaceCaptureRecord) {
+            guard let arView else { return }
+            surfaceEvidenceAnchor?.removeFromParent()
+            let anchor = AnchorEntity(world: matrix_identity_float4x4)
+            let accepted = Set(record.acceptedObservationIDs)
+            for observation in record.diagnosticObservations.prefix(180) {
+                var material = UnlitMaterial()
+                material.color = .init(tint: accepted.contains(observation.id)
+                    ? UIColor.systemGreen.withAlphaComponent(0.8)
+                    : UIColor.systemGray.withAlphaComponent(0.35), texture: nil)
+                let point = ModelEntity(mesh: .generateSphere(radius: 0.003), materials: [material])
+                point.position = SIMD3(Float(observation.position.x), Float(observation.position.y), Float(observation.position.z))
+                anchor.addChild(point)
+            }
+            var planeMaterial = UnlitMaterial()
+            planeMaterial.color = .init(tint: UIColor.systemGreen.withAlphaComponent(0.22), texture: nil)
+            let sheet = ModelEntity(
+                mesh: .generatePlane(width: Float(record.coverageFirstAxisMetres),
+                                     depth: Float(record.coverageSecondAxisMetres)),
+                materials: [planeMaterial]
+            )
+            sheet.position = SIMD3(Float(record.fittedPlane.plane.origin.x),
+                                   Float(record.fittedPlane.plane.origin.y),
+                                   Float(record.fittedPlane.plane.origin.z))
+            sheet.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0),
+                                           to: SIMD3<Float>(record.fittedPlane.plane.normal.normalized.simd))
+            anchor.addChild(sheet)
+            arView.scene.addAnchor(anchor)
+            surfaceEvidenceAnchor = anchor
+        }
+
+        @MainActor
+        private func renderRejectedSurfaceEvidence(
+            _ observations: [SurfaceCaptureObservation], conflicting: Bool
+        ) {
+            guard let arView else { return }
+            surfaceEvidenceAnchor?.removeFromParent()
+            let anchor = AnchorEntity(world: matrix_identity_float4x4)
+            for observation in observations.prefix(180) {
+                var material = UnlitMaterial()
+                material.color = .init(
+                    tint: (conflicting ? UIColor.systemRed : UIColor.systemGray).withAlphaComponent(0.5),
+                    texture: nil
+                )
+                let point = ModelEntity(mesh: .generateSphere(radius: 0.003), materials: [material])
+                point.position = SIMD3(Float(observation.position.x), Float(observation.position.y), Float(observation.position.z))
+                anchor.addChild(point)
+            }
+            arView.scene.addAnchor(anchor)
+            surfaceEvidenceAnchor = anchor
+        }
+
+        @MainActor
+        private func renderAcceptedSurfaceGeometry(corners: [CompartmentCornerEvidence]) {
+            guard let arView else { return }
+            surfaceEvidenceAnchor?.removeFromParent()
+            let anchor = AnchorEntity(world: matrix_identity_float4x4)
+            let colors: [CompartmentSurface: UIColor] = [
+                .bottom: .systemGreen, .back: .systemBlue, .left: .systemOrange,
+                .right: .systemPurple, .top: .systemYellow, .frontOpening: .systemTeal
+            ]
+            for surface in surfaceSequence {
+                guard let capture = surfaceCaptures[surface] else { continue }
+                var material = UnlitMaterial()
+                material.color = .init(tint: (colors[surface] ?? .white).withAlphaComponent(0.20), texture: nil)
+                let sheet = ModelEntity(
+                    mesh: .generatePlane(width: Float(capture.coverageFirstAxisMetres),
+                                         depth: Float(capture.coverageSecondAxisMetres)),
+                    materials: [material]
+                )
+                sheet.position = SIMD3(Float(capture.fittedPlane.plane.origin.x),
+                                       Float(capture.fittedPlane.plane.origin.y),
+                                       Float(capture.fittedPlane.plane.origin.z))
+                sheet.orientation = simd_quatf(
+                    from: SIMD3<Float>(0, 1, 0),
+                    to: SIMD3<Float>(capture.fittedPlane.plane.normal.normalized.simd)
+                )
+                anchor.addChild(sheet)
+            }
+            for corner in corners {
+                var markerMaterial = UnlitMaterial()
+                markerMaterial.color = .init(tint: .systemPink, texture: nil)
+                let marker = ModelEntity(mesh: .generateSphere(radius: 0.012), materials: [markerMaterial])
+                marker.position = SIMD3(Float(corner.position.x), Float(corner.position.y), Float(corner.position.z))
+                anchor.addChild(marker)
+                var uncertaintyMaterial = UnlitMaterial()
+                uncertaintyMaterial.color = .init(tint: UIColor.systemPink.withAlphaComponent(0.15), texture: nil)
+                let uncertainty = ModelEntity(
+                    mesh: .generateSphere(radius: Float(min(max(corner.uncertaintyMetres, 0.004), 0.08))),
+                    materials: [uncertaintyMaterial]
+                )
+                uncertainty.position = marker.position
+                anchor.addChild(uncertainty)
+            }
+            for first in corners.indices {
+                for second in corners.indices where second > first {
+                    let shared = Set(corners[first].supportingSurfaces)
+                        .intersection(corners[second].supportingSurfaces).count
+                    if shared == 2 {
+                        anchor.addChild(spatialLine(
+                            from: SIMD3(Float(corners[first].position.x),
+                                        Float(corners[first].position.y),
+                                        Float(corners[first].position.z)),
+                            to: SIMD3(Float(corners[second].position.x),
+                                      Float(corners[second].position.y),
+                                      Float(corners[second].position.z)),
+                            color: .systemCyan
+                        ))
+                    }
+                }
+            }
+            arView.scene.addAnchor(anchor)
+            surfaceEvidenceAnchor = anchor
         }
 
         @MainActor
@@ -1713,8 +2354,8 @@ struct LiDARSurfaceScannerView: UIViewRepresentable {
             switch measurementStage.wrappedValue {
             case .boundary:
                 if geometryType == .openSpace, !manualBorderCorrection.wrappedValue {
-                    isValid = !coordinateEpochInvalid && selectedPlane != nil
-                        && guidedCaptureStartedAt == nil && guidedCandidate == nil
+                    isValid = !coordinateEpochInvalid
+                        && surfaceCaptureStartedAt == nil && surfaceCandidate == nil
                 } else {
                     isValid = !coordinateEpochInvalid && currentPointEstimate?.canPlace == true
                 }

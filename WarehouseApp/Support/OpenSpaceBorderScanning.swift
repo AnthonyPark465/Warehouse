@@ -111,6 +111,9 @@ struct ScannedStorageBoundary: Codable, Equatable, Identifiable {
     var localPlacementUncertaintyMetres: Double? = nil
     /// Schema v6 guided-corner evidence. Nil marks a legacy continuous/sectioned trace.
     var guidedCornerMeasurements: [GuidedCornerMeasurement]? = nil
+    /// Schema v7 surface-first evidence. Nil identifies legacy corner/border capture and
+    /// must never be interpreted as satisfying the surface-first accuracy standard.
+    var surfaceFirstCompartment: SurfaceFirstCompartmentRecord? = nil
 }
 
 struct BorderDetectionEvidence: Equatable {
@@ -506,4 +509,11 @@ struct BorderScanSnapshot: Equatable {
     var acceptedCornerCount = 0
     var selectedCornerIndex: Int?
     var scanProgress: Double = 0
+    var surfaceFirstState: SurfaceFirstAcquisitionState?
+    var activeSurface: CompartmentSurface?
+    var acceptedSurfaces: [CompartmentSurface] = []
+    var surfaceCandidate: SurfaceCaptureRecord?
+    var targetVolume: LocalTargetVolume?
+    var calculatedCorners: [CompartmentCornerEvidence] = []
+    var compartmentDimensions: CompartmentDimensions?
 }

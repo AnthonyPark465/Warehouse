@@ -479,9 +479,9 @@ struct PlacementView: View {
             }
             if showBorderScanHelp {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Aim at one physical corner at a time.")
-                    Text("Press Scan Corner, then move slightly for 1–2 seconds so both supporting edges or walls are visible.")
-                    Text("Accepted corners stay fixed. The dashed line is only a proposed closure.")
+                    Text("Point broadly at the middle of the requested surface—not at a corner.")
+                    Text("Scan only one labelled surface at a time and move slowly between distinct viewpoints.")
+                    Text("Corners are calculated from accepted plane intersections; the broad target never places them.")
                 }
                 .font(.caption)
                 .padding(10)
@@ -503,23 +503,21 @@ struct PlacementView: View {
             .padding(.vertical, 8)
             .background(.regularMaterial, in: Capsule())
 
-            if case .scanning = borderScanSnapshot.guidedState {
+            if borderScanSnapshot.surfaceFirstState == .scanningSurface {
                 ProgressView(value: borderScanSnapshot.scanProgress)
                     .frame(maxWidth: 280)
-                Text("Collecting independent depth views…")
+                Text("Collecting independent, confidence-filtered depth views…")
                     .font(.caption2)
             }
 
-            if let candidate = borderScanSnapshot.candidate {
+            if let candidate = borderScanSnapshot.surfaceCandidate {
                 VStack(spacing: 6) {
-                    Text(candidate.provenance == .inferredFromSupportingGeometry
-                        ? "Inferred from supporting planes — explicit approval required"
-                        : "Direct edge-intersection candidate")
+                    Text("Fitted \(candidate.surface.scanTitle) surface")
                         .font(.caption.weight(.semibold))
-                    Text("Uncertainty ±\(format(candidate.uncertaintyMetres * 100)) cm · \(candidate.independentFrameCount) independent frames · RMS \(format(candidate.rmsResidualMetres * 100)) cm")
+                    Text("Uncertainty ±\(format(candidate.fittedPlane.uncertaintyMetres * 100)) cm · \(candidate.independentViewCount) independent views · RMS \(format(candidate.fittedPlane.rmsResidualMetres * 100)) cm · coverage \(format(candidate.coverageFirstAxisMetres * 100)) × \(format(candidate.coverageSecondAxisMetres * 100)) cm")
                         .font(.caption2.monospacedDigit())
                     HStack(spacing: 10) {
-                        Button("Accept Corner") { borderConfirmCornerRequestID += 1 }
+                        Button("Accept Surface") { borderConfirmCornerRequestID += 1 }
                             .buttonStyle(.borderedProminent)
                         Button("Rescan") { borderRescanEdgeRequestID += 1 }
                             .buttonStyle(.bordered)
@@ -531,18 +529,40 @@ struct PlacementView: View {
                 Button {
                     shelfPlacementRequestID += 1
                 } label: {
-                    Label(borderScanSnapshot.acceptedCornerCount == 0 ? "Scan Corner" : "Add Corner",
-                          systemImage: "viewfinder.circle")
+                    Label(
+                        borderScanSnapshot.targetVolume == nil
+                            ? "Confirm Target Region"
+                            : "Scan \((borderScanSnapshot.activeSurface ?? .bottom).scanTitle.capitalized)",
+                        systemImage: "viewfinder.circle"
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(!shelfCanPlacePoint || borderScanSnapshot.lastError == .inconsistentCoordinateSystem)
             }
 
+            if !borderScanSnapshot.acceptedSurfaces.isEmpty {
+                Text("Accepted: \(borderScanSnapshot.acceptedSurfaces.map { $0.scanTitle }.joined(separator: ", "))")
+                    .font(.caption2)
+            }
+            if let dimensions = borderScanSnapshot.compartmentDimensions {
+                Text("Interior \(format(dimensions.interiorWidthMetres * 100)) × \(format(dimensions.interiorDepthMetres * 100)) × \(dimensions.interiorHeightMetres.map { format($0 * 100) } ?? "—") cm · opening \(dimensions.hasVerifiedUsableOpening ? "verified" : "not verified")")
+                    .font(.caption2.monospacedDigit())
+                if borderScanSnapshot.surfaceFirstState == .reviewingGeometry,
+                   !dimensions.hasVerifiedUsableOpening {
+                    Button("Confirm No Lip, Track, or Smaller Frame") {
+                        borderContinueEdgeRequestID += 1
+                    }
+                    .buttonStyle(.bordered)
+                    Text("Do not confirm this if any passage restriction is present; measure the smaller opening instead.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
             HStack(spacing: 10) {
-                Button("Undo Last Corner") { shelfUndoRequestID += 1 }
-                    .disabled(borderScanSnapshot.acceptedCornerCount == 0)
-                Button("Close Shape") { borderFinishRequestID += 1 }
-                    .disabled(!borderScanSnapshot.canFinish || borderScanSnapshot.candidate != nil)
+                Button("Rescan All", role: .destructive) { lidarResetToken += 1 }
+                    .disabled(borderScanSnapshot.acceptedSurfaces.isEmpty)
+                Button("Calculate Geometry") { borderFinishRequestID += 1 }
+                    .disabled(borderScanSnapshot.surfaceFirstState != .reviewingGeometry)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)

@@ -614,6 +614,7 @@ enum RectangularCompartmentEvaluator {
         let missing = required.filter { bySurface[$0]?.evidenceState != .accepted }
         let contradictory = oppositeContradiction(bySurface[.left], bySurface[.right])
             || oppositeContradiction(bySurface[.bottom], bySurface[.top])
+            || oppositeContradiction(bySurface[.back], bySurface[.frontOpening])
         let tapered = if let frontOpeningWidthMetres, let interiorWidthMetres {
             abs(frontOpeningWidthMetres - interiorWidthMetres) > taperToleranceMetres
         } else { false }

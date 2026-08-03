@@ -196,6 +196,7 @@ final class BorderScanPersistenceTests: XCTestCase {
         XCTAssertNil(decoded.dimensionUncertainties)
         XCTAssertNil(decoded.approvalState)
         XCTAssertNil(decoded.guidedCornerMeasurements)
+        XCTAssertNil(decoded.surfaceFirstCompartment)
 
         var versionFive = boundary
         versionFive.schemaVersion = 5
