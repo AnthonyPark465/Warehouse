@@ -3,15 +3,15 @@ import simd
 
 struct PlacementView: View {
     @Environment(InventoryStore.self) private var store
+    @Environment(AuthService.self) private var auth
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var selectedProduct: Product?
     @State private var width = "30"
     @State private var height = "20"
     @State private var depth = "25"
-    @State private var weight = "4"
+    @State private var weight = ""
     @State private var velocity = 0.5
-    @State private var scale: WarehouseScale = .growing
     @State private var showProductScanner = false
     @State private var showSurfaceScanner = false
     @State private var scanGeometryType: StorageGeometryType = .shelf
@@ -47,13 +47,28 @@ struct PlacementView: View {
     @State private var expectedShelfWidth = ""
     @State private var expectedShelfDepth = ""
     @State private var shelfReviewError: String?
-    @State private var selectedRecommendation: PlacementRecommendation?
     @State private var verification: PlacementVerification?
     @State private var showVerificationScanner = false
     @State private var preciseCalculation: PlacementCalculation?
     @State private var selectedPrecisePlacement: ProductPlacementResult?
     @State private var isCalculating = false
-    @State private var alternativeIndex = 0
+    @State private var markerStage: StorageMarkerStage = .selectSurface
+    @State private var markerDraft: StorageMarkerDraft?
+    @State private var markerCount = 0
+    @State private var markerCanPlace = false
+    @State private var markerGuidance = "Aim at the horizontal surface where products will sit."
+    @State private var markerError: String?
+    @State private var markerPlacementRequestID = 0
+    @State private var markerUndoRequestID = 0
+    @State private var markerResetRequestID = 0
+    @State private var markerPreviewRequestID = 0
+    @State private var markerUseCorrectedFootprint = true
+    @State private var operationalShelves: [ShelfState] = []
+    @State private var selectedShelfID = ""
+    @State private var placementReservation: PlacementReservation?
+    @State private var reservedPackageProfile: PackagePlacementProfile?
+    @State private var placementStatusMessage: String?
+    @State private var isPersistingPlacement = false
 
     var body: some View {
         NavigationStack {
@@ -81,13 +96,17 @@ struct PlacementView: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .background, showSurfaceScanner else { return }
-                shelfReviewError = "The AR session was interrupted. The unfinished geometry remains a draft and must be rescanned before placement."
+                markerError = "The AR session was interrupted. Restart the measurement so markers do not mix coordinate systems."
+                markerDraft = nil
+                markerStage = .selectSurface
+                markerCount = 0
                 showSurfaceScanner = false
                 if measuredSurfaces.first?.geometry?.isApproved != true {
                     shelfMeasurementStage = .boundary
                     shelfCanPlacePoint = false
                 }
             }
+            .task { await loadOperationalShelves() }
         }
     }
 
@@ -105,6 +124,7 @@ struct PlacementView: View {
             } label: {
                 Label("Scan product barcode", systemImage: "barcode.viewfinder")
             }
+            .disabled(placementReservation != nil)
         }
     }
 
@@ -117,33 +137,40 @@ struct PlacementView: View {
             }
             TextField("Weight (kg)", text: $weight)
                 .keyboardType(.decimalPad)
+            if Double(weight).map({ !$0.isFinite || $0 <= 0 }) ?? true {
+                Text("A finite positive weight is required for automatic placement.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
             VStack(alignment: .leading) {
                 Text("Pick frequency")
                 Slider(value: $velocity, in: 0...1)
-            }
-            Picker("Business scale", selection: $scale) {
-                ForEach(WarehouseScale.allCases) { Text($0.rawValue).tag($0) }
             }
         }
     }
 
     private var scanSection: some View {
         Section("3 · Storage geometry") {
-            Button {
-                scanGeometryType = .shelf
-                prepareNewGeometryScan()
-                showSurfaceScanner = true
-            } label: {
-                Label("Scan shelf with AR", systemImage: "viewfinder")
+            if operationalShelves.isEmpty {
+                Text("No saved storage areas are available. Measure and save one before requesting an operational recommendation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("Saved storage area", selection: $selectedShelfID) {
+                    ForEach(operationalShelves) { shelf in
+                        Text(shelf.label).tag(shelf.id)
+                    }
+                }
+                .disabled(placementReservation != nil)
             }
             Button {
                 scanGeometryType = .openSpace
-                prepareNewGeometryScan()
+                prepareNewMarkerScan()
                 showSurfaceScanner = true
             } label: {
-                Label("Scan open space", systemImage: "square.dashed.inset.filled")
+                Label("Measure storage space", systemImage: "scope")
             }
-            Picker("Open-space base surface", selection: $spaceSurfaceType) {
+            Picker("Storage surface", selection: $spaceSurfaceType) {
                 ForEach(SpaceSurfaceType.allCases) { Text($0.title).tag($0) }
             }
             if let surface = measuredSurfaces.first {
@@ -179,7 +206,9 @@ struct PlacementView: View {
                     Task {
                         do {
                             try await SpaceRepository.save(space, expectedVersion: nil)
-                            spaceSaveMessage = "Space saved."
+                            let shelf = try await PlacementRepository.initializeOperationalShelf(from: space)
+                            await loadOperationalShelves(selecting: shelf.id)
+                            spaceSaveMessage = "Space saved and operational occupancy initialized."
                         } catch {
                             spaceSaveMessage = error.localizedDescription
                         }
@@ -187,9 +216,7 @@ struct PlacementView: View {
                 }
                 if let spaceSaveMessage { Text(spaceSaveMessage).font(.caption) }
             }
-            Text(scanGeometryType == .shelf
-                ? "LiDAR measures the shelf footprint and clearance. All displayed dimensions are centimetres."
-                : "Space Scan maps a floor, tabletop, workbench, counter, platform, or custom horizontal area. Select the surface type and approve the boundary before placement.")
+            Text("Select the horizontal base surface, place four wall boundaries, then enter the usable storage height. All displayed dimensions are centimetres.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -198,21 +225,17 @@ struct PlacementView: View {
     @ViewBuilder
     private var recommendationsSection: some View {
         Section("4 · Recommended location") {
-            if recommendations.isEmpty {
-                Text("Scan a product and enter valid dimensions. Locations that fail size or weight checks are excluded.")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(recommendations.prefix(3)) { recommendation in
-                    Button {
-                        select(recommendation)
-                    } label: {
-                        RecommendationRow(
-                            recommendation: recommendation,
-                            isSelected: selectedRecommendation?.id == recommendation.id
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
+            Button("Calculate and reserve placement") { calculatePrecisePlacement() }
+                .disabled(packageProfile == nil || selectedShelfID.isEmpty || isCalculating || placementReservation != nil)
+            if placementReservation != nil {
+                Button("Cancel reservation", role: .destructive) { cancelReservation() }
+                    .disabled(isPersistingPlacement)
+            }
+            Text("The latest saved occupancy is loaded first. A storage-area lock is acquired before guidance is shown.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let placementStatusMessage {
+                Text(placementStatusMessage).font(.caption)
             }
         }
     }
@@ -220,8 +243,7 @@ struct PlacementView: View {
     @ViewBuilder
     private var verificationSection: some View {
         Section("6 · Verify placement") {
-            if let destination = selectedRecommendation?.location.label ??
-                (selectedPrecisePlacement == nil ? nil : activePlacementState?.label) {
+            if let destination = selectedPrecisePlacement == nil ? nil : activePlacementState?.label {
                 LabeledContent("Destination", value: destination)
                 switch verification?.stage {
                 case .scanProduct:
@@ -229,14 +251,22 @@ struct PlacementView: View {
                 case .scanLocation:
                     Button("Scan location") { showVerificationScanner = true }
                 case .complete:
-                    Label("Placement verified", systemImage: "checkmark.seal.fill")
+                    Label("Both barcodes verified", systemImage: "checkmark.seal.fill")
                         .foregroundStyle(.green)
+                    Button("Confirm placement is physically complete") {
+                        confirmPlacement()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isPersistingPlacement || placementReservation == nil)
                 case .failed(let message):
                     Label(message, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.red)
                     Button("Try again") { verification?.retry() }
                 case nil:
                     Text("Select a recommendation first.")
+                }
+                if let placementStatusMessage {
+                    Text(placementStatusMessage).font(.caption)
                 }
             } else {
                 Text("Select a recommended location to start the two-scan check.")
@@ -246,6 +276,213 @@ struct PlacementView: View {
     }
 
     private var surfaceScanner: some View {
+        NavigationStack {
+            ZStack {
+                if StorageMarkerScannerView.isSupported {
+                    StorageMarkerScannerView(
+                        stage: $markerStage,
+                        draft: $markerDraft,
+                        markerCount: $markerCount,
+                        canPlace: $markerCanPlace,
+                        guidance: $markerGuidance,
+                        errorMessage: $markerError,
+                        placementRequestID: markerPlacementRequestID,
+                        undoRequestID: markerUndoRequestID,
+                        resetRequestID: markerResetRequestID,
+                        previewRequestID: markerPreviewRequestID,
+                        useCorrectedFootprint: markerUseCorrectedFootprint,
+                        previewHeightCM: validManualSpaceHeight
+                    )
+                    .ignoresSafeArea()
+                } else {
+                    ContentUnavailableView(
+                        "AR measurement unavailable",
+                        systemImage: "viewfinder",
+                        description: Text("Use a device that supports AR world tracking.")
+                    )
+                }
+
+                VStack {
+                    markerProgressHeader
+                    Spacer()
+                    markerControls
+                }
+                .padding()
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showSurfaceScanner = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Finish") {
+                        showSurfaceScanner = false
+                        calculatePrecisePlacement()
+                    }
+                    .disabled(markerStage != .complete || scannedOpenSpace == nil)
+                }
+            }
+        }
+    }
+
+    private var markerProgressHeader: some View {
+        VStack(spacing: 5) {
+            Text(markerStageTitle)
+                .font(.headline)
+            Text(markerProgressText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: Capsule())
+    }
+
+    private var markerControls: some View {
+        VStack(spacing: 10) {
+            Text(markerGuidance)
+                .font(.caption)
+                .multilineTextAlignment(.center)
+            if let markerError {
+                Label(markerError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
+
+            switch markerStage {
+            case .selectSurface:
+                Button("Select Storage Surface") { markerPlacementRequestID += 1 }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!markerCanPlace)
+            case .placeBoundaries:
+                Button("Place Boundary \(markerCount + 1)/4") {
+                    markerPlacementRequestID += 1
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!markerCanPlace || markerCount >= 4)
+            case .review:
+                if let draft = markerDraft {
+                    LabeledContent("Measured area", value: markerArea(draft.rawFootprint2D))
+                    if draft.correctedFootprint2D != nil {
+                        Toggle("Apply suggested 90° correction", isOn: $markerUseCorrectedFootprint)
+                        Text("Maximum corner adjustment: \(format(draft.correctionMaximumMovementMetres * 100)) cm. Raw marker positions remain saved.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("The measured angles are intentionally non-rectangular or exceed the safe correction limit. No rectangle was forced.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Button("Use This Footprint") {
+                    markerError = nil
+                    markerStage = .enterHeight
+                }
+                .buttonStyle(.borderedProminent)
+            case .enterHeight:
+                Text("How many cm do you want the storage height to be?")
+                    .font(.headline)
+                HStack {
+                    TextField("Storage height", text: $assumedHeight)
+                        .keyboardType(.decimalPad)
+                        .textFieldStyle(.roundedBorder)
+                    Text("cm")
+                        .foregroundStyle(.secondary)
+                }
+                Button("Preview Storage Volume") {
+                    if validManualSpaceHeight != nil {
+                        markerError = nil
+                        markerStage = .preview
+                        markerPreviewRequestID += 1
+                    } else {
+                        markerError = "Enter a storage height greater than 1 cm and no more than 5000 cm."
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            case .preview:
+                if let outline = markerVolumeOutline {
+                    Text("Available Storage")
+                        .font(.headline)
+                    if let dimensions = outline.rectangularDimensions {
+                        LabeledContent(
+                            "Width", value: "\(format(dimensions.widthMetres * 100)) cm"
+                        )
+                        LabeledContent(
+                            "Depth", value: "\(format(dimensions.depthMetres * 100)) cm"
+                        )
+                    }
+                    LabeledContent(
+                        "Floor area", value: "\(format(outline.floorAreaSquareMetres)) m²"
+                    )
+                    LabeledContent(
+                        "Height", value: "\(format(outline.heightMetres * 100)) cm"
+                    )
+                    LabeledContent(
+                        "Volume", value: "\(format(outline.volumeCubicMetres)) m³"
+                    )
+                }
+                Button("Confirm Storage Space") {
+                    finalizeMarkerSpace()
+                }
+                .buttonStyle(.borderedProminent)
+            case .complete:
+                Label("Storage space confirmed", systemImage: "checkmark.seal.fill")
+                    .foregroundStyle(.green)
+                Text("Use Finish to return to product placement, or reset to measure again.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if [.placeBoundaries, .review].contains(markerStage) {
+                Button("Undo Last Marker") { markerUndoRequestID += 1 }
+                    .buttonStyle(.bordered)
+            } else if markerStage == .enterHeight {
+                Button("Back to Boundary Review") { markerStage = .review }
+                    .buttonStyle(.bordered)
+            } else if markerStage == .preview {
+                Button("Adjust Height") { markerStage = .enterHeight }
+                    .buttonStyle(.bordered)
+                Button("Undo Boundary") { markerUndoRequestID += 1 }
+                    .buttonStyle(.bordered)
+            }
+            if markerStage != .selectSurface {
+                Button(markerStage == .preview ? "Rescan" : "Reset Measurement", role: .destructive) {
+                    scannedOpenSpace = nil
+                    assumedHeight = ""
+                    markerUseCorrectedFootprint = true
+                    markerResetRequestID += 1
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .font(.footnote.weight(.medium))
+        .padding()
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var markerStageTitle: String {
+        switch markerStage {
+        case .selectSurface: "Select Storage Surface"
+        case .placeBoundaries: "Boundary \(min(markerCount + 1, 4))/4"
+        case .review: "Review Footprint"
+        case .enterHeight: "Enter Storage Height"
+        case .preview: "Preview Storage Volume"
+        case .complete: "Storage Space Ready"
+        }
+    }
+
+    private var markerProgressText: String {
+        switch markerStage {
+        case .selectSurface: "Detect horizontal base"
+        case .placeBoundaries: "Horizontal base selected · four wall markers only"
+        case .review: "Surface selected · Boundary 4/4 · Review"
+        case .enterHeight: "Surface selected · Boundary 4/4 · Height"
+        case .preview: "Surface selected · Boundary 4/4 · Preview"
+        case .complete: "Surface selected · Boundary 4/4 · Confirmed"
+        }
+    }
+
+    private var legacySurfaceScanner: some View {
         NavigationStack {
             ZStack {
                 if LiDARSurfaceScannerView.isSupported {
@@ -929,15 +1166,6 @@ struct PlacementView: View {
         )
     }
 
-    private var recommendations: [PlacementRecommendation] {
-        guard let packageProfile else { return [] }
-        return PlacementEngine.recommend(
-            package: packageProfile,
-            locations: candidateLocations,
-            scale: scale
-        )
-    }
-
     @ViewBuilder
     private var preciseGuidanceSection: some View {
         Section("5 · Placement guidance") {
@@ -952,7 +1180,12 @@ struct PlacementView: View {
                     .font(.callout)
                 LabeledContent("Confidence", value: result.confidence.formatted(.percent.precision(.fractionLength(0))))
                 LabeledContent("Clearance from front", value: "\(result.position.z.formatted(.number.precision(.fractionLength(0)))) cm")
-                LabeledContent("Rotation", value: "\(result.quarterTurns * 90)° clockwise")
+                if let orientation = result.orientation {
+                    LabeledContent("Resting face", value: orientation.restingFace.rawValue.capitalized)
+                    LabeledContent("Forward-facing face", value: orientation.forwardFace.rawValue.capitalized)
+                } else {
+                    LabeledContent("Legacy yaw", value: "\(result.quarterTurns * 90)° clockwise")
+                }
                 if let support = result.supportingProductIDs.first {
                     LabeledContent("Supporting product", value: support)
                 }
@@ -963,12 +1196,6 @@ struct PlacementView: View {
                 }
                 HStack {
                     Button("Use Recommendation") { selectPrecise(result) }
-                    if let next = nextAlternative {
-                        Button("Alternative") {
-                            selectedPrecisePlacement = next
-                            alternativeIndex += 1
-                        }
-                    }
                 }
             } else if let message = preciseCalculation?.failureMessage {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
@@ -979,11 +1206,6 @@ struct PlacementView: View {
                     .foregroundStyle(.secondary)
             }
         }
-    }
-
-    private var nextAlternative: ProductPlacementResult? {
-        guard let alternatives = preciseCalculation?.alternatives, !alternatives.isEmpty else { return nil }
-        return alternatives[alternativeIndex % alternatives.count]
     }
 
     private var scannedShelfState: ShelfState? {
@@ -1039,10 +1261,100 @@ struct PlacementView: View {
     }
 
     private var activePlacementState: ShelfState? {
-        if scanGeometryType == .openSpace, let scannedOpenSpace {
-            return try? OpenSpacePlacementAdapter.shelfState(from: scannedOpenSpace)
+        operationalShelves.first { $0.id == selectedShelfID }
+    }
+
+    private func prepareNewMarkerScan() {
+        scannedOpenSpace = nil
+        measuredSurfaces = []
+        assumedHeight = ""
+        markerDraft = nil
+        markerStage = .selectSurface
+        markerCount = 0
+        markerCanPlace = false
+        markerGuidance = "Aim at the horizontal surface where products will sit."
+        markerError = nil
+        markerUseCorrectedFootprint = true
+        markerPlacementRequestID = 0
+        markerUndoRequestID = 0
+        markerPreviewRequestID = 0
+        markerResetRequestID += 1
+    }
+
+    private func finalizeMarkerSpace() {
+        guard let draft = markerDraft, let height = validManualSpaceHeight else {
+            markerError = "The footprint or storage height is incomplete."
+            return
         }
-        return scannedShelfState
+        let record = draft.record(
+            approvedCorrected: markerUseCorrectedFootprint,
+            heightCM: height
+        )
+        let toCentimetres: ([Vector2D]) -> [Vector2D] = { points in
+            points.map { Vector2D($0.x * 100, $0.y * 100) }
+        }
+        let space = ScannedSpaceGeometry(
+            id: draft.id,
+            geometryType: .openSpace,
+            surfaceType: spaceSurfaceType,
+            rawBoundary2D: toCentimetres(record.rawFootprint2D),
+            suggestedBoundary2D: record.correctedFootprint2D.map(toCentimetres),
+            approvedBoundary2D: toCentimetres(record.approvedFootprint2D),
+            excludedRegions2D: [],
+            localOrigin: draft.basePlaneOriginWorld,
+            localXAxis: draft.localXAxisWorld,
+            localYAxis: draft.localDepthAxisWorld,
+            localVerticalAxis: draft.verticalAxisWorld,
+            bottomPlane: CodablePlane(
+                origin: draft.basePlaneOriginWorld,
+                normal: draft.verticalAxisWorld
+            ),
+            topDefinition: .manualLimitCM(height),
+            heightCM: height,
+            accessDirections: [Vector3D(0, 0, 1)],
+            confidence: SpaceConfidence(
+                baseSurface: draft.confidence,
+                boundary: draft.confidence,
+                corners: draft.confidence,
+                walls: nil,
+                surfaceEdges: draft.deviceHasLiDAR ? draft.confidence : nil,
+                height: 1
+            ),
+            approval: .approved,
+            geometryVersion: 9,
+            createdAt: record.capturedAt,
+            updatedAt: record.capturedAt,
+            measurementMethod: .markerBoundaries,
+            measuredCorners: nil,
+            scannedBoundary: nil,
+            markerMeasurement: record
+        )
+        do {
+            try SpaceGeometryValidator.validate(space)
+            scannedOpenSpace = space
+            markerStage = .complete
+            markerError = nil
+            markerGuidance = "The polygon footprint and height are approved for product placement."
+        } catch {
+            markerError = error.localizedDescription
+        }
+    }
+
+    private func markerArea(_ polygon: [Vector2D]) -> String {
+        guard polygon.count >= 3 else { return "—" }
+        let doubled = polygon.indices.reduce(0.0) { value, index in
+            let next = polygon[(index + 1) % polygon.count]
+            return value + polygon[index].x * next.y - next.x * polygon[index].y
+        }
+        return "\(format(abs(doubled) / 2)) m²"
+    }
+
+    private var markerVolumeOutline: StorageVolumeOutline? {
+        guard let draft = markerDraft, let height = validManualSpaceHeight else { return nil }
+        return draft.volumeOutline(
+            useCorrectedFootprint: markerUseCorrectedFootprint,
+            heightCM: height
+        )
     }
 
     private func prepareNewGeometryScan() {
@@ -1145,18 +1457,42 @@ struct PlacementView: View {
     }
 
     private func calculatePrecisePlacement() {
-        guard let packageProfile, let shelf = activePlacementState else { return }
+        guard let packageProfile, !selectedShelfID.isEmpty,
+              let userID = auth.user?.uid else { return }
         isCalculating = true
+        placementStatusMessage = nil
         selectedPrecisePlacement = nil
-        alternativeIndex = 0
         Task {
-            let result = await Task.detached(priority: .userInitiated) {
-                PlacementEngine.calculate(package: packageProfile, shelf: shelf)
-            }.value
-            guard !Task.isCancelled else { return }
-            preciseCalculation = result
-            selectedPrecisePlacement = result.recommendation
-            isCalculating = false
+            do {
+                guard let shelf = try await PlacementRepository.fetchShelf(id: selectedShelfID) else {
+                    throw PlacementPersistenceError.shelfMissing
+                }
+                if try await PlacementRepository.fetchActiveReservation(shelfID: shelf.id) != nil {
+                    throw PlacementPersistenceError.reservationConflict
+                }
+                let result = await Task.detached(priority: .userInitiated) {
+                    PlacementEngine.calculate(package: packageProfile, shelf: shelf)
+                }.value
+                guard !Task.isCancelled else { return }
+                preciseCalculation = result
+                guard let recommendation = result.recommendation else {
+                    placementStatusMessage = result.failureMessage
+                    isCalculating = false
+                    return
+                }
+                let reservation = try await PlacementRepository.reserve(
+                    result: recommendation, userID: userID
+                )
+                placementReservation = reservation
+                reservedPackageProfile = packageProfile
+                selectedPrecisePlacement = recommendation
+                replaceOperationalShelf(shelf)
+                placementStatusMessage = "Storage area reserved for two minutes. Verify both barcodes, place the product, then confirm."
+                isCalculating = false
+            } catch {
+                placementStatusMessage = error.localizedDescription
+                isCalculating = false
+            }
         }
     }
 
@@ -1169,34 +1505,74 @@ struct PlacementView: View {
         )
     }
 
-    private var candidateLocations: [StorageLocation] {
-        var locations = [
-            StorageLocation(
-                id: "A-01-02", label: "Aisle A · Bay 01 · Shelf 02", barcode: "LOC-A-01-02",
-                freeWidthCM: 60, freeHeightCM: 42, freeDepthCM: 50,
-                remainingWeightKG: 35, walkingDistanceM: 12, orderAffinity: 0.82, source: .mapped
-            ),
-            StorageLocation(
-                id: "B-03-01", label: "Aisle B · Bay 03 · Shelf 01", barcode: "LOC-B-03-01",
-                freeWidthCM: 45, freeHeightCM: 32, freeDepthCM: 45,
-                remainingWeightKG: 18, walkingDistanceM: 7, orderAffinity: 0.35, source: .mapped
-            ),
-            StorageLocation(
-                id: "C-02-04", label: "Aisle C · Bay 02 · Shelf 04", barcode: "LOC-C-02-04",
-                freeWidthCM: 90, freeHeightCM: 55, freeDepthCM: 60,
-                remainingWeightKG: 70, walkingDistanceM: 24, orderAffinity: 0.94, source: .mapped
-            )
-        ]
-        if let surface = measuredSurfaces.first {
-            locations.append(StorageLocation(
-                id: "LIDAR-01", label: "Current LiDAR scan", barcode: "LOC-LIDAR-01",
-                freeWidthCM: surface.widthCM,
-                freeHeightCM: Double(assumedHeight) ?? surface.measuredFreeHeightCM ?? 40,
-                freeDepthCM: surface.depthCM,
-                remainingWeightKG: 25, walkingDistanceM: 10, orderAffinity: 0.5, source: .lidarScan
-            ))
+    private func loadOperationalShelves(selecting shelfID: String? = nil) async {
+        do {
+            let shelves = try await PlacementRepository.fetchShelves()
+            operationalShelves = shelves
+            if let shelfID, shelves.contains(where: { $0.id == shelfID }) {
+                selectedShelfID = shelfID
+            } else if !shelves.contains(where: { $0.id == selectedShelfID }) {
+                selectedShelfID = shelves.first?.id ?? ""
+            }
+        } catch {
+            placementStatusMessage = error.localizedDescription
         }
-        return locations
+    }
+
+    private func replaceOperationalShelf(_ shelf: ShelfState) {
+        if let index = operationalShelves.firstIndex(where: { $0.id == shelf.id }) {
+            operationalShelves[index] = shelf
+        } else {
+            operationalShelves.append(shelf)
+        }
+    }
+
+    private func confirmPlacement() {
+        guard verification?.stage == .complete,
+              let reservation = placementReservation,
+              let result = selectedPrecisePlacement,
+              let packageProfile = reservedPackageProfile else { return }
+        isPersistingPlacement = true
+        Task {
+            do {
+                try await PlacementRepository.confirm(
+                    reservation: reservation, result: result, package: packageProfile
+                )
+                guard let shelf = try await PlacementRepository.fetchShelf(id: result.shelfID) else {
+                    throw PlacementPersistenceError.shelfMissing
+                }
+                replaceOperationalShelf(shelf)
+                placementReservation = nil
+                reservedPackageProfile = nil
+                preciseCalculation = nil
+                selectedPrecisePlacement = nil
+                verification = nil
+                placementStatusMessage = "Placement confirmed. Occupancy and storage version \(shelf.version) are now current."
+                isPersistingPlacement = false
+            } catch {
+                placementStatusMessage = error.localizedDescription
+                isPersistingPlacement = false
+            }
+        }
+    }
+
+    private func cancelReservation() {
+        guard let reservation = placementReservation else { return }
+        isPersistingPlacement = true
+        Task {
+            do {
+                try await PlacementRepository.cancel(reservation)
+                placementReservation = nil
+                reservedPackageProfile = nil
+                selectedPrecisePlacement = nil
+                preciseCalculation = nil
+                verification = nil
+                placementStatusMessage = "Reservation cancelled."
+            } catch {
+                placementStatusMessage = error.localizedDescription
+            }
+            isPersistingPlacement = false
+        }
     }
 
     private func selectProduct(barcode: String) {
@@ -1210,21 +1586,13 @@ struct PlacementView: View {
         }
         if let savedWeight = selectedProduct?.placementMetadata?.weightKG {
             weight = String(savedWeight)
+        } else {
+            weight = ""
         }
         velocity = selectedProduct?.placementMetadata?.expectedRetrievalFrequency ?? velocity
-        selectedRecommendation = nil
         verification = nil
         preciseCalculation = nil
         selectedPrecisePlacement = nil
-    }
-
-    private func select(_ recommendation: PlacementRecommendation) {
-        guard let barcode = selectedProduct?.barcode else { return }
-        selectedRecommendation = recommendation
-        verification = PlacementVerification(
-            expectedProductBarcode: barcode,
-            expectedLocationBarcode: recommendation.location.barcode
-        )
     }
 
     private var verificationTitle: String {
@@ -1236,40 +1604,6 @@ struct PlacementView: View {
 
     private func acceptVerificationScan(_ value: String) {
         verification?.accept(value)
-    }
-}
-
-private struct RecommendationRow: View {
-    let recommendation: PlacementRecommendation
-    let isSelected: Bool
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(isSelected ? .blue : .secondary)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(recommendation.location.label)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                Text(
-                    "Fit \(recommendation.orientation.widthCM.formatted()) × \(recommendation.orientation.heightCM.formatted()) × \(recommendation.orientation.depthCM.formatted()) cm"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                HStack {
-                    metric("Score", recommendation.score)
-                    metric("Orders", recommendation.affinityScore)
-                    metric("Travel", recommendation.distanceScore)
-                }
-            }
-        }
-        .contentShape(Rectangle())
-    }
-
-    private func metric(_ label: String, _ value: Double) -> some View {
-        Text("\(label) \(value.formatted(.percent.precision(.fractionLength(0))))")
-            .font(.caption2.monospacedDigit())
-            .foregroundStyle(.secondary)
     }
 }
 

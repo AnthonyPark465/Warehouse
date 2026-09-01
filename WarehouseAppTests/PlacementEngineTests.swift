@@ -94,6 +94,32 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         let result = PlacementEngine.calculate(package: product, shelf: shelf(width: 35, height: 50, depth: 50))
         XCTAssertNotNil(result.recommendation)
         XCTAssertNotEqual(result.recommendation?.orientedDimensions, product.dimensions)
+        XCTAssertNotNil(result.recommendation?.orientation)
+    }
+
+    func testForbiddenRestingFaceIsRejected() {
+        var rules = metadata()
+        rules.mayRotateAutomatically = true
+        rules.mustRemainUpright = false
+        rules.permittedRestingFaces = [.bottom]
+        let result = PlacementEngine.calculate(
+            package: package(dimensions: .init(widthCM: 40, heightCM: 10, depthCM: 20), metadata: rules),
+            shelf: shelf(width: 25, height: 50, depth: 15)
+        )
+        XCTAssertNil(result.recommendation)
+    }
+
+    func testUprightOnlyProductNeverUsesSideAsRestingFace() {
+        var rules = metadata()
+        rules.mayRotateAutomatically = true
+        rules.mustRemainUpright = true
+        rules.permittedRestingFaces = Set(RestingFace.allCases)
+        let result = PlacementEngine.calculate(
+            package: package(dimensions: .init(widthCM: 40, heightCM: 10, depthCM: 20), metadata: rules),
+            shelf: shelf(width: 25, height: 50, depth: 15)
+        )
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.allSatisfy { $0.result?.orientation?.restingFace != .left })
     }
 
     func testEqualDimensionsRemoveDuplicateOrientations() {
@@ -164,6 +190,109 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.collision))
     }
 
+    func testProductThatDisallowsStackingCannotBePlacedOnSupporter() {
+        var state = shelf(width: 40, height: 50, depth: 30)
+        state.products = [storedProduct(
+            id: "base", volume: volume("base", 0, 0, 0, 40, 20, 30),
+            stacking: supportingRules(maximumWeight: 20)
+        )]
+        let result = PlacementEngine.calculate(package: package(), shelf: state)
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.stackingRule))
+    }
+
+    func testFragileSupporterIsRejected() {
+        var state = shelf(width: 40, height: 50, depth: 30)
+        var fragile = supportingRules(maximumWeight: 20)
+        fragile.fragileTopSurface = true
+        state.products = [storedProduct(
+            id: "base", volume: volume("base", 0, 0, 0, 40, 20, 30), stacking: fragile
+        )]
+        var rules = metadata()
+        rules.stacking.canBePlacedOnAnotherProduct = true
+        XCTAssertNil(PlacementEngine.calculate(package: package(metadata: rules), shelf: state).recommendation)
+    }
+
+    func testUnknownSupportCapacityIsRejected() {
+        var state = shelf(width: 40, height: 50, depth: 30)
+        var unknown = supportingRules(maximumWeight: 20)
+        unknown.maximumSupportedWeight = nil
+        state.products = [storedProduct(
+            id: "base", volume: volume("base", 0, 0, 0, 40, 20, 30), stacking: unknown
+        )]
+        var rules = metadata()
+        rules.stacking.canBePlacedOnAnotherProduct = true
+        XCTAssertNil(PlacementEngine.calculate(package: package(metadata: rules), shelf: state).recommendation)
+    }
+
+    func testCumulativeSupportedWeightIsRejected() {
+        var state = shelf(width: 40, height: 60, depth: 30)
+        state.products = [
+            storedProduct(id: "base", volume: volume("base", 0, 0, 0, 40, 20, 30),
+                          stacking: supportingRules(maximumWeight: 8)),
+            storedProduct(id: "child", volume: volume("child", 0, 20, 0, 20, 10, 30),
+                          stacking: .conservative, supportingProductIDs: ["base"])
+        ]
+        var rules = metadata()
+        rules.stacking.canBePlacedOnAnotherProduct = true
+        let result = PlacementEngine.calculate(
+            package: package(dimensions: .init(widthCM: 18, heightCM: 10, depthCM: 25), metadata: rules),
+            shelf: state
+        )
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.weightLimit))
+    }
+
+    func testInsufficientFootprintOverlapIsRejected() {
+        var state = shelf(width: 30, height: 50, depth: 30)
+        state.products = [storedProduct(
+            id: "base", volume: volume("base", 0, 0, 0, 18, 20, 30),
+            stacking: supportingRules(maximumWeight: 20)
+        )]
+        var rules = metadata()
+        rules.stacking.canBePlacedOnAnotherProduct = true
+        let result = PlacementEngine.calculate(
+            package: package(dimensions: .init(widthCM: 22, heightCM: 10, depthCM: 25), metadata: rules),
+            shelf: state
+        )
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.insufficientSupport))
+    }
+
+    func testUnsupportedCentreIsRejected() {
+        var state = shelf(width: 40, height: 50, depth: 30)
+        state.products = [storedProduct(
+            id: "base", volume: volume("base", 0, 0, 0, 8, 20, 30),
+            stacking: supportingRules(maximumWeight: 20)
+        )]
+        state.obstacles = [ShelfObstacle(
+            id: "floor-blocker", compartmentID: "main", kind: .divider,
+            volume: volume("floor-blocker", 8, 0, 0, 32, 20, 30)
+        )]
+        var rules = metadata()
+        rules.stacking.canBePlacedOnAnotherProduct = true
+        rules.stacking.requiresFullBaseSupport = false
+        rules.stacking.minimumSupportRatio = 0.2
+        let result = PlacementEngine.calculate(
+            package: package(dimensions: .init(widthCM: 20, heightCM: 10, depthCM: 20), metadata: rules),
+            shelf: state
+        )
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.unstable))
+    }
+
+    func testMaximumTotalStackHeightIsRespected() {
+        var state = shelf(width: 40, height: 60, depth: 30)
+        var baseRules = supportingRules(maximumWeight: 20)
+        baseRules.maximumTotalStackHeight = 25
+        state.products = [storedProduct(
+            id: "base", volume: volume("base", 0, 0, 0, 40, 20, 30), stacking: baseRules
+        )]
+        var rules = metadata()
+        rules.stacking.canBePlacedOnAnotherProduct = true
+        XCTAssertNil(PlacementEngine.calculate(package: package(metadata: rules), shelf: state).recommendation)
+    }
+
     func testSupportWeightLimitIsHardConstraint() {
         var state = shelf(width: 40, height: 50, depth: 30)
         state.products = [storedProduct(
@@ -196,10 +325,79 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    func testUnknownMetadataWarnsAndUsesShelfSurface() {
+    func testUnknownWeightRejectsAutomaticPlacement() {
         let result = PlacementEngine.calculate(package: package(metadata: .conservative), shelf: shelf())
-        XCTAssertTrue(result.recommendation?.warnings.contains(where: { $0.contains("Weight information is missing") }) == true)
-        XCTAssertTrue(result.recommendation?.supportingProductIDs.isEmpty == true)
+        XCTAssertNil(result.recommendation)
+        XCTAssertEqual(result.failureMessage, "Enter a finite positive product weight before automatic placement.")
+    }
+
+    func testHighFrequencyProductPrefersFrontCandidate() {
+        var rules = metadata()
+        rules.expectedRetrievalFrequency = 1
+        rules.retrievalPriority = .high
+        let result = PlacementEngine.calculate(package: package(metadata: rules), shelf: shelf(depth: 80))
+        XCTAssertEqual(result.recommendation?.position.z ?? -1, 0, accuracy: 0.001)
+    }
+
+    func testActiveStorageReservationRejectsCalculation() {
+        let reservation = PlacementReservation(
+            id: "lock", shelfID: "shelf", productID: "other", shelfVersion: 1,
+            volume: volume("reserved", 40, 0, 40, 10, 10, 10),
+            expiresAt: Date().addingTimeInterval(60), createdBy: "worker"
+        )
+        let result = PlacementEngine.calculate(
+            package: package(), shelf: shelf(), activeReservations: [reservation]
+        )
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.activeReservation))
+    }
+
+    func testConfirmationUpdatesOccupancyAndVersionAndPreventsReuse() throws {
+        let original = shelf()
+        let first = try XCTUnwrap(PlacementEngine.calculate(package: package(), shelf: original).recommendation)
+        let confirmed = try ShelfStateOperations.confirming(result: first, package: package(), in: original)
+        XCTAssertEqual(confirmed.version, original.version + 1)
+        XCTAssertEqual(confirmed.products.count, 1)
+        let second = try XCTUnwrap(PlacementEngine.calculate(package: package(), shelf: confirmed).recommendation)
+        XCTAssertNotEqual(second.position, first.position)
+    }
+
+    func testStaleStorageVersionRejectsConfirmation() throws {
+        let original = shelf()
+        let result = try XCTUnwrap(PlacementEngine.calculate(package: package(), shelf: original).recommendation)
+        var stale = original
+        stale.version += 1
+        XCTAssertThrowsError(try ShelfStateOperations.confirming(result: result, package: package(), in: stale))
+    }
+
+    func testSupportingPlacementCannotBeRemovedWhileDependedUpon() {
+        var state = shelf()
+        state.products = [
+            storedProduct(id: "base", volume: volume("base", 0, 0, 0, 30, 10, 30),
+                          stacking: supportingRules(maximumWeight: 20)),
+            storedProduct(id: "child", volume: volume("child", 0, 10, 0, 20, 10, 20),
+                          stacking: .conservative, supportingProductIDs: ["base"])
+        ]
+        XCTAssertThrowsError(try ShelfStateOperations.removing(id: "base", from: state, expectedVersion: state.version))
+    }
+
+    func testOldMetadataDecodesWithConservativeDefaults() throws {
+        let decoded = try JSONDecoder().decode(ProductPlacementMetadata.self, from: Data("{}".utf8))
+        XCTAssertNil(decoded.weightKG)
+        XCTAssertEqual(decoded.permittedRestingFaces, [.bottom])
+        XCTAssertFalse(decoded.stacking.canSupportProductsAbove)
+        XCTAssertFalse(decoded.stacking.canBePlacedOnAnotherProduct)
+    }
+
+    func testOldFirestoreStyleProductUsesConservativePlacementDefaults() throws {
+        let json = """
+        {"id":"old","name":"Legacy","productCode":"SKU-1","type":"General","totalStock":0,"createdAt":0}
+        """
+        let product = try JSONDecoder().decode(Product.self, from: Data(json.utf8))
+        let metadata = product.placementMetadata ?? .conservative
+        XCTAssertNil(metadata.weightKG)
+        XCTAssertEqual(metadata.permittedRestingFaces, [.bottom])
+        XCTAssertFalse(metadata.stacking.canSupportProductsAbove)
     }
 
     func testOverlappingStoredProductsInvalidateShelfState() {
@@ -267,12 +465,13 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         id: String,
         volume: AxisAlignedVolume,
         priority: RetrievalPriority = .low,
-        stacking: StackingRules
+        stacking: StackingRules,
+        supportingProductIDs: [String] = []
     ) -> StoredProductPlacement {
         StoredProductPlacement(
             id: id, productID: id, productType: "General", compartmentID: "main",
             volume: volume, weightKG: 5, priority: priority, retrievalFrequency: 0.3,
-            stacking: stacking, supportingProductIDs: [], blockedProductIDs: []
+            stacking: stacking, supportingProductIDs: supportingProductIDs, blockedProductIDs: []
         )
     }
 }

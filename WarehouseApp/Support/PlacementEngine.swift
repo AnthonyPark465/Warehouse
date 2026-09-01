@@ -1,6 +1,81 @@
 import Foundation
 import simd
 
+enum ShelfStateOperationError: LocalizedError, Equatable {
+    case staleVersion(expected: Int, actual: Int)
+    case invalidPlacement
+    case dependentPlacementExists
+
+    var errorDescription: String? {
+        switch self {
+        case .staleVersion(let expected, let actual):
+            "Storage state changed from version \(expected) to \(actual). Recalculate placement."
+        case .invalidPlacement:
+            "The placement is no longer valid for the current storage state."
+        case .dependentPlacementExists:
+            "Remove products above this supporting product first."
+        }
+    }
+}
+
+/// Pure operational-state mutations shared by Firestore transactions and unit
+/// tests. Geometry scan history remains in `spaces`; this `ShelfState` is the
+/// canonical occupancy, obstacle, rating, barcode, and version record.
+enum ShelfStateOperations {
+    static func confirming(
+        result: ProductPlacementResult,
+        package: PackagePlacementProfile,
+        in shelf: ShelfState
+    ) throws -> ShelfState {
+        guard result.shelfVersion == shelf.version else {
+            throw ShelfStateOperationError.staleVersion(expected: result.shelfVersion, actual: shelf.version)
+        }
+        guard !shelf.products.contains(where: { $0.id == result.id }) else {
+            throw ShelfStateOperationError.invalidPlacement
+        }
+        let calculation = PlacementEngine.calculate(package: package, shelf: shelf)
+        let candidates = [calculation.recommendation].compactMap { $0 } + calculation.alternatives
+        guard candidates.contains(where: { $0.id == result.id }) else {
+            throw ShelfStateOperationError.invalidPlacement
+        }
+        var next = shelf
+        next.products.append(StoredProductPlacement(
+            id: result.id, productID: package.productId, productType: package.productType,
+            compartmentID: result.compartmentID,
+            volume: AxisAlignedVolume(
+                id: result.id, minimum: result.position, dimensions: result.orientedDimensions
+            ),
+            orientation: result.orientation,
+            weightKG: package.metadata.explicitValidWeightKG,
+            priority: package.metadata.retrievalPriority,
+            retrievalFrequency: package.metadata.expectedRetrievalFrequency,
+            stacking: package.metadata.stacking,
+            supportingProductIDs: result.supportingProductIDs,
+            blockedProductIDs: result.blockedProductIDs
+        ))
+        next.version += 1
+        next.updatedAt = .now
+        return next
+    }
+
+    static func removing(id: String, from shelf: ShelfState, expectedVersion: Int) throws -> ShelfState {
+        guard shelf.version == expectedVersion else {
+            throw ShelfStateOperationError.staleVersion(expected: expectedVersion, actual: shelf.version)
+        }
+        guard shelf.products.contains(where: { $0.id == id }) else {
+            throw ShelfStateOperationError.invalidPlacement
+        }
+        guard !shelf.products.contains(where: { $0.supportingProductIDs.contains(id) }) else {
+            throw ShelfStateOperationError.dependentPlacementExists
+        }
+        var next = shelf
+        next.products.removeAll { $0.id == id }
+        next.version += 1
+        next.updatedAt = .now
+        return next
+    }
+}
+
 enum ShelfScanValidator {
     static let precisePlacementMinimumConfidence = 0.62
 
@@ -20,7 +95,10 @@ enum ShelfScanValidator {
             shelf.scanQuality.trackingDriftCM > 5 {
             reasons.append(.lowScanConfidence)
         }
-        if shelf.version >= 2 && shelf.geometry?.isApproved != true {
+        // `version` is the operational occupancy revision, not a geometry
+        // schema number. Legacy shelves without geometry remain valid against
+        // their conservative axis-aligned boundary after confirmations.
+        if let geometry = shelf.geometry, !geometry.isApproved {
             reasons.append(.staleShelfState)
         }
         if shelf.products.contains(where: { !containsShelfGeometry(shelf, $0.volume) }) ||
@@ -101,10 +179,32 @@ enum PlacementEngine {
     static func calculate(
         package: PackagePlacementProfile,
         shelf: ShelfState,
+        activeReservations: [PlacementReservation] = [],
         tolerance: PlacementToleranceConfiguration = .warehouse,
         reach: ReachConfiguration = .warehouse,
         handling: HandlingPolicy = .warehouse
     ) -> PlacementCalculation {
+        guard let explicitWeight = package.metadata.explicitValidWeightKG else {
+            return .init(recommendation: nil, alternatives: [], evaluations: [
+                .init(identifier: "product-weight", result: nil, rejectionReasons: [.weightLimit])
+            ], failureMessage: "Enter a finite positive product weight before automatic placement.")
+        }
+        let liveReservations = activeReservations.filter { $0.shelfID == shelf.id && $0.expiresAt > Date() }
+        guard liveReservations.isEmpty else {
+            return .init(recommendation: nil, alternatives: [], evaluations: [
+                .init(identifier: "storage-lock", result: nil, rejectionReasons: [.activeReservation])
+            ], failureMessage: "Another placement operation currently holds this storage area. Retry after it is confirmed, cancelled, or expires.")
+        }
+        var package = package
+        package.metadata = package.metadata.conservativeForAutomaticPlacement
+        // The persisted metadata is authoritative; the duplicate profile field
+        // exists only for compatibility with the earlier capacity-only API.
+        package = PackagePlacementProfile(
+            productId: package.productId, dimensions: package.dimensions,
+            weightKG: explicitWeight, demandVelocity: package.demandVelocity,
+            productType: package.productType, metadata: package.metadata,
+            measurementUncertaintyCM: package.measurementUncertaintyCM
+        )
         let scanReasons = ShelfScanValidator.rejectionReasons(for: shelf)
         guard scanReasons.isEmpty, ShelfScanValidator.validFrontDirection(shelf.primaryFrontDirection) else {
             let message = scanReasons.contains(.lowScanConfidence)
@@ -131,7 +231,9 @@ enum PlacementEngine {
         var evaluations: [PlacementCandidateEvaluation] = []
         for compartment in compartments.sorted(by: { $0.id < $1.id }) {
             for (orientationIndex, orientation) in orientations.enumerated() {
-                let candidates = candidateOrigins(in: compartment, orientation: orientation, shelf: shelf)
+                let candidates = candidateOrigins(
+                    in: compartment, orientation: orientation.orientedDimensions, shelf: shelf
+                )
                 for (candidateIndex, origin) in candidates.enumerated() {
                     let identifier = "\(compartment.id)-\(orientationIndex)-\(candidateIndex)-\(origin.x)-\(origin.y)-\(origin.z)"
                     evaluations.append(evaluate(
@@ -181,16 +283,30 @@ enum PlacementEngine {
     private static func allowedOrientations(
         package: PackagePlacementProfile,
         effectiveDimensions: PackageDimensions
-    ) -> [PackageDimensions] {
-        guard package.metadata.mayRotateAutomatically else { return [effectiveDimensions] }
-        return effectiveDimensions.orientations.filter { oriented in
-            let verticalFace: Set<RestingFace>
-            if approximately(oriented.heightCM, effectiveDimensions.heightCM) { verticalFace = [.bottom, .top] }
-            else if approximately(oriented.heightCM, effectiveDimensions.widthCM) { verticalFace = [.left, .right] }
-            else { verticalFace = [.front, .back] }
-            let faceAllowed = !package.metadata.permittedRestingFaces.isDisjoint(with: verticalFace)
-            let upright = !package.metadata.mustRemainUpright || approximately(oriented.heightCM, effectiveDimensions.heightCM)
-            return faceAllowed && upright
+    ) -> [ProductOrientation] {
+        let metadata = package.metadata
+        let restingFaces: [RestingFace]
+        if metadata.mustRemainUpright {
+            restingFaces = metadata.permittedRestingFaces.contains(.bottom) ? [.bottom] : []
+        } else if metadata.mayRotateAutomatically {
+            restingFaces = RestingFace.allCases.filter(metadata.permittedRestingFaces.contains)
+        } else {
+            restingFaces = metadata.permittedRestingFaces.contains(.bottom) ? [.bottom] : []
+        }
+        return restingFaces.flatMap { restingFace -> [ProductOrientation] in
+            let forwardFaces = metadata.mayRotateAutomatically
+                ? RestingFace.allCases.filter { $0.axis != restingFace.axis }
+                : [.front].filter { $0.axis != restingFace.axis }
+            return forwardFaces.enumerated().map { index, forwardFace in
+                let dimensions = orientedDimensions(
+                    effectiveDimensions, restingFace: restingFace, forwardFace: forwardFace
+                )
+                return ProductOrientation(
+                    restingFace: restingFace, forwardFace: forwardFace,
+                    orientedDimensions: dimensions,
+                    yawQuarterTurns: yawQuarterTurns(restingFace: restingFace, forwardFace: forwardFace, fallback: index)
+                )
+            }
         }
     }
 
@@ -242,7 +358,7 @@ enum PlacementEngine {
     private static func evaluate(
         identifier: String,
         origin: Vector3D,
-        orientation: PackageDimensions,
+        orientation: ProductOrientation,
         package: PackagePlacementProfile,
         shelf: ShelfState,
         compartment: ShelfCompartment,
@@ -250,7 +366,8 @@ enum PlacementEngine {
         reach: ReachConfiguration,
         handling: HandlingPolicy
     ) -> PlacementCandidateEvaluation {
-        let volume = AxisAlignedVolume(id: identifier, minimum: origin, dimensions: orientation)
+        let dimensions = orientation.orientedDimensions
+        let volume = AxisAlignedVolume(id: identifier, minimum: origin, dimensions: dimensions)
         var rejected: [PlacementRejectionCode] = []
         if !contains(compartment.volume, volume)
             || !containsShelfGeometry(shelf, volume) {
@@ -262,7 +379,9 @@ enum PlacementEngine {
            shelf.products.compactMap(\.weightKG).reduce(0, +) + package.weightKG > rated { rejected.append(.weightLimit) }
 
         let support = supportEvaluation(volume: volume, package: package, shelf: shelf, compartment: compartment)
-        if support.ratio + 0.0001 < package.metadata.stacking.minimumSupportRatio { rejected.append(.insufficientSupport) }
+        let requiredSupport = package.metadata.stacking.requiresFullBaseSupport
+            ? 1 : package.metadata.stacking.minimumSupportRatio
+        if support.ratio + 0.0001 < requiredSupport { rejected.append(.insufficientSupport) }
         if !support.centreSupported { rejected.append(.unstable) }
         if !support.rulesValid { rejected.append(.stackingRule) }
         if !support.weightValid { rejected.append(.weightLimit) }
@@ -270,7 +389,11 @@ enum PlacementEngine {
         let insertion = insertionPath(for: volume, compartment: compartment, shelf: shelf, clearance: tolerance.insertionClearanceCM)
         if insertion == nil { rejected.append(.noInsertionPath) }
 
-        let blocked = productsBlockedBy(volume, in: shelf, gripClearance: tolerance.retrievalClearanceCM)
+        let blocked = (productsBlockedBy(
+            volume, in: shelf, gripClearance: tolerance.retrievalClearanceCM
+        ) + support.supportingProducts).reduce(into: [StoredProductPlacement]()) { result, product in
+            if !result.contains(where: { $0.id == product.id }) { result.append(product) }
+        }
         let critical = blocked.filter { $0.priority == .critical }
         if !critical.isEmpty && !handling.allowCriticalBlockingOverride { rejected.append(.criticalProductBlocked) }
 
@@ -289,18 +412,30 @@ enum PlacementEngine {
         let blockingCost = blocked.reduce(0.0) {
             $0 + Double($1.priority.rawValue) * max($1.retrievalFrequency, 0.1)
         }
-        let depthRange = max(compartment.volume.dimensions.depthCM - orientation.depthCM, 1)
+        let depthRange = max(compartment.volume.dimensions.depthCM - dimensions.depthCM, 1)
         let frontScore = 1 - clamp((origin.z - compartment.volume.minimum.z) / depthRange)
         let preferredMid = (reach.minimumPreferredHeightCM + reach.maximumPreferredHeightCM) / 2
         let heightDistance = abs(volume.maximum.y - preferredMid)
         let safeHeight = 1 - clamp(heightDistance / max(preferredMid, 1))
         let accessibility = clamp(1 - Double(requiredMoves.count) * 0.25) * 0.65 + frontScore * 0.35
-        let space = 1 - clamp((compartment.volume.dimensions.volumeCM3 - orientation.volumeCM3) /
+        let space = 1 - clamp((compartment.volume.dimensions.volumeCM3 - dimensions.volumeCM3) /
                               max(compartment.volume.dimensions.volumeCM3, 1))
+        let demand = max(
+            package.metadata.expectedRetrievalFrequency,
+            Double(package.metadata.retrievalPriority.rawValue) / 5,
+            clamp(package.metadata.expirationUrgency)
+        )
+        let stackAccessibilityCost = support.supportingProducts.reduce(0.0) {
+            $0 + max($1.retrievalFrequency, Double($1.priority.rawValue) / 5)
+        }
+        let retrievalCost = demand * (1 - frontScore) * 4 + stackAccessibilityCost * 2
+        let fragmentation = fragmentationPenalty(for: volume, in: compartment, shelf: shelf)
         let rank = PlacementRank(
             criticalProductBlockingCount: critical.count,
             higherPriorityBlockingCost: blockingCost,
             requiredMoveCount: requiredMoves.count,
+            expectedRetrievalCost: retrievalCost,
+            fragmentationPenalty: fragmentation,
             accessibilityScore: accessibility,
             safeHeightScore: safeHeight,
             frontScore: frontScore,
@@ -308,18 +443,19 @@ enum PlacementEngine {
             spaceEfficiencyScore: space
         )
         var warnings: [String] = []
-        if package.metadata.weightKG == nil { warnings.append("Weight information is missing. Recommendation is limited to conservative support rules.") }
         if package.metadata.isFragile == nil { warnings.append("Fragility is unknown; stacking above this product is disabled.") }
         if shelf.ratedWeightKG == nil && compartment.ratedWeightKG == nil { warnings.append("Shelf load rating is unknown.") }
-        let rotation = quarterTurns(from: package.dimensions, to: orientation)
+        let rotation = orientation.yawQuarterTurns
         let supportText = support.supportingProducts.first.map { " Set it on top of product \($0.id)." } ?? " Set it directly on the shelf surface."
-        let rotateText = rotation == 0 ? "Keep its scanned bottom face down." : "Rotate it \(rotation * 90)° clockwise while keeping an allowed resting face down."
-        let instructions = "Place the product in \(shelf.label), \(compartment.label).\(supportText) \(rotateText) Align its front face about \(max(origin.z - compartment.volume.minimum.z, 0).formatted(.number.precision(.fractionLength(0)))) cm behind the shelf opening."
+        let instructions = placementInstructions(
+            shelf: shelf, compartment: compartment, origin: origin,
+            orientation: orientation, supportText: supportText
+        )
         let removal = Array(insertion.reversed())
         let result = ProductPlacementResult(
             id: identifier, shelfID: shelf.id, compartmentID: compartment.id,
             productID: package.productId, shelfVersion: shelf.version, position: origin,
-            quarterTurns: rotation, orientedDimensions: orientation,
+            quarterTurns: rotation, orientedDimensions: dimensions, orientation: orientation,
             supportSurfaceID: support.supportingProducts.first?.volume.id ?? compartment.volume.id,
             supportingProductIDs: support.supportingProducts.map(\.id).sorted(),
             blockedProductIDs: blocked.map(\.id).sorted(), insertionPath: insertion,
@@ -348,25 +484,60 @@ enum PlacementEngine {
             return .init(ratio: 1, centreSupported: true, rulesValid: true, weightValid: true, supportingProducts: [])
         }
         let supporters = shelf.products.filter { product in
+            // 1.5 mm is deliberately smaller than normal warehouse clearance:
+            // support must be coplanar, not merely near the candidate.
             approximately(product.volume.maximum.y, volume.minimum.y, epsilon: 0.15) &&
             horizontalOverlapArea(product.volume, volume) > 0
         }
         let baseArea = max(volume.dimensions.widthCM * volume.dimensions.depthCM, 0.0001)
-        let ratio = min(supporters.reduce(0.0) { $0 + horizontalOverlapArea($1.volume, volume) } / baseArea, 1)
+        // Multi-support balancing is intentionally outside this MVP.
+        guard supporters.count == 1, let supporter = supporters.first else {
+            return .init(ratio: 0, centreSupported: false, rulesValid: false,
+                         weightValid: false, supportingProducts: supporters)
+        }
+        let ratio = min(horizontalOverlapArea(supporter.volume, volume) / baseArea, 1)
         let centre = Vector3D(volume.minimum.x + volume.dimensions.widthCM / 2, volume.minimum.y,
                               volume.minimum.z + volume.dimensions.depthCM / 2)
-        let centreSupported = supporters.contains { horizontalContains($0.volume, centre) }
-        let rulesValid = package.metadata.stacking.canBePlacedOnAnotherProduct && supporters.allSatisfy { support in
-            support.stacking.canSupportProductsAbove && !support.stacking.fragileTopSurface &&
-            !(support.stacking.prohibitedProductTypesAbove?.contains(package.productType) ?? false) &&
-            (support.stacking.allowedProductTypesAbove?.contains(package.productType) ?? true)
-        }
-        let weightValid = supporters.allSatisfy {
-            guard let maximum = $0.stacking.maximumSupportedWeight else { return false }
-            return package.weightKG <= maximum
-        }
+        let centreSupported = horizontalContains(supporter.volume, centre)
+        let descendants = supportedDescendants(of: supporter.id, in: shelf.products)
+        let directChildren = shelf.products.filter { $0.supportingProductIDs == [supporter.id] }
+        let typeAllowed = !(supporter.stacking.prohibitedProductTypesAbove?.contains(package.productType) ?? false)
+            && (supporter.stacking.allowedProductTypesAbove?.contains(package.productType) ?? true)
+        let countAllowed = supporter.stacking.maximumItemsAbove.map { descendants.count + 1 <= $0 } ?? true
+        let identicalAllowed = supporter.stacking.maximumIdenticalStackCount.map { limit in
+            descendants.filter { $0.productID == package.productId }.count + 1 <= limit
+        } ?? true
+        let heightAllowed = supporter.stacking.maximumTotalStackHeight.map {
+            volume.maximum.y - supporter.volume.minimum.y <= $0 + 0.0001
+        } ?? true
+        let supporterAccessible = supporter.priority != .critical
+        let rulesValid = package.metadata.stacking.canBePlacedOnAnotherProduct
+            && supporter.stacking.canSupportProductsAbove
+            && supporter.stacking.hasValidSupportConfiguration
+            && !supporter.stacking.fragileTopSurface
+            && typeAllowed && countAllowed && identicalAllowed && heightAllowed
+            && supporterAccessible && directChildren.count == descendants.count
+        let cumulativeWeight = descendants.compactMap(\.weightKG).reduce(0, +) + package.weightKG
+        let weightValid = supporter.stacking.maximumSupportedWeight.map {
+            $0.isFinite && $0 > 0 && cumulativeWeight <= $0 + 0.0001
+        } ?? false
         return .init(ratio: ratio, centreSupported: centreSupported, rulesValid: rulesValid,
                      weightValid: weightValid, supportingProducts: supporters)
+    }
+
+    private static func supportedDescendants(
+        of supporterID: String,
+        in products: [StoredProductPlacement]
+    ) -> [StoredProductPlacement] {
+        var discovered: Set<String> = []
+        var frontier = [supporterID]
+        while let current = frontier.popLast() {
+            for child in products where child.supportingProductIDs.contains(current) && !discovered.contains(child.id) {
+                discovered.insert(child.id)
+                frontier.append(child.id)
+            }
+        }
+        return products.filter { discovered.contains($0.id) }
     }
 
     private static func insertionPath(
@@ -424,8 +595,80 @@ enum PlacementEngine {
         }
     }
 
-    private static func quarterTurns(from original: PackageDimensions, to oriented: PackageDimensions) -> Int {
-        approximately(original.widthCM, oriented.widthCM) && approximately(original.depthCM, oriented.depthCM) ? 0 : 1
+    private static func orientedDimensions(
+        _ dimensions: PackageDimensions,
+        restingFace: RestingFace,
+        forwardFace: RestingFace
+    ) -> PackageDimensions {
+        func length(for axis: Int) -> Double {
+            switch axis {
+            case 0: dimensions.widthCM
+            case 1: dimensions.heightCM
+            default: dimensions.depthCM
+            }
+        }
+        let remainingAxis = Set([0, 1, 2]).subtracting([restingFace.axis, forwardFace.axis]).first ?? 0
+        return PackageDimensions(
+            widthCM: length(for: remainingAxis),
+            heightCM: length(for: restingFace.axis),
+            depthCM: length(for: forwardFace.axis)
+        )
+    }
+
+    private static func yawQuarterTurns(
+        restingFace: RestingFace,
+        forwardFace: RestingFace,
+        fallback: Int
+    ) -> Int {
+        if restingFace == .bottom {
+            return [.front, .right, .back, .left].firstIndex(of: forwardFace) ?? fallback
+        }
+        return fallback % 4
+    }
+
+    private static func placementInstructions(
+        shelf: ShelfState,
+        compartment: ShelfCompartment,
+        origin: Vector3D,
+        orientation: ProductOrientation,
+        supportText: String
+    ) -> String {
+        let fromFront = max(origin.z - compartment.volume.minimum.z, 0)
+        let fromLeft = max(origin.x - compartment.volume.minimum.x, 0)
+        let fromRight = max(compartment.volume.maximum.x
+            - (origin.x + orientation.orientedDimensions.widthCM), 0)
+        let horizontal = fromLeft <= fromRight
+            ? "\(fromLeft.formatted(.number.precision(.fractionLength(0)))) cm from the left boundary"
+            : "\(fromRight.formatted(.number.precision(.fractionLength(0)))) cm from the right boundary"
+        return "Place the product in \(shelf.label), \(compartment.label).\(supportText) "
+            + "Put the \(orientation.restingFace.rawValue) face down and the \(orientation.forwardFace.rawValue) face toward the opening. "
+            + "Position its front \(fromFront.formatted(.number.precision(.fractionLength(0)))) cm behind the opening and \(horizontal)."
+    }
+
+    /// Explainable MVP fragmentation metric: penalize narrow side/rear gaps
+    /// and volume trapped behind the candidate. This is deliberately local and
+    /// deterministic; it leaves room for future look-ahead without using it now.
+    private static func fragmentationPenalty(
+        for volume: AxisAlignedVolume,
+        in compartment: ShelfCompartment,
+        shelf: ShelfState
+    ) -> Double {
+        let left = max(volume.minimum.x - compartment.volume.minimum.x, 0)
+        let right = max(compartment.volume.maximum.x - volume.maximum.x, 0)
+        let behind = max(compartment.volume.maximum.z - volume.maximum.z, 0)
+        let sliverLimit = 10.0
+        let sliverPenalty = [left, right, behind].reduce(0.0) { total, gap in
+            guard gap > 0, gap < sliverLimit else { return total }
+            return total + (sliverLimit - gap) / sliverLimit
+        }
+        let laneBlocked = shelf.products.contains {
+            intervalOverlap($0.volume.minimum.x, $0.volume.maximum.x,
+                            volume.minimum.x, volume.maximum.x) > 0
+                && $0.volume.minimum.z > volume.maximum.z
+        }
+        let trappedVolumeRatio = behind * volume.dimensions.widthCM * volume.dimensions.heightCM
+            / max(compartment.volume.dimensions.volumeCM3, 1)
+        return sliverPenalty + trappedVolumeRatio + (laneBlocked ? 1 : 0)
     }
 }
 
@@ -455,7 +698,7 @@ private func containsShelfGeometry(
     _ volume: AxisAlignedVolume
 ) -> Bool {
     guard contains(shelf.boundary, volume) else { return false }
-    guard let polygon = approvedFootprint(shelf) else { return shelf.version < 2 }
+    guard let polygon = approvedFootprint(shelf) else { return true }
     let margin = max(shelf.geometry?.placementSafetyMarginCM ?? 0, 0)
     let corners = [
         SIMD2(volume.minimum.x, volume.minimum.z),

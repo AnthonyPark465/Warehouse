@@ -344,12 +344,14 @@ final class ApprovedShelfGeometryPlacementTests: XCTestCase {
     }
 
     private func package() -> PackagePlacementProfile {
-        PackagePlacementProfile(
+        var metadata = ProductPlacementMetadata.conservative
+        metadata.weightKG = 2
+        return PackagePlacementProfile(
             productId: "product",
             dimensions: PackageDimensions(widthCM: 20, heightCM: 20, depthCM: 20),
             weightKG: 2,
             demandVelocity: 0.5,
-            metadata: .conservative
+            metadata: metadata
         )
     }
 

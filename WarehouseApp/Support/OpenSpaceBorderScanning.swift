@@ -198,7 +198,7 @@ struct DefaultBorderDetectionEngine: BorderDetectionEngine {
     private func threshold(for surface: SpaceSurfaceType) -> Double {
         switch surface {
         case .floor: 0.10
-        case .tabletop, .workbench, .platform, .counter: 0.055
+        case .shelf, .tabletop, .workbench, .platform, .counter: 0.055
         case .customHorizontalSurface, .unknown: 0.075
         }
     }

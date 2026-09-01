@@ -8,10 +8,11 @@ enum StorageGeometryType: String, Codable, CaseIterable, Identifiable {
 }
 
 enum SpaceSurfaceType: String, Codable, CaseIterable, Identifiable {
-    case floor, tabletop, workbench, platform, counter, customHorizontalSurface, unknown
+    case shelf, floor, tabletop, workbench, platform, counter, customHorizontalSurface, unknown
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .shelf: "Shelf"
         case .floor: "Floor"
         case .tabletop: "Tabletop"
         case .workbench: "Workbench"
@@ -85,6 +86,8 @@ struct ScannedSpaceGeometry: Codable, Equatable, Identifiable {
     var measuredCorners: [MeasuredSpaceCornerRecord]? = nil
     /// Full border-scan provenance (schema v4+). Older corner-placement records decode with nil.
     var scannedBoundary: ScannedStorageBoundary? = nil
+    /// Selected base-plane provenance plus exactly four wall boundaries.
+    var markerMeasurement: StorageMarkerMeasurementRecord? = nil
 
     var isApprovedForPlacement: Bool {
         approval == .approved && approvedBoundary2D.count >= 3 && heightCM.isFinite && heightCM > 0
@@ -134,6 +137,16 @@ enum SpaceGeometryValidator {
                       }) else { throw SpaceGeometryError.accuracyNotVerified }
             }
         }
+        if let markerMeasurement = space.markerMeasurement {
+            guard markerMeasurement.isValidForPlacement,
+                  polygonsApproximatelyEqual(
+                      markerMeasurement.approvedFootprint2D,
+                      space.approvedBoundary2D.map { Vector2D($0.x / 100, $0.y / 100) }
+                  ),
+                  abs(markerMeasurement.heightCM - space.heightCM) < 0.001 else {
+                throw SpaceGeometryError.invalidBoundary
+            }
+        }
         guard space.localVerticalAxis.normalized.y.isFinite,
               simd_length(space.localVerticalAxis.simd) > 0.9 else {
             throw SpaceGeometryError.reversedVerticalAxis
@@ -175,6 +188,15 @@ enum SpaceGeometryValidator {
         }
         return inside
     }
+
+    private static func polygonsApproximatelyEqual(
+        _ first: [Vector2D], _ second: [Vector2D]
+    ) -> Bool {
+        guard first.count == second.count else { return false }
+        return zip(first, second).allSatisfy {
+            simd_distance($0.simd, $1.simd) <= 0.000_001
+        }
+    }
 }
 
 enum OpenSpacePlacementAdapter {
@@ -190,7 +212,8 @@ enum OpenSpacePlacementAdapter {
         )
         let metadata = ShelfMeasurementMetadata(
             capturedAt: space.createdAt, deviceModel: "Space Scan",
-            hasLiDAR: space.measurementMethod == .lidarBorderScan
+            hasLiDAR: space.markerMeasurement?.deviceHasLiDAR == true
+                || space.measurementMethod == .lidarBorderScan
                 || space.measurementMethod == .lidarCornerPlacement,
             coordinateSpace: .shelfLocal, unit: .centimetres,
             planeRMSResidualMetres: 0, planeMaximumResidualMetres: 0,

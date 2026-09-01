@@ -49,6 +49,10 @@ struct AddProductView: View {
     @State private var canSupportAbove = false
     @State private var canRestOnProduct = false
     @State private var maximumSupportedWeight = ""
+    @State private var fragileTopSurface = true
+    @State private var requiredSupportPercentage = "95"
+    @State private var maximumItemsAbove = ""
+    @State private var maximumTotalStackHeight = ""
     @State private var requiredClearance = "2"
     @State private var selectedRestingFaces: Set<RestingFace> = [.bottom]
     @State private var quantityArrangement: QuantityArrangement = .singleUnit
@@ -216,7 +220,7 @@ struct AddProductView: View {
 
     private var placementRulesSection: some View {
         Section("Placement & Handling") {
-            TextField("Weight in kg (recommended)", text: $placementWeight)
+            TextField("Product weight in kg (required for automatic placement)", text: $placementWeight)
                 .keyboardType(.decimalPad)
             Picker("Retrieval priority", selection: $retrievalPriority) {
                 ForEach(RetrievalPriority.allCases) { priority in
@@ -229,7 +233,7 @@ struct AddProductView: View {
             }
             Toggle("Fragility information is known", isOn: $fragilityKnown)
             if fragilityKnown { Toggle("Fragile", isOn: $isFragile) }
-            Picker("Can this product rest directly on its current bottom surface?", selection: $restingSurface) {
+            Picker("Allowed resting faces", selection: $restingSurface) {
                 ForEach(RestingSurfaceAnswer.allCases) { Text($0.rawValue).tag($0) }
             }
             if restingSurface == .selected {
@@ -245,10 +249,17 @@ struct AddProductView: View {
             }
             Toggle("Must remain upright", isOn: $mustRemainUpright)
             Toggle("May rotate automatically", isOn: $canBeRotated)
-            Toggle("Can support products above", isOn: $canSupportAbove)
-            Toggle("Can be placed on another product", isOn: $canRestOnProduct)
+            Toggle("May support products above", isOn: $canSupportAbove)
+            Toggle("May be placed on another product", isOn: $canRestOnProduct)
             if canSupportAbove {
                 TextField("Maximum supported weight (kg)", text: $maximumSupportedWeight)
+                    .keyboardType(.decimalPad)
+                Toggle("Fragile top surface", isOn: $fragileTopSurface)
+                TextField("Required support ratio (%)", text: $requiredSupportPercentage)
+                    .keyboardType(.decimalPad)
+                TextField("Maximum items above (optional)", text: $maximumItemsAbove)
+                    .keyboardType(.numberPad)
+                TextField("Maximum total stack height in cm (optional)", text: $maximumTotalStackHeight)
                     .keyboardType(.decimalPad)
             }
             TextField("Required handling clearance (cm)", text: $requiredClearance)
@@ -258,7 +269,7 @@ struct AddProductView: View {
                 Text("One grouped case").tag(QuantityArrangement.groupedCase)
                 Text("Separate units").tag(QuantityArrangement.separateUnits)
             }
-            Text("Unknown weight, fragility, or load limits use conservative direct-shelf-only placement.")
+            Text("Missing weight disables automatic placement. Invalid or incomplete support data is treated as direct-surface-only.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -294,11 +305,22 @@ struct AddProductView: View {
     private var isValid: Bool {
         let shelfLifeOk = shelfLifeText.isEmpty || (Int(shelfLifeText).map { $0 > 0 } ?? false)
         let barcodeOk = barcodeMode != .scanned || !trimmedBarcode.isEmpty
+        let weightOk = placementWeight.isEmpty || (Double(placementWeight).map { $0.isFinite && $0 > 0 } ?? false)
+        let supportCapacityOk = !canSupportAbove || (Double(maximumSupportedWeight).map { $0.isFinite && $0 > 0 } ?? false)
+        let supportRatioOk = !canSupportAbove || (Double(requiredSupportPercentage).map { (95...100).contains($0) } ?? false)
+        let itemLimitOk = maximumItemsAbove.isEmpty || (Int(maximumItemsAbove).map { $0 > 0 } ?? false)
+        let heightLimitOk = maximumTotalStackHeight.isEmpty
+            || (Double(maximumTotalStackHeight).map { $0.isFinite && $0 > 0 } ?? false)
         return !name.trimmingCharacters(in: .whitespaces).isEmpty
             && !productCode.trimmingCharacters(in: .whitespaces).isEmpty
             && !type.trimmingCharacters(in: .whitespaces).isEmpty
             && shelfLifeOk
             && barcodeOk
+            && weightOk
+            && supportCapacityOk
+            && supportRatioOk
+            && itemLimitOk
+            && heightLimitOk
     }
 
     private var trimmedBarcode: String {
@@ -343,14 +365,14 @@ struct AddProductView: View {
                             canSupportProductsAbove: canSupportAbove,
                             canBePlacedOnAnotherProduct: canRestOnProduct,
                             maximumSupportedWeight: Double(maximumSupportedWeight),
-                            maximumTotalStackHeight: nil,
-                            maximumItemsAbove: nil,
+                            maximumTotalStackHeight: Double(maximumTotalStackHeight),
+                            maximumItemsAbove: Int(maximumItemsAbove),
                             maximumIdenticalStackCount: nil,
                             allowedProductTypesAbove: nil,
                             prohibitedProductTypesAbove: nil,
-                            requiresFullBaseSupport: true,
-                            minimumSupportRatio: 0.95,
-                            fragileTopSurface: fragilityKnown ? isFragile : true,
+                            requiresFullBaseSupport: (Double(requiredSupportPercentage) ?? 100) >= 100,
+                            minimumSupportRatio: (Double(requiredSupportPercentage) ?? 100) / 100,
+                            fragileTopSurface: fragileTopSurface,
                             notes: nil
                         ),
                         quantityArrangement: quantityArrangement

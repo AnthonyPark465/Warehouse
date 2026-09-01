@@ -1,6 +1,7 @@
 import Foundation
 
 enum SpaceMeasurementMethod: String, Codable, Equatable {
+    case markerBoundaries
     case lidarBorderScan
     case lidarSectionedEdgeScan
     case standardARBorderScan

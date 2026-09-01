@@ -33,6 +33,35 @@ enum RetrievalPriority: Int, Codable, Comparable, CaseIterable, Identifiable {
 enum RestingFace: String, Codable, CaseIterable, Hashable, Identifiable {
     case bottom, top, left, right, front, back
     var id: String { rawValue }
+
+    var opposite: RestingFace {
+        switch self {
+        case .bottom: .top
+        case .top: .bottom
+        case .left: .right
+        case .right: .left
+        case .front: .back
+        case .back: .front
+        }
+    }
+
+    var axis: Int {
+        switch self {
+        case .left, .right: 0
+        case .bottom, .top: 1
+        case .front, .back: 2
+        }
+    }
+}
+
+/// A complete axis-aligned pose. Unlike the legacy `quarterTurns` value this
+/// records which physical face is down, so a worker is never told that tipping
+/// a carton onto its side is merely a yaw rotation.
+struct ProductOrientation: Codable, Equatable, Hashable {
+    var restingFace: RestingFace
+    var forwardFace: RestingFace
+    var orientedDimensions: PackageDimensions
+    var yawQuarterTurns: Int
 }
 
 enum QuantityArrangement: String, Codable, CaseIterable, Identifiable {
@@ -54,6 +83,47 @@ struct StackingRules: Codable, Equatable {
     var fragileTopSurface: Bool
     var notes: String?
 
+    init(
+        canSupportProductsAbove: Bool,
+        canBePlacedOnAnotherProduct: Bool,
+        maximumSupportedWeight: Double?,
+        maximumTotalStackHeight: Double?,
+        maximumItemsAbove: Int?,
+        maximumIdenticalStackCount: Int?,
+        allowedProductTypesAbove: Set<String>?,
+        prohibitedProductTypesAbove: Set<String>?,
+        requiresFullBaseSupport: Bool,
+        minimumSupportRatio: Double,
+        fragileTopSurface: Bool,
+        notes: String?
+    ) {
+        self.canSupportProductsAbove = canSupportProductsAbove
+        self.canBePlacedOnAnotherProduct = canBePlacedOnAnotherProduct
+        self.maximumSupportedWeight = maximumSupportedWeight
+        self.maximumTotalStackHeight = maximumTotalStackHeight
+        self.maximumItemsAbove = maximumItemsAbove
+        self.maximumIdenticalStackCount = maximumIdenticalStackCount
+        self.allowedProductTypesAbove = allowedProductTypesAbove
+        self.prohibitedProductTypesAbove = prohibitedProductTypesAbove
+        self.requiresFullBaseSupport = requiresFullBaseSupport
+        self.minimumSupportRatio = minimumSupportRatio
+        self.fragileTopSurface = fragileTopSurface
+        self.notes = notes
+    }
+
+    var hasValidSupportConfiguration: Bool {
+        guard canSupportProductsAbove else { return true }
+        guard let maximumSupportedWeight,
+              maximumSupportedWeight.isFinite,
+              maximumSupportedWeight > 0,
+              minimumSupportRatio.isFinite,
+              (0.95...1).contains(minimumSupportRatio) else { return false }
+        if let maximumItemsAbove, maximumItemsAbove < 1 { return false }
+        if let maximumTotalStackHeight,
+           !maximumTotalStackHeight.isFinite || maximumTotalStackHeight <= 0 { return false }
+        return true
+    }
+
     static let conservative = StackingRules(
         canSupportProductsAbove: false,
         canBePlacedOnAnotherProduct: false,
@@ -68,6 +138,35 @@ struct StackingRules: Codable, Equatable {
         fragileTopSurface: true,
         notes: "Unspecified stacking data; direct shelf support only."
     )
+
+    private enum CodingKeys: String, CodingKey {
+        case canSupportProductsAbove, canBePlacedOnAnotherProduct, maximumSupportedWeight
+        case maximumTotalStackHeight, maximumItemsAbove, maximumIdenticalStackCount
+        case allowedProductTypesAbove, prohibitedProductTypesAbove, requiresFullBaseSupport
+        case minimumSupportRatio, fragileTopSurface, notes
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = Self.conservative
+        canSupportProductsAbove = try values.decodeIfPresent(Bool.self, forKey: .canSupportProductsAbove)
+            ?? fallback.canSupportProductsAbove
+        canBePlacedOnAnotherProduct = try values.decodeIfPresent(Bool.self, forKey: .canBePlacedOnAnotherProduct)
+            ?? fallback.canBePlacedOnAnotherProduct
+        maximumSupportedWeight = try values.decodeIfPresent(Double.self, forKey: .maximumSupportedWeight)
+        maximumTotalStackHeight = try values.decodeIfPresent(Double.self, forKey: .maximumTotalStackHeight)
+        maximumItemsAbove = try values.decodeIfPresent(Int.self, forKey: .maximumItemsAbove)
+        maximumIdenticalStackCount = try values.decodeIfPresent(Int.self, forKey: .maximumIdenticalStackCount)
+        allowedProductTypesAbove = try values.decodeIfPresent(Set<String>.self, forKey: .allowedProductTypesAbove)
+        prohibitedProductTypesAbove = try values.decodeIfPresent(Set<String>.self, forKey: .prohibitedProductTypesAbove)
+        requiresFullBaseSupport = try values.decodeIfPresent(Bool.self, forKey: .requiresFullBaseSupport)
+            ?? fallback.requiresFullBaseSupport
+        minimumSupportRatio = try values.decodeIfPresent(Double.self, forKey: .minimumSupportRatio)
+            ?? fallback.minimumSupportRatio
+        fragileTopSurface = try values.decodeIfPresent(Bool.self, forKey: .fragileTopSurface)
+            ?? fallback.fragileTopSurface
+        notes = try values.decodeIfPresent(String.self, forKey: .notes)
+    }
 }
 
 struct ProductPlacementMetadata: Codable, Equatable {
@@ -83,6 +182,27 @@ struct ProductPlacementMetadata: Codable, Equatable {
     var stacking: StackingRules
     var quantityArrangement: QuantityArrangement
 
+    init(
+        weightKG: Double?, retrievalPriority: RetrievalPriority,
+        expectedRetrievalFrequency: Double, expirationUrgency: Double,
+        isFragile: Bool?, permittedRestingFaces: Set<RestingFace>,
+        mustRemainUpright: Bool, mayRotateAutomatically: Bool,
+        requiredClearanceCM: Double, stacking: StackingRules,
+        quantityArrangement: QuantityArrangement
+    ) {
+        self.weightKG = weightKG
+        self.retrievalPriority = retrievalPriority
+        self.expectedRetrievalFrequency = expectedRetrievalFrequency
+        self.expirationUrgency = expirationUrgency
+        self.isFragile = isFragile
+        self.permittedRestingFaces = permittedRestingFaces
+        self.mustRemainUpright = mustRemainUpright
+        self.mayRotateAutomatically = mayRotateAutomatically
+        self.requiredClearanceCM = requiredClearanceCM
+        self.stacking = stacking
+        self.quantityArrangement = quantityArrangement
+    }
+
     static let conservative = ProductPlacementMetadata(
         weightKG: nil,
         retrievalPriority: .normal,
@@ -96,6 +216,62 @@ struct ProductPlacementMetadata: Codable, Equatable {
         stacking: .conservative,
         quantityArrangement: .singleUnit
     )
+
+    var explicitValidWeightKG: Double? {
+        guard let weightKG, weightKG.isFinite, weightKG > 0 else { return nil }
+        return weightKG
+    }
+
+    /// Invalid or incomplete support data is never repaired by granting more
+    /// permission. It is downgraded to direct-surface placement for this run.
+    var conservativeForAutomaticPlacement: ProductPlacementMetadata {
+        var value = self
+        value.expectedRetrievalFrequency = min(max(value.expectedRetrievalFrequency.isFinite
+            ? value.expectedRetrievalFrequency : 0.5, 0), 1)
+        value.requiredClearanceCM = value.requiredClearanceCM.isFinite
+            ? max(value.requiredClearanceCM, 0) : Self.conservative.requiredClearanceCM
+        if value.permittedRestingFaces.isEmpty {
+            value.mayRotateAutomatically = false
+        }
+        if !value.stacking.hasValidSupportConfiguration {
+            value.stacking = .conservative
+        }
+        value.stacking.minimumSupportRatio = min(max(
+            value.stacking.minimumSupportRatio.isFinite ? value.stacking.minimumSupportRatio : 1,
+            0.95
+        ), 1)
+        return value
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case weightKG, retrievalPriority, expectedRetrievalFrequency, expirationUrgency
+        case isFragile, permittedRestingFaces, mustRemainUpright, mayRotateAutomatically
+        case requiredClearanceCM, stacking, quantityArrangement
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = Self.conservative
+        weightKG = try values.decodeIfPresent(Double.self, forKey: .weightKG)
+        retrievalPriority = try values.decodeIfPresent(RetrievalPriority.self, forKey: .retrievalPriority)
+            ?? fallback.retrievalPriority
+        expectedRetrievalFrequency = try values.decodeIfPresent(Double.self, forKey: .expectedRetrievalFrequency)
+            ?? fallback.expectedRetrievalFrequency
+        expirationUrgency = try values.decodeIfPresent(Double.self, forKey: .expirationUrgency)
+            ?? fallback.expirationUrgency
+        isFragile = try values.decodeIfPresent(Bool.self, forKey: .isFragile)
+        permittedRestingFaces = try values.decodeIfPresent(Set<RestingFace>.self, forKey: .permittedRestingFaces)
+            ?? fallback.permittedRestingFaces
+        mustRemainUpright = try values.decodeIfPresent(Bool.self, forKey: .mustRemainUpright)
+            ?? fallback.mustRemainUpright
+        mayRotateAutomatically = try values.decodeIfPresent(Bool.self, forKey: .mayRotateAutomatically)
+            ?? fallback.mayRotateAutomatically
+        requiredClearanceCM = try values.decodeIfPresent(Double.self, forKey: .requiredClearanceCM)
+            ?? fallback.requiredClearanceCM
+        stacking = try values.decodeIfPresent(StackingRules.self, forKey: .stacking) ?? fallback.stacking
+        quantityArrangement = try values.decodeIfPresent(QuantityArrangement.self, forKey: .quantityArrangement)
+            ?? fallback.quantityArrangement
+    }
 }
 
 struct PackagePlacementProfile: Equatable {
@@ -188,6 +364,8 @@ struct StoredProductPlacement: Codable, Equatable, Identifiable {
     var productType: String
     var compartmentID: String?
     var volume: AxisAlignedVolume
+    /// Nil only for legacy records written before full axis-aligned poses were stored.
+    var orientation: ProductOrientation? = nil
     var weightKG: Double?
     var priority: RetrievalPriority
     var retrievalFrequency: Double
@@ -423,12 +601,17 @@ enum PlacementRejectionCode: String, Codable, Equatable {
     case invalidOrientation = "REJECT_INVALID_ORIENTATION"
     case lowScanConfidence = "REJECT_LOW_SCAN_CONFIDENCE"
     case unstable = "REJECT_UNSTABLE"
+    case activeReservation = "REJECT_ACTIVE_RESERVATION"
 }
 
 struct PlacementRank: Codable, Equatable, Comparable {
     var criticalProductBlockingCount: Int
     var higherPriorityBlockingCost: Double
     var requiredMoveCount: Int
+    /// Lower is better. Optional keeps old saved placement results decodable.
+    var expectedRetrievalCost: Double? = nil
+    /// Lower is better; measures slivers and space trapped behind the candidate.
+    var fragmentationPenalty: Double? = nil
     var accessibilityScore: Double
     var safeHeightScore: Double
     var frontScore: Double
@@ -436,12 +619,17 @@ struct PlacementRank: Codable, Equatable, Comparable {
     var spaceEfficiencyScore: Double
 
     static func < (lhs: PlacementRank, rhs: PlacementRank) -> Bool {
-        let l = [Double(-lhs.criticalProductBlockingCount), -lhs.higherPriorityBlockingCost,
-                 Double(-lhs.requiredMoveCount), lhs.accessibilityScore, lhs.safeHeightScore,
-                 lhs.frontScore, lhs.stabilityScore, lhs.spaceEfficiencyScore]
-        let r = [Double(-rhs.criticalProductBlockingCount), -rhs.higherPriorityBlockingCost,
-                 Double(-rhs.requiredMoveCount), rhs.accessibilityScore, rhs.safeHeightScore,
-                 rhs.frontScore, rhs.stabilityScore, rhs.spaceEfficiencyScore]
+        // Safety violations have already been rejected. The remaining fields
+        // follow the documented MVP lexicographic order; ID is the final tie
+        // breaker in PlacementEngine.calculate.
+        let l = [Double(-lhs.criticalProductBlockingCount),
+                 -(lhs.expectedRetrievalCost ?? 0), -lhs.higherPriorityBlockingCost,
+                 Double(-lhs.requiredMoveCount), -(lhs.fragmentationPenalty ?? 0),
+                 lhs.spaceEfficiencyScore, lhs.stabilityScore, lhs.safeHeightScore]
+        let r = [Double(-rhs.criticalProductBlockingCount),
+                 -(rhs.expectedRetrievalCost ?? 0), -rhs.higherPriorityBlockingCost,
+                 Double(-rhs.requiredMoveCount), -(rhs.fragmentationPenalty ?? 0),
+                 rhs.spaceEfficiencyScore, rhs.stabilityScore, rhs.safeHeightScore]
         for (a, b) in zip(l, r) where a != b { return a < b }
         return false
     }
@@ -456,6 +644,8 @@ struct ProductPlacementResult: Codable, Equatable, Identifiable {
     var position: Vector3D
     var quarterTurns: Int
     var orientedDimensions: PackageDimensions
+    /// Full pose for new records. Legacy records retain quarterTurns and decode with nil.
+    var orientation: ProductOrientation? = nil
     var supportSurfaceID: String?
     var supportingProductIDs: [String]
     var blockedProductIDs: [String]
