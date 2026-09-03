@@ -71,6 +71,42 @@ enum ProductRepository {
         return id
     }
 
+    /// Editable product fields (photo and barcode change through their own services).
+    struct ProductEdits {
+        let name: String
+        let productCode: String
+        let type: String
+        let shelfLifeDays: Int?
+    }
+
+    static func update(id: String, edits: ProductEdits) async throws {
+        var fields: [String: Any] = [
+            "name": edits.name,
+            "productCode": edits.productCode,
+            "type": edits.type,
+        ]
+        fields["shelfLifeDays"] = edits.shelfLifeDays ?? FieldValue.delete()
+        try await FirestoreCollections.products.document(id).updateData(fields)
+    }
+
+    /// Deletes the product and everything attached to it: batches, photo, and
+    /// its barcode registry entry (freeing the barcode for reuse). Shipment
+    /// itemCounts are left as received-history on purpose.
+    static func delete(_ product: Product) async throws {
+        let batches = try await fetchBatches(productId: product.id)
+        let writes = FirestoreCollections.db.batch()
+        for batch in batches {
+            writes.deleteDocument(FirestoreCollections.batches(productId: product.id).document(batch.id))
+        }
+        writes.deleteDocument(FirestoreCollections.productPhotos.document(product.id))
+        if let barcode = product.barcode {
+            writes.deleteDocument(FirestoreCollections.barcodes.document(barcode))
+        }
+        writes.deleteDocument(FirestoreCollections.products.document(product.id))
+        try await writes.commit()
+        PhotoService.evictCache(productId: product.id)
+    }
+
     static func fetch(id: String) async throws -> Product? {
         let doc = try await FirestoreCollections.products.document(id).getDocument()
         guard doc.exists else { return nil }

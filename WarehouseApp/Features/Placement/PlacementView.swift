@@ -79,6 +79,7 @@ struct PlacementView: View {
                 recommendationsSection
                 preciseGuidanceSection
                 verificationSection
+                storedPlacementsSection
             }
             .navigationTitle("Place")
             .sheet(isPresented: $showProductScanner) {
@@ -241,6 +242,58 @@ struct PlacementView: View {
     }
 
     @ViewBuilder
+    /// Confirmed placements across all measured spaces, with the ability to
+    /// take a product back out (frees its occupied volume for new placements).
+    private var storedPlacementsSection: some View {
+        Section("Stored Products") {
+            let entries = operationalShelves.flatMap { shelf in
+                shelf.products.map { (shelf: shelf, placement: $0) }
+            }
+            if entries.isEmpty {
+                Text("Nothing placed yet. Confirmed placements appear here.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(entries, id: \.placement.id) { entry in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(placedProductName(entry.placement.productID))
+                            Text(entry.shelf.label)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Un-place", role: .destructive) {
+                            unplace(entry.placement, from: entry.shelf)
+                        }
+                        .disabled(isPersistingPlacement)
+                    }
+                }
+            }
+        }
+    }
+
+    private func placedProductName(_ productID: String) -> String {
+        store.products.first { $0.id == productID }?.name ?? "Unknown product"
+    }
+
+    private func unplace(_ placement: StoredProductPlacement, from shelf: ShelfState) {
+        isPersistingPlacement = true
+        Task { @MainActor in
+            do {
+                try await PlacementRepository.removePlacement(
+                    id: placement.id,
+                    shelfID: shelf.id,
+                    expectedShelfVersion: shelf.version
+                )
+                await loadOperationalShelves(selecting: shelf.id)
+                placementStatusMessage = "Removed \(placedProductName(placement.productID)) from \(shelf.label)."
+            } catch {
+                placementStatusMessage = error.localizedDescription
+            }
+            isPersistingPlacement = false
+        }
+    }
+
     private var verificationSection: some View {
         Section("6 · Verify placement") {
             if let destination = selectedPrecisePlacement == nil ? nil : activePlacementState?.label {

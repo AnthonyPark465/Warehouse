@@ -25,6 +25,15 @@ enum PhotoService {
         cache.setObject(jpeg as NSData, forKey: productId as NSString)
     }
 
+    static func delete(productId: String) async throws {
+        try await FirestoreCollections.productPhotos.document(productId).delete()
+        cache.removeObject(forKey: productId as NSString)
+    }
+
+    static func evictCache(productId: String) {
+        cache.removeObject(forKey: productId as NSString)
+    }
+
     static func load(productId: String) async throws -> Data? {
         if let cached = cache.object(forKey: productId as NSString) {
             return cached as Data

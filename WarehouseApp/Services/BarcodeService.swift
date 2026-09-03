@@ -82,6 +82,75 @@ enum BarcodeService {
         }
     }
 
+    /// Atomically swaps a product's barcode: reserves the new value and frees
+    /// the old registry entry in one transaction. Use `clear(for:)` to remove
+    /// a barcode without assigning a new one.
+    static func replace(for product: Product, with choice: ProductBarcodeChoice) async throws -> String {
+        if case .scanned(let value) = choice, !BarcodeValue.isValidExternal(value) {
+            throw BarcodeError.invalidValue
+        }
+        let productRef = FirestoreCollections.products.document(product.id)
+        let counterRef = FirestoreCollections.meta.document(counterDocId)
+        let oldBarcode = product.barcode
+
+        let result = try await FirestoreCollections.db.runTransaction { transaction, errorPointer -> Any? in
+            do {
+                // Transactions require every read to precede the first write,
+                // so the old entry's delete happens after the availability reads.
+                let newValue: String
+                var counterBump: Int?
+                switch choice {
+                case .none:
+                    throw BarcodeError.invalidValue
+                case .generate:
+                    let counterDoc = try transaction.getDocument(counterRef)
+                    let next = (counterDoc.data()?["next"] as? Int) ?? 1
+                    newValue = BarcodeValue.generated(counter: next)
+                    counterBump = next + 1
+                    if try transaction.getDocument(FirestoreCollections.barcodes.document(newValue)).exists {
+                        throw BarcodeError.alreadyInUse
+                    }
+                case .scanned(let value):
+                    newValue = value
+                    if value != oldBarcode,
+                       try transaction.getDocument(FirestoreCollections.barcodes.document(value)).exists {
+                        throw BarcodeError.alreadyInUse
+                    }
+                }
+
+                if let oldBarcode, oldBarcode != newValue {
+                    transaction.deleteDocument(FirestoreCollections.barcodes.document(oldBarcode))
+                }
+                if let counterBump {
+                    transaction.setData(["next": counterBump], forDocument: counterRef)
+                }
+                transaction.setData(
+                    ["productId": product.id],
+                    forDocument: FirestoreCollections.barcodes.document(newValue)
+                )
+                transaction.updateData(["barcode": newValue], forDocument: productRef)
+                return newValue
+            } catch {
+                errorPointer?.pointee = error as NSError
+                return nil
+            }
+        }
+        guard let newValue = result as? String else { throw BarcodeError.notFound }
+        return newValue
+    }
+
+    /// Removes a product's barcode and frees its registry entry for reuse.
+    static func clear(for product: Product) async throws {
+        guard let oldBarcode = product.barcode else { return }
+        let writes = FirestoreCollections.db.batch()
+        writes.deleteDocument(FirestoreCollections.barcodes.document(oldBarcode))
+        writes.updateData(
+            ["barcode": FieldValue.delete()],
+            forDocument: FirestoreCollections.products.document(product.id)
+        )
+        try await writes.commit()
+    }
+
     static func lookupProductId(barcode: String) async throws -> String? {
         let doc = try await FirestoreCollections.barcodes.document(barcode).getDocument()
         return doc.data()?["productId"] as? String

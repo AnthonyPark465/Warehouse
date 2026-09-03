@@ -3,6 +3,16 @@ import Foundation
 
 /// Stock movements: receiving batches into a day's shipment and FIFO removals.
 enum StockService {
+    enum StockError: LocalizedError {
+        case batchMissing
+
+        var errorDescription: String? {
+            switch self {
+            case .batchMissing: "That batch no longer exists."
+            }
+        }
+    }
+
     /// Records an arrival: creates a batch under the product, upserts today's
     /// shipment, and bumps the product's denormalized stock fields.
     static func receive(product: Product, quantity: Int, date: Date = .now) async throws {
@@ -38,6 +48,63 @@ enum StockService {
             forDocument: FirestoreCollections.products.document(product.id)
         )
         try await writes.commit()
+    }
+
+    /// Corrects a mis-received batch's original quantity. Consumed units stay
+    /// consumed (see BatchCorrection); the product total and the day-shipment
+    /// count move by the same delta, all in one transaction.
+    static func correctBatch(productId: String, batchId: String, newQuantity: Int) async throws {
+        let batchRef = FirestoreCollections.batches(productId: productId).document(batchId)
+        _ = try await FirestoreCollections.db.runTransaction { transaction, errorPointer in
+            do {
+                let document = try transaction.getDocument(batchRef)
+                guard document.exists else { throw StockError.batchMissing }
+                let batch = try document.data(as: Batch.self)
+                let outcome = try BatchCorrection.plan(
+                    quantity: batch.quantity,
+                    remaining: batch.remaining,
+                    newQuantity: newQuantity
+                )
+                transaction.updateData(
+                    ["quantity": newQuantity, "remaining": outcome.newRemaining],
+                    forDocument: batchRef
+                )
+                transaction.updateData(
+                    ["totalStock": FieldValue.increment(Int64(outcome.stockDelta))],
+                    forDocument: FirestoreCollections.products.document(productId)
+                )
+                transaction.setData(
+                    ["itemCount": FieldValue.increment(Int64(outcome.shipmentDelta))],
+                    forDocument: FirestoreCollections.shipments.document(batch.shipmentId),
+                    merge: true
+                )
+            } catch { errorPointer?.pointee = error as NSError }
+            return nil
+        }
+    }
+
+    /// Deletes a batch record entirely: its remaining units leave stock and
+    /// the day's received count drops by the batch's full quantity.
+    static func deleteBatch(productId: String, batchId: String) async throws {
+        let batchRef = FirestoreCollections.batches(productId: productId).document(batchId)
+        _ = try await FirestoreCollections.db.runTransaction { transaction, errorPointer in
+            do {
+                let document = try transaction.getDocument(batchRef)
+                guard document.exists else { return nil } // already gone
+                let batch = try document.data(as: Batch.self)
+                transaction.deleteDocument(batchRef)
+                transaction.updateData(
+                    ["totalStock": FieldValue.increment(Int64(-batch.remaining))],
+                    forDocument: FirestoreCollections.products.document(productId)
+                )
+                transaction.setData(
+                    ["itemCount": FieldValue.increment(Int64(-batch.quantity))],
+                    forDocument: FirestoreCollections.shipments.document(batch.shipmentId),
+                    merge: true
+                )
+            } catch { errorPointer?.pointee = error as NSError }
+            return nil
+        }
     }
 
     /// Removes stock FIFO across the product's batches.

@@ -4,10 +4,17 @@ struct ProductDetailView: View {
     let productId: String
 
     @Environment(InventoryStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
 
     @State private var batches: [Batch] = []
     @State private var showsRemoveSheet = false
     @State private var showsScanner = false
+    @State private var showsReplaceScanner = false
+    @State private var showsEditSheet = false
+    @State private var showsDeleteConfirm = false
+    @State private var batchToCorrect: Batch?
+    @State private var batchToDelete: Batch?
+    @State private var photoVersion = 0
     @State private var isWorking = false
     @State private var errorMessage: String?
 
@@ -42,6 +49,7 @@ struct ProductDetailView: View {
                 HStack {
                     Spacer()
                     PhotoThumbnailView(productId: product.id, size: 140)
+                        .id(photoVersion)
                     Spacer()
                 }
             }
@@ -59,19 +67,25 @@ struct ProductDetailView: View {
 
             barcodeSection(product)
 
-            Section("Stock — \(product.totalStock) units") {
-                if batches.filter({ $0.remaining > 0 }).isEmpty {
-                    Text("No stock on hand.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(batches.filter { $0.remaining > 0 }) { batch in
-                        BatchRowView(batch: batch)
+            stockSection(product)
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button {
+                        showsEditSheet = true
+                    } label: {
+                        Label("Edit Product", systemImage: "pencil")
                     }
+                    Button(role: .destructive) {
+                        showsDeleteConfirm = true
+                    } label: {
+                        Label("Delete Product", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
                 }
-                Button("Remove Stock…", role: .destructive) {
-                    showsRemoveSheet = true
-                }
-                .disabled(product.totalStock == 0)
+                .accessibilityLabel("Product Actions")
             }
         }
         .sheet(isPresented: $showsRemoveSheet) {
@@ -83,6 +97,45 @@ struct ProductDetailView: View {
             ScannerSheet(title: "Assign Barcode") { value in
                 assignBarcode(value, to: product)
             }
+        }
+        .sheet(isPresented: $showsReplaceScanner) {
+            ScannerSheet(title: "Replace Barcode") { value in
+                replaceBarcode(.scanned(value), for: product)
+            }
+        }
+        .sheet(isPresented: $showsEditSheet) {
+            EditProductSheet(product: product) { photoChanged in
+                if photoChanged { photoVersion += 1 }
+            }
+        }
+        .sheet(item: $batchToCorrect) { batch in
+            CorrectBatchSheet(product: product, batch: batch) {
+                await reloadBatches()
+            }
+        }
+        .confirmationDialog(
+            "Delete this batch?",
+            isPresented: .init(
+                get: { batchToDelete != nil },
+                set: { if !$0 { batchToDelete = nil } }
+            ),
+            presenting: batchToDelete
+        ) { batch in
+            Button("Delete Batch", role: .destructive) {
+                deleteBatch(batch)
+            }
+        } message: { batch in
+            Text("\(batch.remaining) units leave stock and the \(batch.shipmentId) report drops by \(batch.quantity). This can't be undone.")
+        }
+        .confirmationDialog(
+            "Delete \(product.name)?",
+            isPresented: $showsDeleteConfirm
+        ) {
+            Button("Delete Product and All Stock", role: .destructive) {
+                deleteProduct(product)
+            }
+        } message: {
+            Text("Deletes the product, its \(product.totalStock) units of stock, its photo, and frees its barcode for reuse. This can't be undone.")
         }
     }
 
@@ -146,6 +199,22 @@ struct ProductDetailView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 4)
+
+                if isWorking {
+                    ProgressView()
+                } else {
+                    Menu("Change Barcode…") {
+                        Button("Replace with Generated") {
+                            replaceBarcode(.generate, for: product)
+                        }
+                        Button("Replace with Scanned…") {
+                            showsReplaceScanner = true
+                        }
+                        Button("Remove Barcode", role: .destructive) {
+                            clearBarcode(for: product)
+                        }
+                    }
+                }
             } else if isWorking {
                 ProgressView()
             } else {
@@ -156,6 +225,35 @@ struct ProductDetailView: View {
                     showsScanner = true
                 }
             }
+        }
+    }
+
+    private func stockSection(_ product: Product) -> some View {
+        Section("Stock — \(product.totalStock) units") {
+            if batches.isEmpty {
+                Text("No stock received yet.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(batches) { batch in
+                    BatchRowView(batch: batch)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                batchToDelete = batch
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                            Button {
+                                batchToCorrect = batch
+                            } label: {
+                                Label("Correct", systemImage: "pencil")
+                            }
+                        }
+                }
+            }
+            Button("Remove Stock…", role: .destructive) {
+                showsRemoveSheet = true
+            }
+            .disabled(product.totalStock == 0)
         }
     }
 
@@ -183,6 +281,56 @@ struct ProductDetailView: View {
         }
     }
 
+    private func replaceBarcode(_ choice: ProductBarcodeChoice, for product: Product) {
+        isWorking = true
+        Task { @MainActor in
+            defer { isWorking = false }
+            do {
+                _ = try await BarcodeService.replace(for: product, with: choice)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func clearBarcode(for product: Product) {
+        isWorking = true
+        Task { @MainActor in
+            defer { isWorking = false }
+            do {
+                try await BarcodeService.clear(for: product)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func deleteBatch(_ batch: Batch) {
+        isWorking = true
+        Task { @MainActor in
+            defer { isWorking = false }
+            do {
+                try await StockService.deleteBatch(productId: productId, batchId: batch.id)
+                await reloadBatches()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func deleteProduct(_ product: Product) {
+        isWorking = true
+        Task { @MainActor in
+            defer { isWorking = false }
+            do {
+                try await ProductRepository.delete(product)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func reloadBatches() async {
         do {
             batches = try await ProductRepository.fetchBatches(productId: productId)
@@ -190,6 +338,7 @@ struct ProductDetailView: View {
             errorMessage = error.localizedDescription
         }
     }
+
 }
 
 struct BatchRowView: View {

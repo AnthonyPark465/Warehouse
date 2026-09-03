@@ -9,6 +9,8 @@ struct InventoryListView: View {
     @State private var grouping: InventoryGrouping = .none
     @State private var showsAddProduct = false
     @State private var showsSignOutConfirm = false
+    @State private var productToDelete: Product?
+    @State private var errorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -22,6 +24,28 @@ struct InventoryListView: View {
                 }
                 .confirmationDialog("Sign out?", isPresented: $showsSignOutConfirm) {
                     Button("Sign Out", role: .destructive) { try? auth.signOut() }
+                }
+                .confirmationDialog(
+                    "Delete product?",
+                    isPresented: .init(
+                        get: { productToDelete != nil },
+                        set: { if !$0 { productToDelete = nil } }
+                    ),
+                    presenting: productToDelete
+                ) { product in
+                    Button("Delete \(product.name) and All Stock", role: .destructive) {
+                        delete(product)
+                    }
+                } message: { product in
+                    Text("Deletes the product, its \(product.totalStock) units of stock, its photo, and frees its barcode for reuse. This can't be undone.")
+                }
+                .alert("Couldn't Delete", isPresented: .init(
+                    get: { errorMessage != nil },
+                    set: { if !$0 { errorMessage = nil } }
+                )) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(errorMessage ?? "")
                 }
         }
     }
@@ -89,6 +113,23 @@ struct InventoryListView: View {
         ForEach(products) { product in
             NavigationLink(value: product.id) {
                 ProductRow(product: product)
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button(role: .destructive) {
+                    productToDelete = product
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    private func delete(_ product: Product) {
+        Task { @MainActor in
+            do {
+                try await ProductRepository.delete(product)
+            } catch {
+                errorMessage = error.localizedDescription
             }
         }
     }
