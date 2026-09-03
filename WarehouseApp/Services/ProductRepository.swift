@@ -8,6 +8,8 @@ struct ProductDraft {
     let type: String
     let shelfLifeDays: Int?
     let photoJpeg: Data?
+    let objectScan: ProductObjectScan?
+    let placementMetadata: ProductPlacementMetadata?
 }
 
 enum ProductRepository {
@@ -25,9 +27,27 @@ enum ProductRepository {
             shelfLifeDays: draft.shelfLifeDays,
             totalStock: 0,
             createdAt: .now,
-            lastReceivedAt: nil
+            lastReceivedAt: nil,
+            objectScan: draft.objectScan,
+            placementMetadata: draft.placementMetadata
         )
-        try FirestoreCollections.products.document(id).setData(from: product)
+        // The Codable setData(from:) has no async overload; without awaiting
+        // the completion, a rejected write would be silently swallowed and
+        // create() would report success for a product that never persisted.
+        let document = FirestoreCollections.products.document(id)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            do {
+                try document.setData(from: product) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
         if let jpeg = draft.photoJpeg {
             try await PhotoService.save(jpeg, productId: id)
         }

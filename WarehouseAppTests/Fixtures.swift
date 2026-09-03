@@ -25,7 +25,8 @@ enum Fixtures {
         Product(
             id: id, name: name, productCode: "SKU-\(id)", type: type,
             barcode: nil, shelfLifeDays: nil, totalStock: totalStock,
-            createdAt: createdAt, lastReceivedAt: lastReceivedAt
+            createdAt: createdAt, lastReceivedAt: lastReceivedAt,
+            objectScan: nil, placementMetadata: nil
         )
     }
 

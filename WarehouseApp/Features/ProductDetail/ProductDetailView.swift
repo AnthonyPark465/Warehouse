@@ -55,6 +55,8 @@ struct ProductDetailView: View {
                 LabeledContent("Registered", value: product.createdAt.formatted(date: .abbreviated, time: .omitted))
             }
 
+            dimensionsSection(product)
+
             barcodeSection(product)
 
             Section("Stock — \(product.totalStock) units") {
@@ -80,6 +82,49 @@ struct ProductDetailView: View {
         .sheet(isPresented: $showsScanner) {
             ScannerSheet(title: "Assign Barcode") { value in
                 assignBarcode(value, to: product)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dimensionsSection(_ product: Product) -> some View {
+        Section("Dimensions") {
+            if let scan = product.objectScan {
+                LabeledContent(
+                    "Length",
+                    value: DimensionUnitConverter.formatted(
+                        scan.finalLength,
+                        unit: scan.displayUnit
+                    )
+                )
+                LabeledContent(
+                    "Width",
+                    value: DimensionUnitConverter.formatted(
+                        scan.finalWidth,
+                        unit: scan.displayUnit
+                    )
+                )
+                LabeledContent(
+                    "Height",
+                    value: DimensionUnitConverter.formatted(
+                        scan.finalHeight,
+                        unit: scan.displayUnit
+                    )
+                )
+                LabeledContent(
+                    "Can be rotated",
+                    value: scan.canBeRotated ? "Yes" : "No"
+                )
+                Text(
+                    scan.usesAdjustedDimensions == false
+                        ? "Saved dimensions use the raw product measurement."
+                        : "Saved dimensions include the configured scan tolerance."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                Text("No product dimensions have been recorded.")
+                    .foregroundStyle(.secondary)
             }
         }
     }
