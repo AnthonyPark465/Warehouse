@@ -1,7 +1,5 @@
 name: Warehouse
 options:
-  # Keep the project readable by Xcode 15.4 (objectVersion <= 56) until Xcode is updated
-  xcodeVersion: "15.4"
   bundleIdPrefix: com.tetris
   deploymentTarget:
     iOS: "17.0"
@@ -10,7 +8,8 @@ options:
 packages:
   Firebase:
     url: https://github.com/firebase/firebase-ios-sdk
-    # Pinned: 11.7+ needs the Swift 6 compiler (Xcode 16). Bump after updating Xcode.
+    # Pinned for reproducible builds; newer 11.x/12.x need Xcode 16+ (now the
+    # project minimum), so bump deliberately and re-run the test suite.
     exactVersion: 11.6.0
 
 targets:

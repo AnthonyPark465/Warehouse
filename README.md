@@ -74,10 +74,13 @@ is ever needed). Bundle ID: `com.tetris.warehouse`.
 WarehouseApp/
   App/        entry point, Firebase bootstrap, auth gate, tab shell
   Models/     Product, Batch, Shipment (immutable Codable structs)
-  Services/   Firestore access, auth, photos, barcode registry, stock moves
-  Features/   Auth, Inventory, ProductDetail, AddProduct, Scan, Receive, Reports
-  Support/    pure logic: expiry math, FIFO planning, sorting/grouping, barcode values
-WarehouseAppTests/  unit tests for all the pure logic
+  Services/   Firestore access, auth, photos, barcode registry, stock moves,
+              shelf/space/placement persistence, LiDAR fusion + reconstruction
+  Features/   Auth, Inventory, ProductDetail, AddProduct, Scan, Receive,
+              Reports, Placement (AR storage measurement + placement engine)
+  Support/    pure logic: expiry math, FIFO planning, batch corrections,
+              sorting/grouping, barcode values, AR measurement geometry
+WarehouseAppTests/  unit tests for the pure logic and geometry engines
 ```
 
 The camera scanner only works on a real device; on the simulator the app

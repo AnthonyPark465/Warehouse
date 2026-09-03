@@ -1,6 +1,12 @@
 # Shelf boundary measurement
 
-## Active constrained-compartment flow
+> **Status (2026-09-03):** the scanning *UI* this document belongs to was
+> removed from the app; the shipping measurement flow is the storage marker
+> scanner (`StorageMarkerScannerView`). The boundary-geometry code described
+> here (`ShelfBoundaryGeometry` and friends in `WarehouseApp/Support/`) remains
+> in the codebase with unit tests as reference material.
+
+## Constrained-compartment flow (reference)
 
 The retired automatic path captured a fixed centre-pixel patch, mixed multiple
 visible surfaces, and selected line/plane intersections near the reticle. At close

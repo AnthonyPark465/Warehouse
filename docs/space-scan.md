@@ -1,7 +1,15 @@
 # Space Scan
 
-Space Scan is selected independently from **Scan shelf with AR** in the Place
-workflow. The active LiDAR path for a box, cabinet, shelf bay, or other constrained
+> **Status (2026-09-03):** the surface-first scanning *UI* described below was
+> removed from the app — the shipping flow is the staged **storage marker
+> scanner** (`StorageMarkerScannerView`: select surface → four wall markers →
+> review → height → preview → confirm). The geometry engines this document
+> explains (`SurfaceFirstCompartmentMeasurement`, `AccuracyFirstSpaceMeasurement`
+> and friends in `WarehouseApp/Support/`) remain in the codebase with full unit
+> tests and are kept as reference for future flows. This document describes
+> their algorithm, not a reachable screen.
+
+The active LiDAR path for a box, cabinet, shelf bay, or other constrained
 compartment is surface-first. A screen point never becomes a final corner. Legacy
 corner and border records remain decodable, but do not satisfy schema-v7 accuracy.
 
