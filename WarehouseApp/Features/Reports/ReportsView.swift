@@ -61,10 +61,19 @@ struct ReportsView: View {
         store.products.first { $0.id == productId }?.name ?? "Unknown product"
     }
 
-    private func formattedDay(_ dateKey: String) -> String {
+    /// Parsing fixed-format keys needs a POSIX locale and gregorian calendar,
+    /// or devices set to non-Gregorian calendars misparse the date.
+    private static let dayKeyFormatter: DateFormatter = {
         let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
         formatter.dateFormat = "yyyy-MM-dd"
-        guard let date = formatter.date(from: dateKey) else { return dateKey }
+        return formatter
+    }()
+
+    private func formattedDay(_ dateKey: String) -> String {
+        guard let date = Self.dayKeyFormatter.date(from: dateKey) else { return dateKey }
         if Calendar.current.isDateInToday(date) { return "Today" }
         if Calendar.current.isDateInYesterday(date) { return "Yesterday" }
         return date.formatted(date: .abbreviated, time: .omitted)

@@ -203,7 +203,7 @@ struct PlacementView: View {
                 LabeledContent("Height", value: "\(format(space.heightCM)) cm")
                 LabeledContent("Geometry confidence", value: space.confidence.overall.formatted(.percent.precision(.fractionLength(0))))
                 Button("Save approved space") {
-                    Task {
+                    Task { @MainActor in
                         do {
                             try await SpaceRepository.save(space, expectedVersion: nil)
                             let shelf = try await PlacementRepository.initializeOperationalShelf(from: space)
@@ -1462,7 +1462,7 @@ struct PlacementView: View {
         isCalculating = true
         placementStatusMessage = nil
         selectedPrecisePlacement = nil
-        Task {
+        Task { @MainActor in
             do {
                 guard let shelf = try await PlacementRepository.fetchShelf(id: selectedShelfID) else {
                     throw PlacementPersistenceError.shelfMissing
@@ -1533,7 +1533,7 @@ struct PlacementView: View {
               let result = selectedPrecisePlacement,
               let packageProfile = reservedPackageProfile else { return }
         isPersistingPlacement = true
-        Task {
+        Task { @MainActor in
             do {
                 try await PlacementRepository.confirm(
                     reservation: reservation, result: result, package: packageProfile
@@ -1559,7 +1559,7 @@ struct PlacementView: View {
     private func cancelReservation() {
         guard let reservation = placementReservation else { return }
         isPersistingPlacement = true
-        Task {
+        Task { @MainActor in
             do {
                 try await PlacementRepository.cancel(reservation)
                 placementReservation = nil

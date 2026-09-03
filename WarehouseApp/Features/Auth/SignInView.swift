@@ -64,7 +64,7 @@ struct SignInView: View {
 
     private func submit() {
         isWorking = true
-        Task {
+        Task { @MainActor in
             defer { isWorking = false }
             do {
                 switch mode {

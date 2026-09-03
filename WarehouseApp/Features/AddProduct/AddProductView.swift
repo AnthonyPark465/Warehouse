@@ -198,7 +198,7 @@ struct AddProductView: View {
             }
         }
         .onChange(of: pickedItem) {
-            Task {
+            Task { @MainActor in
                 if let data = try? await pickedItem?.loadTransferable(type: Data.self) {
                     photo = UIImage(data: data)
                 }
@@ -294,6 +294,11 @@ struct AddProductView: View {
                     }
                     .accessibilityLabel("Scan Barcode")
                 }
+                if !trimmedBarcode.isEmpty && !BarcodeValue.isValidExternal(trimmedBarcode) {
+                    Text("Letters, digits, and . _ ~ : @ + - only (no slashes), up to 100 characters.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             } else if barcodeMode == .generate {
                 Text("A unique Code 128 barcode will be created for this product.")
                     .font(.caption)
@@ -304,7 +309,7 @@ struct AddProductView: View {
 
     private var isValid: Bool {
         let shelfLifeOk = shelfLifeText.isEmpty || (Int(shelfLifeText).map { $0 > 0 } ?? false)
-        let barcodeOk = barcodeMode != .scanned || !trimmedBarcode.isEmpty
+        let barcodeOk = barcodeMode != .scanned || BarcodeValue.isValidExternal(trimmedBarcode)
         let weightOk = placementWeight.isEmpty || (Double(placementWeight).map { $0.isFinite && $0 > 0 } ?? false)
         let supportCapacityOk = !canSupportAbove || (Double(maximumSupportedWeight).map { $0.isFinite && $0 > 0 } ?? false)
         let supportRatioOk = !canSupportAbove || (Double(requiredSupportPercentage).map { (95...100).contains($0) } ?? false)
@@ -329,7 +334,7 @@ struct AddProductView: View {
 
     private func save() {
         isSaving = true
-        Task {
+        Task { @MainActor in
             do {
                 let draft = ProductDraft(
                     name: name.trimmingCharacters(in: .whitespaces),
@@ -378,16 +383,12 @@ struct AddProductView: View {
                         quantityArrangement: quantityArrangement
                     )
                 )
-                let productId = try await ProductRepository.create(draft)
-
-                switch barcodeMode {
-                case .none:
-                    break
-                case .generate:
-                    _ = try await BarcodeService.generateAndAssign(to: productId)
-                case .scanned:
-                    try await BarcodeService.assign(trimmedBarcode, to: productId)
+                let barcodeChoice: ProductBarcodeChoice = switch barcodeMode {
+                case .none: .none
+                case .generate: .generate
+                case .scanned: .scanned(trimmedBarcode)
                 }
+                _ = try await ProductRepository.create(draft, barcode: barcodeChoice)
                 dismiss()
             } catch {
                 isSaving = false

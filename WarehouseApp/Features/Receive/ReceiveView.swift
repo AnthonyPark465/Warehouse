@@ -133,7 +133,7 @@ struct ReceiveQuantitySheet: View {
     private func receive() {
         guard let quantity = Int(quantityText), quantity > 0 else { return }
         isWorking = true
-        Task {
+        Task { @MainActor in
             defer { isWorking = false }
             do {
                 try await StockService.receive(product: product, quantity: quantity)

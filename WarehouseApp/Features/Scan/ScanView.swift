@@ -64,6 +64,9 @@ struct ScanView: View {
     private func handleScan(_ value: String) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // The live scanner keeps running behind the registration sheet;
+        // swapping the sheet's item while presented breaks the presentation.
+        guard unknownBarcode == nil else { return }
         if let product = store.products.first(where: { $0.barcode == trimmed }) {
             foundProduct = product
         } else {

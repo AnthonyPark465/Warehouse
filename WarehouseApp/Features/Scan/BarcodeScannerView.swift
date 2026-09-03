@@ -60,14 +60,14 @@ struct ScannerSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var manualValue = ""
+    @State private var pendingValue: String?
 
     var body: some View {
         NavigationStack {
             Group {
                 if BarcodeScannerView.isSupported {
                     BarcodeScannerView { value in
-                        onScan(value)
-                        dismiss()
+                        accept(value)
                     }
                     .ignoresSafeArea(edges: .bottom)
                 } else {
@@ -77,8 +77,7 @@ struct ScannerSheet: View {
                                 .textInputAutocapitalization(.characters)
                                 .autocorrectionDisabled()
                             Button("Use This Barcode") {
-                                onScan(manualValue)
-                                dismiss()
+                                accept(manualValue)
                             }
                             .disabled(manualValue.isEmpty)
                         }
@@ -93,5 +92,19 @@ struct ScannerSheet: View {
                 }
             }
         }
+        // Deliver the value only after this sheet is fully gone. Calling onScan
+        // while still presented makes the caller's follow-up sheet lose the
+        // dismiss/present race and silently never appear.
+        .onDisappear {
+            if let pendingValue {
+                onScan(pendingValue)
+            }
+        }
+    }
+
+    private func accept(_ value: String) {
+        guard pendingValue == nil else { return }
+        pendingValue = value
+        dismiss()
     }
 }

@@ -37,11 +37,16 @@ final class InventoryStore {
                 return
             }
             self.loadError = nil
-            self.products = Self.decode(snapshot?.documents, as: Product.self)
+            self.products = FirestoreDecoding.decode(snapshot?.documents, as: Product.self)
         }
         batchListener = FirestoreCollections.db.collectionGroup("batches")
-            .addSnapshotListener { [weak self] snapshot, _ in
-                self?.batches = Self.decode(snapshot?.documents, as: Batch.self)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self else { return }
+                if let error {
+                    Self.logger.error("Batch listener failed: \(error.localizedDescription, privacy: .public)")
+                    return
+                }
+                self.batches = FirestoreDecoding.decode(snapshot?.documents, as: Batch.self)
             }
     }
 
@@ -52,21 +57,11 @@ final class InventoryStore {
         batchListener = nil
     }
 
-    /// Decodes snapshot documents, logging any that fail instead of letting
-    /// malformed records vanish indistinguishably from "no data".
-    private static func decode<T: Decodable>(
-        _ documents: [QueryDocumentSnapshot]?,
-        as type: T.Type
-    ) -> [T] {
-        (documents ?? []).compactMap { document in
-            do {
-                return try document.data(as: type)
-            } catch {
-                logger.error(
-                    "Dropping undecodable \(String(describing: type), privacy: .public) \(document.documentID, privacy: .public): \(error.localizedDescription, privacy: .public)"
-                )
-                return nil
-            }
-        }
+    /// Tears down and re-attaches the listeners after a load failure.
+    func restart() {
+        stop()
+        isLoading = true
+        loadError = nil
+        start()
     }
 }

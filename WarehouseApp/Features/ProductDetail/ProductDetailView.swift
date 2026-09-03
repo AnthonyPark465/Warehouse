@@ -161,7 +161,7 @@ struct ProductDetailView: View {
 
     private func generateBarcode(for product: Product) {
         isWorking = true
-        Task {
+        Task { @MainActor in
             defer { isWorking = false }
             do {
                 _ = try await BarcodeService.generateAndAssign(to: product.id)
@@ -173,7 +173,7 @@ struct ProductDetailView: View {
 
     private func assignBarcode(_ value: String, to product: Product) {
         isWorking = true
-        Task {
+        Task { @MainActor in
             defer { isWorking = false }
             do {
                 try await BarcodeService.assign(value, to: product.id)
@@ -292,7 +292,7 @@ struct RemoveStockSheet: View {
     private func remove() {
         guard let quantity = Int(quantityText), quantity > 0 else { return }
         isWorking = true
-        Task {
+        Task { @MainActor in
             defer { isWorking = false }
             do {
                 try await StockService.remove(product: product, quantity: quantity)

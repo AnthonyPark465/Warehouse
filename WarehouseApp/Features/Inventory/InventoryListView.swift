@@ -31,7 +31,14 @@ struct InventoryListView: View {
         if store.isLoading {
             ProgressView("Loading inventory…")
         } else if let loadError = store.loadError {
-            ContentUnavailableView("Couldn't Load Inventory", systemImage: "wifi.slash", description: Text(loadError))
+            ContentUnavailableView {
+                Label("Couldn't Load Inventory", systemImage: "wifi.slash")
+            } description: {
+                Text(loadError)
+            } actions: {
+                Button("Retry") { store.restart() }
+                    .buttonStyle(.borderedProminent)
+            }
         } else if store.products.isEmpty {
             ContentUnavailableView {
                 Label("No Products Yet", systemImage: "shippingbox")
