@@ -125,7 +125,9 @@ struct LiDARPolygonalPrism: Equatable {
         )
     }
 
-    private static func pointInPolygon(
+    /// Internal (not private) so ManualMeasurementGeometry can reuse the same
+    /// containment test instead of maintaining a second implementation.
+    static func pointInPolygon(
         _ point: SIMD2<Float>,
         polygon: [SIMD2<Float>],
         margin: Float

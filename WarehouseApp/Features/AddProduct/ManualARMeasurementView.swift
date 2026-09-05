@@ -7,6 +7,10 @@ struct ManualARMeasurementView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var state = ManualARMeasurementState()
     @State private var showsManualEntry = false
+    /// Capture handed back by the manual-entry sheet. Applied in the sheet's
+    /// onDismiss so this fullScreenCover only dismisses after the sheet has
+    /// finished dismissing itself — never both at once (D15).
+    @State private var pendingManualCapture: ObjectScanCapture?
 
     var body: some View {
         NavigationStack {
@@ -33,18 +37,11 @@ struct ManualARMeasurementView: View {
             } message: {
                 Text(state.errorMessage ?? "")
             }
-            .sheet(isPresented: $showsManualEntry) {
+            .sheet(isPresented: $showsManualEntry, onDismiss: completePendingManualCapture) {
                 ManualDimensionEntryView(
                     canBeRotated: $state.canBeRotated,
                     onSave: { capture in
-                        onConfirm(
-                            capture,
-                            state.percentageTolerance,
-                            state.fixedToleranceCM,
-                            state.canBeRotated,
-                            state.useAdjustedDimensions
-                        )
-                        dismiss()
+                        pendingManualCapture = capture
                     }
                 )
             }
@@ -101,6 +98,18 @@ struct ManualARMeasurementView: View {
                     Text("LiDAR unavailable—standard ARKit estimates may be less accurate.")
                         .font(.caption2)
                         .foregroundStyle(.orange)
+                }
+                // Inline rejection/guidance lines replace the old modal
+                // alerts for placement problems (D16/D6).
+                if let reason = state.statusReason {
+                    Label(reason, systemImage: "exclamationmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                if let guidance = state.placementGuidance {
+                    Label(guidance, systemImage: "dot.viewfinder")
+                        .font(.caption)
+                        .foregroundStyle(.yellow)
                 }
             }
             .padding(12)
@@ -231,6 +240,12 @@ struct ManualARMeasurementView: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.green)
             }
+            // The boundary + height always yield a usable measurement. On
+            // non-LiDAR devices fusion cannot reach its voxel target, so the
+            // fallback is the primary path there (D9).
+            if !ObjectScannerCapabilities.hasLiDAR {
+                boundaryFallbackButton(isPrimary: true)
+            }
             if state.productScanIsActive {
                 Button("Finish Product Scan") { state.finishProductScan() }
                     .buttonStyle(.borderedProminent)
@@ -241,7 +256,51 @@ struct ManualARMeasurementView: View {
                     .buttonStyle(.borderedProminent)
                     .frame(maxWidth: .infinity)
             }
+            if ObjectScannerCapabilities.hasLiDAR {
+                boundaryFallbackButton(isPrimary: false)
+            }
         }
+    }
+
+    @ViewBuilder
+    private func boundaryFallbackButton(isPrimary: Bool) -> some View {
+        if state.boundaryFallbackDimensionsCM != nil {
+            if isPrimary {
+                Button("Use Boundary Dimensions") { applyBoundaryFallback() }
+                    .buttonStyle(.borderedProminent)
+                    .frame(maxWidth: .infinity)
+            } else {
+                Button("Use Boundary Dimensions") { applyBoundaryFallback() }
+                    .buttonStyle(.bordered)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private func applyBoundaryFallback() {
+        guard let capture = state.makeBoundaryFallbackCapture() else { return }
+        onConfirm(
+            capture,
+            state.percentageTolerance,
+            state.fixedToleranceCM,
+            state.canBeRotated,
+            state.useAdjustedDimensions
+        )
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        dismiss()
+    }
+
+    private func completePendingManualCapture() {
+        guard let capture = pendingManualCapture else { return }
+        pendingManualCapture = nil
+        onConfirm(
+            capture,
+            state.percentageTolerance,
+            state.fixedToleranceCM,
+            state.canBeRotated,
+            state.useAdjustedDimensions
+        )
+        dismiss()
     }
 
     private func placeButtonLabel(_ title: String) -> some View {
@@ -326,7 +385,9 @@ struct ManualARMeasurementView: View {
                 HStack {
                     Button("Restart", role: .destructive) { state.reset() }
                     Button("Enter Manually") { showsManualEntry = true }
-                    Button("Continue Scanning") { state.continueProductScan() }
+                    // "Restart", not "Continue": the fusion engine resets on
+                    // every start, so resumption cannot be promised (D8).
+                    Button("Restart Scan") { state.restartProductScan() }
                     Spacer()
                     Button("Apply to Product") { apply() }
                         .buttonStyle(.borderedProminent)

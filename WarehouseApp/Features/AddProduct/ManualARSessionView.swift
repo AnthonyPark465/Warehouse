@@ -1,6 +1,5 @@
 import ARKit
 import AVFoundation
-import os
 import SceneKit
 import SwiftUI
 
@@ -40,22 +39,32 @@ struct ManualARSessionView: UIViewRepresentable {
         private let previewNode = SCNNode()
         private let measurementGeometryNode = SCNNode()
         private var markerAnchors: [ARAnchor] = []
-        private var renderedMarkerPositions: [SIMD3<Float>] = []
-        private var lastPreviewUpdate: TimeInterval = 0
         private var handledPlacementRequestID = 0
         private var renderedRevision = -1
         private var handledProductScanStartRequestID = 0
         private var handledProductScanStopRequestID = 0
         private let fusionConfiguration = LiDARFusionConfiguration.smallObject
+        // Fusion state below is confined to `fusionQueue`: ARSession delivers
+        // its delegate callbacks there (see `attach`), and every reset runs
+        // there, so no lock is required (D1).
+        private var lastPreviewUpdate: TimeInterval = 0
         private var fusion = LiDARVoxelFusionEngine()
         private var stabilizer = LiDARMeasurementStabilizer()
         private var stableProductMeasurement: LiDARFusionMeasurement?
         private var latestProductStatus = ManualProductScanStatus()
         private var fusionFrameCount = 0
         private var rejectedOutsideRegionCount = 0
-        // Read on the ARKit delegate thread and the fusion queue, written on
-        // the main actor — must be lock-protected, not a plain Bool.
-        private let productScanIsActive = OSAllocatedUnfairLock(initialState: false)
+        private var productScanIsActive = false
+        /// Fusion-queue copy of the scan generation. Frame points captured
+        /// under an older generation are dropped before integration so a
+        /// pre-reset frame cannot pollute a fresh scan (D1).
+        private var fusionScanGeneration = 0
+        /// Main-actor source of truth for the scan generation; also gates
+        /// status publishes so a stale scan cannot overwrite a fresh one.
+        @MainActor private var latestScanGeneration = 0
+        /// Main-actor mirror of the newest frame timestamp, used to judge
+        /// corner-lock freshness at placement time (D3f).
+        @MainActor private var latestFrameTimestamp: TimeInterval = 0
         // Corner recognition: rolling reticle patch + current lock (main actor).
         private var cornerLockWindow = ObjectCornerLockWindow()
         private var lockedCorner: ObjectCornerLockWindow.Lock?
@@ -77,6 +86,11 @@ struct ManualARSessionView: UIViewRepresentable {
             view.scene = SCNScene()
             view.delegate = self
             view.session.delegate = self
+            // Deliver ARSession callbacks on the fusion queue (mirrors
+            // ARObjectScannerView): frame extraction and voxel integration
+            // never touch the main thread, and the coordinator's fusion
+            // state stays confined to one serial queue (D1).
+            view.session.delegateQueue = fusionQueue
             view.automaticallyUpdatesLighting = false
             view.preferredFramesPerSecond = 60
             view.scene.rootNode.addChildNode(measurementGeometryNode)
@@ -113,7 +127,7 @@ struct ManualARSessionView: UIViewRepresentable {
             guard let sceneView else { return }
             markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
             markerAnchors.removeAll()
-            renderedMarkerPositions.removeAll()
+            fusionQueue.async { [weak self] in self?.productScanIsActive = false }
             sceneView.session.delegate = nil
             sceneView.delegate = nil
             sceneView.session.pause()
@@ -142,7 +156,9 @@ struct ManualARSessionView: UIViewRepresentable {
             }
             if productScanStopRequestID != handledProductScanStopRequestID {
                 handledProductScanStopRequestID = productScanStopRequestID
-                productScanIsActive.withLock { $0 = false }
+                fusionQueue.async { [weak self] in
+                    self?.productScanIsActive = false
+                }
             }
             if productScanStartRequestID != handledProductScanStartRequestID {
                 handledProductScanStartRequestID = productScanStartRequestID
@@ -153,7 +169,9 @@ struct ManualARSessionView: UIViewRepresentable {
         }
 
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            // Throttle before crossing to the main actor. Do not capture the
+            // Delivered on the fusion queue (session.delegateQueue): frame
+            // extraction and integration stay off the main thread. Throttle
+            // before crossing to the main actor, and never capture the
             // ARFrame in the Task because it owns large camera buffers.
             let now = frame.timestamp
             guard now - lastPreviewUpdate >= 0.1 else { return }
@@ -161,23 +179,42 @@ struct ManualARSessionView: UIViewRepresentable {
             let trackingState = frame.camera.trackingState
             let shouldIntegrate: Bool
             if case .normal = trackingState {
-                shouldIntegrate = productScanIsActive.withLock { $0 }
+                shouldIntegrate = productScanIsActive
             } else {
                 shouldIntegrate = false
             }
+            // Capture the generation alongside the frame's points so a reset
+            // enqueued between extraction and integration invalidates them.
+            let generation = fusionScanGeneration
             let scanPoints = shouldIntegrate ? extractMeasurementPoints(from: frame) : []
             let cornerPatch = extractCornerPatch(from: frame)
+            let trackingSnapshot = Self.trackingSnapshot(of: trackingState)
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                latestFrameTimestamp = now
                 state.updateTracking(trackingState)
-                let sample = raycastAtCentre()
-                state.updatePreview(sample)
-                updateCornerLock(sample: sample, patch: cornerPatch, timestamp: now)
-                updatePreview(sample)
+                let centre = raycastAtCentre()
+                state.updatePreview(centre.sample)
+                state.updatePlacementGuidance(centre.guidance)
+                updateCornerLock(
+                    sample: centre.sample,
+                    patch: cornerPatch,
+                    timestamp: now,
+                    tracking: trackingSnapshot
+                )
+                updatePreview(centre.sample)
             }
             guard !scanPoints.isEmpty else { return }
-            fusionQueue.async { [weak self] in
-                self?.integrateProductPoints(scanPoints)
+            integrateProductPoints(scanPoints, generation: generation)
+        }
+
+        private static func trackingSnapshot(
+            of state: ARCamera.TrackingState
+        ) -> TrackingQualitySnapshot {
+            switch state {
+            case .normal: .normal
+            case .limited: .limited
+            case .notAvailable: .unavailable
             }
         }
 
@@ -240,8 +277,14 @@ struct ManualARSessionView: UIViewRepresentable {
                 state.errorMessage = "The scanning region is incomplete. Set the polygon, bottom limit, and top limit again."
                 return
             }
-            productScanIsActive.withLock { $0 = false }
-            fusionQueue.sync {
+            // Async, never sync from the main actor (the fusion queue may be
+            // mid-frame). The new generation invalidates any frame points
+            // extracted before this reset runs (D1).
+            latestScanGeneration += 1
+            let generation = latestScanGeneration
+            fusionQueue.async { [weak self] in
+                guard let self else { return }
+                fusionScanGeneration = generation
                 fusion.reset()
                 fusion.lockSelection(region: .polygonalPrism(region), seed: seed)
                 stabilizer.reset()
@@ -249,12 +292,12 @@ struct ManualARSessionView: UIViewRepresentable {
                 latestProductStatus = ManualProductScanStatus()
                 fusionFrameCount = 0
                 rejectedOutsideRegionCount = 0
+                productScanIsActive = true
             }
-            productScanIsActive.withLock { $0 = true }
         }
 
-        private func integrateProductPoints(_ points: [SIMD3<Float>]) {
-            guard productScanIsActive.withLock({ $0 }) else { return }
+        private func integrateProductPoints(_ points: [SIMD3<Float>], generation: Int) {
+            guard productScanIsActive, generation == fusionScanGeneration else { return }
             let result = fusion.integrate(framePoints: points)
             fusionFrameCount += 1
             rejectedOutsideRegionCount += result.rejectedOutsideVolumeCount
@@ -353,8 +396,12 @@ struct ManualARSessionView: UIViewRepresentable {
 
         private func publishProductStatus(_ status: ManualProductScanStatus) {
             latestProductStatus = status
+            // Gate on the generation, not the active flag: a stop request in
+            // flight must not swallow the terminal status the user finishes
+            // with (D13); only a newer scan invalidates a publish.
+            let generation = fusionScanGeneration
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.productScanIsActive.withLock({ $0 }) else { return }
+                guard let self, generation == self.latestScanGeneration else { return }
                 self.state.updateProductScan(status)
             }
         }
@@ -393,9 +440,11 @@ struct ManualARSessionView: UIViewRepresentable {
             let centreX = width / 2
             let centreY = height / 2
             var points: [SIMD3<Float>] = []
-            points.reserveCapacity(240)
-            for y in stride(from: centreY - 14, through: centreY + 14, by: 2) {
-                for x in stride(from: centreX - 14, through: centreX + 14, by: 2) {
+            points.reserveCapacity(640)
+            // ±24 px (was ±14): small products need the wider patch for both
+            // corner legs to gather enough coverage to fit lines (D3a).
+            for y in stride(from: centreY - 24, through: centreY + 24, by: 2) {
+                for x in stride(from: centreX - 24, through: centreX + 24, by: 2) {
                     guard x >= 0, x < width, y >= 0, y < height else { continue }
                     let depth = depths[y * rowStride + x]
                     guard depth.isFinite, depth >= 0.10, depth <= 3 else { continue }
@@ -422,7 +471,8 @@ struct ManualARSessionView: UIViewRepresentable {
         private func updateCornerLock(
             sample: CentreRaycastSample?,
             patch: CornerPatch?,
-            timestamp: TimeInterval
+            timestamp: TimeInterval,
+            tracking: TrackingQualitySnapshot
         ) {
             guard state.stage == .boundary, let sample, let patch else {
                 if lockedCorner != nil || state.stage != .boundary {
@@ -436,7 +486,8 @@ struct ManualARSessionView: UIViewRepresentable {
                 patchWorldPoints: patch.points,
                 cameraWorld: patch.cameraWorld,
                 timestamp: timestamp,
-                depthConfidence: patch.depthConfidence
+                depthConfidence: patch.depthConfidence,
+                trackingState: tracking
             )
             guard timestamp - lastCornerRecognitionAt >= 0.3 else { return }
             lastCornerRecognitionAt = timestamp
@@ -457,12 +508,20 @@ struct ManualARSessionView: UIViewRepresentable {
         /// locked, otherwise the raw centre raycast.
         @MainActor
         private func placementSample() -> CentreRaycastSample? {
-            let raw = raycastAtCentre()
+            let raw = raycastAtCentre().sample
             guard state.stage == .boundary, let lockedCorner, let raw else {
                 return raw
             }
             cornerLockWindow.reset()
             self.lockedCorner = nil
+            // Advisory only: a stale or drifted lock falls back to the raw
+            // raycast rather than snapping the marker to where the user was
+            // aiming almost half a second ago (D3f). It never blocks placing.
+            guard ObjectCornerLockWindow.lockIsUsableForPlacement(
+                lockedCorner,
+                reticleWorld: raw.position,
+                at: latestFrameTimestamp
+            ) else { return raw }
             return CentreRaycastSample(
                 position: lockedCorner.worldPosition,
                 raycastType: "recognisedCorner",
@@ -560,12 +619,15 @@ struct ManualARSessionView: UIViewRepresentable {
             return SIMD3(world.x, world.y, world.z)
         }
 
+        /// Centre sample plus a human-readable reason when the sample is
+        /// unusable, so the UI can say WHY Place is disabled instead of
+        /// silently greying it out (D6).
         @MainActor
-        private func raycastAtCentre() -> CentreRaycastSample? {
+        private func raycastAtCentre() -> (sample: CentreRaycastSample?, guidance: String?) {
             guard let sceneView,
                   sceneView.bounds.width > 0,
                   sceneView.bounds.height > 0
-            else { return nil }
+            else { return (nil, nil) }
             let centre = CGPoint(x: sceneView.bounds.midX, y: sceneView.bounds.midY)
 
             if state.stage == .topLimit {
@@ -576,25 +638,32 @@ struct ManualARSessionView: UIViewRepresentable {
                 // selected bottom. Do not fall back through the object.
                 if let frame = sceneView.session.currentFrame,
                    frame.smoothedSceneDepth != nil || frame.sceneDepth != nil {
-                    guard let sample = depthSampleAtCentre(frame: frame),
-                          isUsableTopSample(sample)
-                    else { return nil }
-                    return sample
+                    guard let sample = depthSampleAtCentre(frame: frame) else {
+                        return (nil, "No reliable depth under the centre dot. Move closer to the product's top.")
+                    }
+                    if let problem = topSampleProblem(sample) {
+                        return (nil, problem)
+                    }
+                    return (sample, nil)
                 }
 
                 // Non-LiDAR fallback: use only finite/estimated surfaces.
                 // Infinite planes are deliberately excluded for the top marker.
+                var lastProblem: String?
                 for target in [
                     ARRaycastQuery.Target.estimatedPlane,
                     .existingPlaneGeometry
                 ] {
                     if let result = raycast(from: centre, target: target, in: sceneView),
-                       let sample = sample(from: result, target: target, in: sceneView),
-                       isUsableTopSample(sample) {
-                        return sample
+                       let sample = sample(from: result, target: target, in: sceneView) {
+                        if let problem = topSampleProblem(sample) {
+                            lastProblem = problem
+                        } else {
+                            return (sample, nil)
+                        }
                     }
                 }
-                return nil
+                return (nil, lastProblem ?? "Aim the centre dot at a detected surface above the bottom limit.")
             }
 
             let existing = raycast(
@@ -609,12 +678,12 @@ struct ManualARSessionView: UIViewRepresentable {
                 ? raycast(from: centre, target: .estimatedPlane, in: sceneView)
                 : nil
             let result = existing ?? infinite ?? estimated
-            guard let result else { return nil }
+            guard let result else { return (nil, nil) }
 
             let target: ARRaycastQuery.Target = existing != nil
                 ? .existingPlaneGeometry
                 : (infinite != nil ? .existingPlaneInfinite : .estimatedPlane)
-            return sample(from: result, target: target, in: sceneView)
+            return (sample(from: result, target: target, in: sceneView), nil)
         }
 
         @MainActor
@@ -746,18 +815,30 @@ struct ManualARSessionView: UIViewRepresentable {
             )
         }
 
+        /// Nil when the sample can be used as a top limit; otherwise the
+        /// reason it cannot, surfaced as live guidance (D6).
         @MainActor
-        private func isUsableTopSample(_ sample: CentreRaycastSample) -> Bool {
+        private func topSampleProblem(_ sample: CentreRaycastSample) -> String? {
             guard let bottom = state.bottomMarker,
-                  let boundary = state.boundaryMeasurement,
-                  sample.position.y - bottom.position.simd.y
+                  let boundary = state.boundaryMeasurement
+            else {
+                return "Set the base boundary and bottom limit before the top limit."
+            }
+            guard sample.position.y - bottom.position.simd.y
                     >= Float(ManualMeasurementGeometry.minimumHeightMetres)
-            else { return false }
-            return (try? ManualMeasurementGeometry.height(
-                top: sample.position,
-                bottom: bottom.position.simd,
-                boundary: boundary
-            )) != nil
+            else {
+                return "The aimed surface is not above the bottom limit. Aim at the product's top."
+            }
+            do {
+                _ = try ManualMeasurementGeometry.height(
+                    top: sample.position,
+                    bottom: bottom.position.simd,
+                    boundary: boundary
+                )
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
         }
 
         @MainActor
@@ -816,20 +897,31 @@ struct ManualARSessionView: UIViewRepresentable {
             let boundary = state.boundaryMarkers.map { $0.position.simd }
             let bottom = state.bottomMarker?.position.simd
             let top = state.topMarker?.position.simd
-            let markerPositions = boundary + [bottom, top].compactMap { $0 }
-            if markerPositions != renderedMarkerPositions {
-                markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
-                markerAnchors.removeAll()
-                boundary.forEach {
-                    addMarkerAnchor(at: $0, name: AnchorName.boundary)
+            // Diff anchors incrementally: removing and re-adding every marker
+            // on any change made all of them blink out and pop back in (D17).
+            var desired: [(position: SIMD3<Float>, name: String)] =
+                boundary.map { ($0, AnchorName.boundary) }
+            if let bottom { desired.append((bottom, AnchorName.bottom)) }
+            if let top { desired.append((top, AnchorName.top)) }
+            var kept: [ARAnchor] = []
+            for anchor in markerAnchors {
+                let position = SIMD3<Float>(
+                    anchor.transform.columns.3.x,
+                    anchor.transform.columns.3.y,
+                    anchor.transform.columns.3.z
+                )
+                if let index = desired.firstIndex(where: {
+                    $0.name == anchor.name && $0.position == position
+                }) {
+                    desired.remove(at: index)
+                    kept.append(anchor)
+                } else {
+                    sceneView.session.remove(anchor: anchor)
                 }
-                if let bottom {
-                    addMarkerAnchor(at: bottom, name: AnchorName.bottom)
-                }
-                if let top {
-                    addMarkerAnchor(at: top, name: AnchorName.top)
-                }
-                renderedMarkerPositions = markerPositions
+            }
+            markerAnchors = kept
+            for marker in desired {
+                addMarkerAnchor(at: marker.position, name: marker.name)
             }
             for (start, end) in zip(boundary, boundary.dropFirst()) {
                 addLine(from: start, to: end, color: .systemCyan)

@@ -80,6 +80,9 @@ struct ManualDimensionEntryView: View {
             confidence: 1,
             timestamp: .now
         ))
+        // Dismiss only this sheet. The presenter must not tear down its own
+        // container inside onSave — it applies the capture from the sheet's
+        // onDismiss, so the two dismissals can never race (D15).
         dismiss()
     }
 }

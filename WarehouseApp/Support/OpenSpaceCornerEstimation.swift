@@ -32,7 +32,9 @@ struct CornerEstimatorConfiguration: Equatable {
     var minimumIndependentFrames = 6
     var minimumCaptureDurationSeconds = 1.0
     var maximumCaptureDurationSeconds = 2.0
-    var minimumCoverageMetres = 0.06
+    /// Legs down to ~4 cm must still support a fit; the old 6 cm floor
+    /// rejected the small products this scanner exists for (D3b).
+    var minimumCoverageMetres = 0.035
     var lineInlierThresholdMetres = 0.012
     var planeInlierThresholdMetres = 0.012
     var minimumLineSupport = 8
@@ -79,9 +81,18 @@ struct TabletopCornerEstimator: LocalCornerEstimating {
         configuration: CornerEstimatorConfiguration = .standard
     ) -> Result<GuidedCornerMeasurement, CornerEstimationFailure> {
         guard validEpoch(capture) else { return .failure(.mixedCoordinateEpoch) }
+        // Anchor the base-surface band to the observed depth patch rather
+        // than the plane-raycast origin: a raycast landing slightly off the
+        // physical surface would otherwise shift the whole band and discard
+        // the real tabletop points (D3d).
+        let patchMedianY = median(capture.samples.compactMap {
+            finite($0.localPosition.simd) ? $0.localPosition.y : nil
+        })
+        let bandCentre = patchMedianY.isFinite ? patchMedianY : 0
         let samples = capture.samples.filter {
             $0.trackingState == .normal && finite($0.localPosition.simd)
-                && abs($0.localPosition.y) <= configuration.basePlaneToleranceMetres
+                && abs($0.localPosition.y - bandCentre)
+                    <= configuration.basePlaneToleranceMetres
                 && $0.depthConfidence >= 0.3
         }
         let frameCount = Set(samples.map(\.frameSequence)).count
@@ -438,8 +449,12 @@ private func makeMeasurement(
 }
 
 private func validEpoch(_ capture: CornerPatchCapture) -> Bool {
+    // Actually compare epochs (D3g): samples recorded under a different
+    // coordinate epoch must not blend into this fit. Tracking quality is a
+    // per-sample concern and is filtered by each estimator, not here —
+    // otherwise one limited-tracking frame failed every capture outright.
     !capture.samples.isEmpty && capture.samples.allSatisfy {
-        $0.trackingState == .normal
+        $0.coordinateEpoch == nil || $0.coordinateEpoch == capture.coordinateEpoch
     }
 }
 
