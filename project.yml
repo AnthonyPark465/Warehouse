@@ -7,6 +7,7 @@ name: Warehouse
 #         base:
 #           DEVELOPMENT_TEAM: YOURTEAMID
 include:
+  - project.defaults.yml
   - project.local.yml
 
 options:
@@ -37,7 +38,6 @@ targets:
         product: FirebaseFirestore
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.tetris.warehouse
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES

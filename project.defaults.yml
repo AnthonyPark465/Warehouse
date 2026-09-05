@@ -1,0 +1,8 @@
+# Shared defaults that project.local.yml may override per machine.
+# (XcodeGen merge order: the main spec beats includes, and later includes beat
+# earlier ones — so overridable defaults must live here, not in project.yml.)
+targets:
+  WarehouseApp:
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tetris.warehouse
