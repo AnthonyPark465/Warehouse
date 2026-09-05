@@ -248,6 +248,44 @@ struct LiDARFusionMeasurement: Equatable {
     let fusedVoxelCount: Int
     let averageObservationsPerVoxel: Double
     let supportPlaneY: Float
+    /// The support plane came from the 2nd-percentile fallback rather than a
+    /// detected histogram plane — height is then measured from the object's
+    /// own lowest points and deserves reduced confidence.
+    var usedSupportPlaneFallback: Bool = false
+    /// Component connectivity needed the wide (bridging) radius — background
+    /// merge risk is elevated.
+    var usedWideConnectivity: Bool = false
+}
+
+/// Why a measurement pass produced no result — surfaced to the capture UI so
+/// a non-converging scan explains itself instead of "fusing" forever.
+enum LiDARMeasurementFailure: Equatable {
+    case selectionPending
+    case tooFewStableVoxels(have: Int, needed: Int)
+    case noSupportPlane
+    case tooFewPointsAboveSupport(have: Int, needed: Int)
+    case noComponentNearSeed
+    case degenerateBounds
+
+    var guidance: String {
+        switch self {
+        case .selectionPending:
+            "Aim at the product and lock the scan region."
+        case .tooFewStableVoxels, .tooFewPointsAboveSupport:
+            "Keep scanning — move slowly around the product to gather more surface."
+        case .noSupportPlane:
+            "Include the surface the product rests on in the scan box."
+        case .noComponentNearSeed:
+            "Aim the reticle at the product itself, then re-lock the region."
+        case .degenerateBounds:
+            "Not enough of the product is visible yet — scan more of its sides."
+        }
+    }
+}
+
+enum LiDARMeasurementOutcome: Equatable {
+    case measured(LiDARFusionMeasurement)
+    case failed(LiDARMeasurementFailure)
 }
 
 /// Central configuration for object isolation and measurement. Distances are
@@ -273,14 +311,20 @@ struct LiDARFusionConfiguration: Equatable {
     /// The selected seed must be reasonably close to retained target geometry.
     var maximumSeedDistance: Float = 0.08
     /// Robust oriented-bound percentiles.
-    var lowerPercentile = 0.01
-    var upperPercentile = 0.99
+    // 0.5% trims: enough to shed genuine outliers, but trimming a full 1% of
+    // a box's surface points on BOTH ends of BOTH axes systematically
+    // under-reported every dimension.
+    var lowerPercentile = 0.005
+    var upperPercentile = 0.995
     /// Live estimates must agree this many times before becoming stable.
     var stableEstimateCount = 3
     /// A dimension increase beyond this is frozen as likely nearby geometry.
     var dimensionJumpThreshold = 0.25
     /// Estimates in a candidate series may vary by this fraction.
-    var estimateConsistencyTolerance = 0.08
+    // 12%: 0.08 was tight enough that ordinary LiDAR noise on hand-sized
+    // objects kept toggling estimates between "consistent" and "changed",
+    // feeding the stabilizer oscillation.
+    var estimateConsistencyTolerance = 0.12
 
     static let smallObject = LiDARFusionConfiguration()
 }
@@ -379,11 +423,23 @@ final class LiDARVoxelFusionEngine {
     }
 
     func measurement() -> LiDARFusionMeasurement? {
-        guard let selection else { return nil }
+        if case .measured(let measurement) = evaluateMeasurement() {
+            return measurement
+        }
+        return nil
+    }
+
+    func evaluateMeasurement() -> LiDARMeasurementOutcome {
+        guard let selection else { return .failed(.selectionPending) }
         let stable = voxels.filter {
             $0.value.frameObservations >= configuration.minimumFrameObservations
         }
-        guard stable.count >= configuration.minimumStableVoxelCount else { return nil }
+        guard stable.count >= configuration.minimumStableVoxelCount else {
+            return .failed(.tooFewStableVoxels(
+                have: stable.count,
+                needed: configuration.minimumStableVoxelCount
+            ))
+        }
 
         let stablePoints = stable.mapValues {
             $0.positionSum / Float($0.frameObservations)
@@ -391,11 +447,12 @@ final class LiDARVoxelFusionEngine {
         let localCoordinates = stablePoints.mapValues {
             selection.region.coordinates(of: $0)
         }
-        guard let supportCoordinate = detectSupportPlane(
+        guard let support = detectSupportPlane(
             in: localCoordinates.values.map(\.y)
         ) else {
-            return nil
+            return .failed(.noSupportPlane)
         }
+        let supportCoordinate = support.coordinate
 
         // The support itself is removed, but supportY remains the lower height
         // boundary so the contact-noise band does not shorten the object.
@@ -403,7 +460,12 @@ final class LiDARVoxelFusionEngine {
             guard let local = localCoordinates[$0.key] else { return false }
             return local.y > supportCoordinate + configuration.supportPlaneNoiseBand
         }
-        guard aboveSupport.count >= configuration.minimumStableVoxelCount else { return nil }
+        guard aboveSupport.count >= configuration.minimumStableVoxelCount else {
+            return .failed(.tooFewPointsAboveSupport(
+                have: aboveSupport.count,
+                needed: configuration.minimumStableVoxelCount
+            ))
+        }
 
         // Tight connectivity first, so a separate object a few millimetres
         // away cannot bridge into the product; the configured (wider) radius
@@ -414,21 +476,28 @@ final class LiDARVoxelFusionEngine {
             radius: tightRadius,
             seed: selection.seed
         )
+        var usedWideConnectivity = false
         if selected == nil, tightRadius < configuration.connectivityRadiusInVoxels {
             selected = selectComponent(
                 in: aboveSupport,
                 radius: configuration.connectivityRadiusInVoxels,
                 seed: selection.seed
             )
+            usedWideConnectivity = selected != nil
         }
-        guard let component = selected else { return nil }
+        guard let component = selected else { return .failed(.noComponentNearSeed) }
 
-        let points = component.compactMap { aboveSupport[$0] }
+        // Sorted so every downstream consumer sees a deterministic order —
+        // Set/Dictionary iteration otherwise varies per process AND per call,
+        // which made the fitted box orientation jitter.
+        let points = component
+            .sorted { ($0.x, $0.y, $0.z) < ($1.x, $1.y, $1.z) }
+            .compactMap { aboveSupport[$0] }
         guard let bounds = orientedBounds(
             points: points,
             region: selection.region,
             supportCoordinate: supportCoordinate
-        ) else { return nil }
+        ) else { return .failed(.degenerateBounds) }
 
         let centre = bounds.worldCentre
         // Express review points in the measured box's own basis (X = length,
@@ -455,7 +524,7 @@ final class LiDARVoxelFusionEngine {
             partial + Double(stable[key]?.frameObservations ?? 0)
         } / Double(component.count)
 
-        return LiDARFusionMeasurement(
+        return .measured(LiDARFusionMeasurement(
             dimensionsCM: ObjectDimensions(
                 length: Double(max(bounds.extentU, bounds.extentV)) * 100,
                 width: Double(min(bounds.extentU, bounds.extentV)) * 100,
@@ -475,8 +544,10 @@ final class LiDARVoxelFusionEngine {
             supportPlaneY: (
                 selection.region.referenceOrigin
                     + selection.region.axisY * supportCoordinate
-            ).y
-        )
+            ).y,
+            usedSupportPlaneFallback: support.usedFallback,
+            usedWideConnectivity: usedWideConnectivity
+        ))
     }
 
     private func voxelKey(for point: SIMD3<Float>) -> VoxelKey {
@@ -487,7 +558,9 @@ final class LiDARVoxelFusionEngine {
         )
     }
 
-    private func detectSupportPlane(in heights: [Float]) -> Float? {
+    private func detectSupportPlane(
+        in heights: [Float]
+    ) -> (coordinate: Float, usedFallback: Bool)? {
         guard !heights.isEmpty else { return nil }
         var bins: [Int32: [Float]] = [:]
         for height in heights {
@@ -500,9 +573,13 @@ final class LiDARVoxelFusionEngine {
         )
         let candidates = bins.filter { $0.value.count >= minimumPlaneSamples }
         if let lowest = candidates.min(by: { $0.key < $1.key }) {
-            return lowest.value.reduce(0, +) / Float(lowest.value.count)
+            return (lowest.value.reduce(0, +) / Float(lowest.value.count), false)
         }
-        return percentile(heights, fraction: 0.02)
+        // No qualifying plane: fall back to the cloud's own low percentile.
+        // This measures height from the object's lowest points, not a real
+        // support — flagged so confidence and UI can reflect it.
+        guard let fallback = percentile(heights, fraction: 0.02) else { return nil }
+        return (fallback, true)
     }
 
     /// The qualifying component nearest the user's aim point, or nil when no
@@ -518,7 +595,16 @@ final class LiDARVoxelFusionEngine {
         let scored = connectedComponents(in: points, radius: radius)
             .filter { $0.count >= configuration.minimumStableVoxelCount }
             .map { ($0, componentDistanceSquared($0, points: points, seed: seed)) }
-        guard let best = scored.min(by: { $0.1 < $1.1 }),
+        // Nearest-to-seed wins, but distances within ~1 cm² of each other are
+        // a wash for a handheld aim — prefer the larger component then, so a
+        // thin sliver of background brushing the aim point cannot beat the
+        // product it is touching.
+        let nearTieToleranceSquared: Float = 0.0001
+        guard let best = scored.min(by: {
+            abs($0.1 - $1.1) <= nearTieToleranceSquared
+                ? $0.0.count > $1.0.count
+                : $0.1 < $1.1
+        }),
               sqrt(best.1) <= configuration.maximumSeedDistance
         else { return nil }
         return best.0
@@ -704,46 +790,34 @@ final class LiDARVoxelFusionEngine {
             return (angle, area, uBounds.low, uBounds.high, vBounds.low, vBounds.high)
         }
 
-        // Searching every angle does not require every fused voxel. Use an
-        // evenly distributed subset for yaw, then recompute the final robust
-        // bounds from the complete point set at the selected angle. 256 is
-        // ample for picking a yaw on a 0.25° grid; the extents themselves
-        // come from the full set below.
-        let maximumSearchPointCount = 256
-        let searchPoints: [SIMD2<Float>]
-        if points.count > maximumSearchPointCount {
-            let stride = max(1, points.count / maximumSearchPointCount)
-            searchPoints = points.enumerated().compactMap {
-                $0.offset.isMultiple(of: stride) ? $0.element : nil
-            }
-        } else {
-            searchPoints = points
+        // The minimum-area enclosing rectangle of a point set is flush with an
+        // edge of its convex hull, so the hull's edge directions are the ONLY
+        // yaw candidates worth evaluating (rotating-calipers insight). The
+        // hull depends solely on the point SET — unlike the previous sampled
+        // grid search, whose stride subsample inherited Set/Dictionary
+        // iteration order and rotated the box nondeterministically. Candidate
+        // angles are evaluated ascending with a strict comparison, so exact
+        // area ties (squares, L-shapes) deterministically resolve to the
+        // smallest yaw.
+        let quarterTurn = Float.pi / 2
+        var angles = convexHullEdgeAngles(of: points).map { raw -> Float in
+            var angle = raw.truncatingRemainder(dividingBy: quarterTurn)
+            if angle < 0 { angle += quarterTurn }
+            return angle
+        }
+        angles.append(0) // axis-aligned fallback for degenerate hulls
+        angles.sort()
+        var uniqueAngles: [Float] = []
+        for angle in angles where uniqueAngles.last.map({ angle - $0 > 1e-4 }) ?? true {
+            uniqueAngles.append(angle)
         }
 
-        let coarseStep = Float.pi / 60 // 3 degrees
         var best: Candidate?
-        for index in 0..<30 {
-            guard let current = candidate(
-                at: Float(index) * coarseStep,
-                using: searchPoints
-            ) else { continue }
+        for angle in uniqueAngles {
+            guard let current = candidate(at: angle, using: points) else { continue }
             if best == nil || current.area < best!.area { best = current }
         }
-        guard let coarseBest = best else { return nil }
-
-        // Refine to 0.25 degrees. A rectangle's yaw repeats every 90 degrees.
-        let quarterTurn = Float.pi / 2
-        let fineStep = Float.pi / 720
-        for offset in -12...12 {
-            var angle = coarseBest.angle + Float(offset) * fineStep
-            while angle < 0 { angle += quarterTurn }
-            while angle >= quarterTurn { angle -= quarterTurn }
-            guard let current = candidate(at: angle, using: searchPoints) else { continue }
-            if current.area < best!.area { best = current }
-        }
-        guard let searchBest = best,
-              let final = candidate(at: searchBest.angle, using: points)
-        else { return nil }
+        guard let final = best else { return nil }
         return (
             axisU: SIMD2<Float>(cos(final.angle), sin(final.angle)),
             axisV: SIMD2<Float>(-sin(final.angle), cos(final.angle)),
@@ -752,6 +826,42 @@ final class LiDARVoxelFusionEngine {
             lowV: final.lowV,
             highV: final.highV
         )
+    }
+
+    /// Edge directions of the 2D convex hull (Andrew's monotone chain).
+    /// Deterministic: the hull is a function of the point set alone.
+    private func convexHullEdgeAngles(of points: [SIMD2<Float>]) -> [Float] {
+        guard points.count >= 3 else { return [] }
+        let sorted = points.sorted { $0.x == $1.x ? $0.y < $1.y : $0.x < $1.x }
+
+        func cross(_ o: SIMD2<Float>, _ a: SIMD2<Float>, _ b: SIMD2<Float>) -> Float {
+            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        }
+        func buildChain(_ input: [SIMD2<Float>]) -> [SIMD2<Float>] {
+            var chain: [SIMD2<Float>] = []
+            for point in input {
+                while chain.count >= 2,
+                      cross(chain[chain.count - 2], chain[chain.count - 1], point) <= 0 {
+                    chain.removeLast()
+                }
+                chain.append(point)
+            }
+            return chain
+        }
+
+        let lower = buildChain(sorted)
+        let upper = buildChain(sorted.reversed())
+        let hull = Array(lower.dropLast() + upper.dropLast())
+        guard hull.count >= 2 else { return [] }
+
+        var angles: [Float] = []
+        angles.reserveCapacity(hull.count)
+        for index in 0..<hull.count {
+            let edge = hull[(index + 1) % hull.count] - hull[index]
+            guard simd_length_squared(edge) > 1e-12 else { continue }
+            angles.append(atan2(edge.y, edge.x))
+        }
+        return angles
     }
 
     private func worldPoint(
@@ -820,6 +930,15 @@ struct LiDARMeasurementStabilizer {
     }
 
     mutating func consider(_ estimate: ObjectDimensions) -> LiDARMeasurementDecision {
+        // An estimate matching the current stable value is pure confirmation.
+        // It must neither advance NOR reset a candidate series tracking a
+        // genuinely different value: with noisy input alternating between the
+        // old stable value and a new truth, either mutation starves the
+        // candidate count and latches the stale value forever.
+        if let stable, dimensionsAreConsistent(stable, estimate) {
+            return .accepted(stable)
+        }
+
         if let candidate, dimensionsAreConsistent(candidate, estimate) {
             candidateCount += 1
             self.candidate = averaged(candidate, estimate, count: candidateCount)
@@ -834,12 +953,6 @@ struct LiDARMeasurementStabilizer {
                 return .accepted(candidate)
             }
             return .warmingUp
-        }
-
-        if dimensionsAreConsistent(stable, estimate) {
-            candidate = nil
-            candidateCount = 0
-            return .accepted(stable)
         }
 
         let isJump = zip(estimate.values, stable.values).contains {
