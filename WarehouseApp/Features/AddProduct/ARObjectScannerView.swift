@@ -165,7 +165,29 @@ struct ARObjectScannerView: UIViewRepresentable {
                         publishStatus()
                         return
                     }
-                    let volume = makeLockedVolume(seed: seed, cameraTransform: frame.camera.transform)
+                    // Highest detected horizontal plane below the aim point:
+                    // the volume stretches down to it so the support surface
+                    // is always inside the scan region.
+                    let floorY = frame.anchors
+                        .compactMap { $0 as? ARPlaneAnchor }
+                        .filter { $0.alignment == .horizontal }
+                        .map { $0.transform.columns.3.y }
+                        .filter { $0 < seed.y - 0.02 }
+                        .max()
+                    let camera = frame.camera.transform
+                    let volume = LockedVolumePlanning.volume(
+                        seed: seed,
+                        cameraRight: SIMD3<Float>(
+                            camera.columns.0.x, camera.columns.0.y, camera.columns.0.z
+                        ),
+                        cameraForward: -SIMD3<Float>(
+                            camera.columns.2.x, camera.columns.2.y, camera.columns.2.z
+                        ),
+                        floorY: floorY,
+                        width: selectionSettings.volumeWidth,
+                        height: selectionSettings.volumeHeight,
+                        depth: selectionSettings.volumeDepth
+                    )
                     fusion.lockSelection(volume: volume, seed: seed)
                     awaitingSelectionLock = false
                     currentStatus.selectionIsLocked = true
@@ -185,7 +207,6 @@ struct ARObjectScannerView: UIViewRepresentable {
                 let result = fusion.integrate(framePoints: points)
                 currentStatus.integratedFrameCount += 1
                 currentStatus.rejectedPointCount += result.rejectedOutsideVolumeCount
-                updateEstimate()
                 if result.rejectedOutsideVolumeCount > 0 {
                     currentStatus.message =
                         "\(result.rejectedOutsideVolumeCount) outside-volume samples rejected this frame."
@@ -193,6 +214,9 @@ struct ARObjectScannerView: UIViewRepresentable {
                     currentStatus.message =
                         "Fusing selected object… capture the front, sides, top, and back."
                 }
+                // After the generic message so convergence guidance, boundary
+                // warnings, and freeze explanations win the label.
+                updateEstimate()
                 publishStatus()
             }
         }
@@ -222,9 +246,24 @@ struct ARObjectScannerView: UIViewRepresentable {
         }
 
         private func updateEstimate() {
-            guard currentStatus.integratedFrameCount.isMultiple(of: 4),
-                  let measurement = fusion.measurement()
-            else { return }
+            // Segmentation is the expensive part of the pipeline and shares
+            // the AR delegate queue; back off as the cloud grows so frames
+            // keep draining.
+            let cadence = currentStatus.pointCount > 40_000 ? 12 : 4
+            guard currentStatus.integratedFrameCount.isMultiple(of: cadence) else { return }
+
+            let measurement: LiDARFusionMeasurement
+            switch fusion.evaluateMeasurement() {
+            case .failed(let failure):
+                // A failing pass must never leave a stale "Finish" enabled,
+                // and the user deserves to know WHY it is not converging.
+                currentStatus.measurementIsStable = false
+                currentStatus.canFinish = false
+                currentStatus.message = failure.guidance
+                return
+            case .measured(let value):
+                measurement = value
+            }
 
             switch stabilizer.consider(measurement.dimensionsCM) {
             case .warmingUp:
@@ -238,6 +277,11 @@ struct ARObjectScannerView: UIViewRepresentable {
                 currentStatus.dimensionsCM = dimensions
                 currentStatus.measurementIsStable = false
                 currentStatus.message = message
+            }
+
+            if measurement.touchesRegionBoundary {
+                currentStatus.message =
+                    "The object reaches the edge of the scan box — step back or enlarge the box."
             }
 
             currentStatus.pointCount = measurement.fusedVoxelCount
@@ -307,16 +351,35 @@ struct ARObjectScannerView: UIViewRepresentable {
             )
             let observationScore = min(measurement.averageObservationsPerVoxel / 8, 1)
             let stabilityScore = currentStatus.measurementIsStable ? 1.0 : 0.25
-            return min(
-                frameScore * 0.25
-                    + voxelScore * 0.25
-                    + observationScore * 0.20
-                    + stabilityScore * 0.30,
-                0.95
-            )
+            var score = frameScore * 0.25
+                + voxelScore * 0.25
+                + observationScore * 0.20
+                + stabilityScore * 0.30
+            // Degraded-path penalties: height measured without a real support
+            // plane, connectivity that needed the bridging radius, and clouds
+            // pressing against the crop boundary are all less trustworthy.
+            if measurement.usedSupportPlaneFallback { score -= 0.15 }
+            if measurement.usedWideConnectivity { score -= 0.05 }
+            if measurement.touchesRegionBoundary { score -= 0.10 }
+            return min(max(score, 0), 0.95)
         }
 
+        private var lastPublishedStatus: ObjectScanLiveStatus?
+        private var lastPublishUptime: UInt64 = 0
+
         private func publishStatus() {
+            // SwiftUI re-renders per publish; ~12 Hz of identical statuses
+            // just contends with frame processing. Publish immediately on
+            // meaningful transitions, at ~6 Hz otherwise.
+            let now = DispatchTime.now().uptimeNanoseconds
+            let significant = currentStatus.canFinish != lastPublishedStatus?.canFinish
+                || currentStatus.selectionIsLocked != lastPublishedStatus?.selectionIsLocked
+                || currentStatus.dimensionsCM != lastPublishedStatus?.dimensionsCM
+            guard significant
+                || lastPublishedStatus == nil
+                || now - lastPublishUptime >= 160_000_000 else { return }
+            lastPublishUptime = now
+            lastPublishedStatus = currentStatus
             let status = currentStatus
             DispatchQueue.main.async { self.onStatus(status) }
         }
@@ -379,17 +442,17 @@ struct ARObjectScannerView: UIViewRepresentable {
             let confidenceMap = depthData.confidenceMap
             return withLockedDepthMaps(depthMap: depthMap, confidenceMap: confidenceMap) {
                 depths, depthStride, confidence, confidenceStride, width, height in
-                let halfWidth = Int(Float(width) * self.selectionSettings.screenWidthFraction / 2)
-                let halfHeight = Int(Float(height) * self.selectionSettings.screenHeightFraction / 2)
-                let minX = max(width / 2 - halfWidth, 0)
-                let maxX = min(width / 2 + halfWidth, width)
-                let minY = max(height / 2 - halfHeight, 0)
-                let maxY = min(height / 2 + halfHeight, height)
+                let crop = DepthCropping.cropRect(
+                    screenWidthFraction: self.selectionSettings.screenWidthFraction,
+                    screenHeightFraction: self.selectionSettings.screenHeightFraction,
+                    depthWidth: width,
+                    depthHeight: height
+                )
 
                 var points: [SIMD3<Float>] = []
                 points.reserveCapacity(2_000)
-                for y in stride(from: minY, to: maxY, by: 2) {
-                    for x in stride(from: minX, to: maxX, by: 2) {
+                for y in stride(from: crop.minY, to: crop.maxY, by: 2) {
+                    for x in stride(from: crop.minX, to: crop.maxX, by: 2) {
                         let depth = depths[y * depthStride + x]
                         guard depth.isFinite, depth >= 0.15, depth <= 1.20 else { continue }
                         if let confidence,
@@ -479,40 +542,13 @@ struct ARObjectScannerView: UIViewRepresentable {
             return SIMD3<Float>(world.x, world.y, world.z)
         }
 
-        private func makeLockedVolume(
-            seed: SIMD3<Float>,
-            cameraTransform: simd_float4x4
-        ) -> LiDARScanVolume {
-            var cameraRight = SIMD3<Float>(
-                cameraTransform.columns.0.x,
-                0,
-                cameraTransform.columns.0.z
-            )
-            if simd_length_squared(cameraRight) < 0.001 {
-                cameraRight = SIMD3<Float>(1, 0, 0)
-            }
-            cameraRight = simd_normalize(cameraRight)
-            let worldUp = SIMD3<Float>(0, 1, 0)
-            let horizontalDepth = simd_normalize(simd_cross(cameraRight, worldUp))
-            return LiDARScanVolume(
-                centre: seed,
-                axisX: cameraRight,
-                axisY: worldUp,
-                axisZ: horizontalDepth,
-                halfExtents: SIMD3<Float>(
-                    selectionSettings.volumeWidth / 2,
-                    selectionSettings.volumeHeight / 2,
-                    selectionSettings.volumeDepth / 2
-                )
-            )
-        }
-
         private func showLockedVolume(_ volume: LiDARScanVolume) {
             DispatchQueue.main.async {
                 guard let arView = self.arView else { return }
                 self.selectionAnchorEntity?.removeFromParent()
                 let anchor = AnchorEntity(world: volume.transform)
-                var material = UnlitMaterial(color: UIColor.cyan.withAlphaComponent(0.12))
+                // Green to match the on-screen guide's locked state and docs.
+                var material = UnlitMaterial(color: UIColor.green.withAlphaComponent(0.12))
                 material.blending = .transparent(opacity: 0.12)
                 let size = volume.halfExtents * 2
                 let box = ModelEntity(

@@ -83,8 +83,8 @@ The LiDAR configuration affects raw measurement only. Existing warehouse rules
 remain separate:
 
 - Internal unit: centimetres
-- Per-axis scan tolerance: `max(2 cm, measured dimension × 2%)`
-- Per-axis storage clearance: `1 cm`
+- Per-axis scan tolerance: `0.5 cm + measured dimension × 2%` (additive)
+- Per-axis storage clearance: `0 cm` by default (user-adjustable in review)
 - Final dimension: raw + scan tolerance + storage clearance
 
 These values remain in `ObjectDimensionPolicy.default`. The confirmed
