@@ -25,6 +25,42 @@ final class SpaceGeometryTests: XCTestCase {
         XCTAssertThrowsError(try SpaceGeometryValidator.validate(value))
     }
 
+    func testReversedWindingAndNegativeLocalCoordinatesRemainValid() throws {
+        var value = space()
+        let boundary = [
+            Vector2D(-50, -50), Vector2D(-50, 50),
+            Vector2D(50, 50), Vector2D(50, -50)
+        ]
+        value.rawBoundary2D = boundary
+        value.approvedBoundary2D = boundary
+
+        try SpaceGeometryValidator.validate(value)
+        XCTAssertEqual(try OpenSpacePlacementAdapter.shelfState(from: value).boundary.minimum.x, -50)
+    }
+
+    func testConcavePolygonIsSupportedButSelfIntersectingPolygonIsRejected() throws {
+        var concave = space()
+        let concaveBoundary = [
+            Vector2D(0, 0), Vector2D(100, 0), Vector2D(100, 100),
+            Vector2D(60, 100), Vector2D(60, 40), Vector2D(40, 40),
+            Vector2D(40, 100), Vector2D(0, 100)
+        ]
+        concave.rawBoundary2D = concaveBoundary
+        concave.approvedBoundary2D = concaveBoundary
+        try SpaceGeometryValidator.validate(concave)
+
+        var crossing = space()
+        let crossingBoundary = [
+            Vector2D(0, 0), Vector2D(100, 100), Vector2D(0, 100),
+            Vector2D(100, 0), Vector2D(50, -10)
+        ]
+        crossing.rawBoundary2D = crossingBoundary
+        crossing.approvedBoundary2D = crossingBoundary
+        XCTAssertThrowsError(try SpaceGeometryValidator.validate(crossing)) {
+            XCTAssertEqual($0 as? SpaceGeometryError, .invalidBoundary)
+        }
+    }
+
     func testExcludedRegionOutsideBoundaryIsRejected() {
         var value = space()
         value.excludedRegions2D = [[
@@ -63,6 +99,47 @@ final class SpaceGeometryTests: XCTestCase {
         XCTAssertEqual(state.boundary.dimensions.heightCM, 120)
         XCTAssertEqual(state.label, "Scanned Tabletop")
         XCTAssertEqual(state.geometry?.measurementMetadata.unit, .centimetres)
+    }
+
+    func testNewlyScannedEmptyRectangularSpaceAcceptsNormalProduct() throws {
+        let state = try OpenSpacePlacementAdapter.shelfState(from: space())
+        var metadata = ProductPlacementMetadata.conservative
+        metadata.weightKG = 2
+        metadata.requiredClearanceCM = 2
+        let product = PackagePlacementProfile(
+            productId: "normal-product",
+            dimensions: .init(widthCM: 30, heightCM: 20, depthCM: 25),
+            weightKG: 2,
+            demandVelocity: 0.5,
+            metadata: metadata,
+            measurementUncertaintyCM: .init(widthCM: 1, heightCM: 1, depthCM: 1)
+        )
+
+        XCTAssertNotNil(PlacementEngine.calculate(package: product, shelf: state).recommendation)
+    }
+
+    func testProductTouchingSafetyMarginExactlyFits() throws {
+        let state = try OpenSpacePlacementAdapter.shelfState(from: space())
+        var metadata = ProductPlacementMetadata.conservative
+        metadata.weightKG = 1
+        metadata.requiredClearanceCM = 1
+        let product = PackagePlacementProfile(
+            productId: "exact-margin",
+            dimensions: .init(widthCM: 96, heightCM: 10, depthCM: 96),
+            weightKG: 1,
+            demandVelocity: 0.5,
+            metadata: metadata,
+            measurementUncertaintyCM: .init(widthCM: 1, heightCM: 1, depthCM: 1)
+        )
+        var tolerance = PlacementToleranceConfiguration.warehouse
+        tolerance.minimumLinearToleranceCM = 0
+        tolerance.percentageTolerance = 0
+        tolerance.lowConfidenceMultiplier = 1
+
+        XCTAssertEqual(PlacementEngine.usableDimensions(of: state).widthCM, 98)
+        XCTAssertNotNil(PlacementEngine.calculate(
+            package: product, shelf: state, tolerance: tolerance
+        ).recommendation)
     }
 
     func testCornerMeasurementProvenanceRoundTrips() throws {

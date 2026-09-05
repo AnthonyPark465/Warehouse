@@ -18,9 +18,11 @@ enum SpaceRepository {
         return snapshot.exists ? try snapshot.data(as: ScannedSpaceGeometry.self) : nil
     }
 
-    static func save(_ space: ScannedSpaceGeometry, expectedVersion: Int?) async throws {
+    @discardableResult
+    static func save(_ space: ScannedSpaceGeometry, expectedVersion: Int?) async throws -> ScannedSpaceGeometry {
         try SpaceGeometryValidator.validate(space)
         let reference = FirestoreCollections.spaces.document(space.id.uuidString)
+        var saved = space
         _ = try await FirestoreCollections.db.runTransaction { transaction, pointer in
             do {
                 let existing = try transaction.getDocument(reference)
@@ -36,9 +38,11 @@ enum SpaceRepository {
                 var next = space
                 next.geometryVersion = (expectedVersion ?? 0) + 1
                 next.updatedAt = .now
+                saved = next
                 try transaction.setData(from: next, forDocument: reference)
             } catch { pointer?.pointee = error as NSError }
             return nil
         }
+        return saved
     }
 }

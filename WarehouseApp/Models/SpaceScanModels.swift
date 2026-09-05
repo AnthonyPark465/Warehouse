@@ -174,7 +174,41 @@ enum SpaceGeometryValidator {
             return value + polygon[i].x * n.y - n.x * polygon[i].y
         }
         let area = abs(doubledArea / 2)
-        return area > 0.01
+        guard area > 0.01 else { return false }
+        for first in polygon.indices {
+            let firstNext = (first + 1) % polygon.count
+            for second in polygon.indices where second > first {
+                let secondNext = (second + 1) % polygon.count
+                if first == second || firstNext == second || secondNext == first { continue }
+                if segmentsIntersect(
+                    polygon[first], polygon[firstNext], polygon[second], polygon[secondNext]
+                ) { return false }
+            }
+        }
+        return true
+    }
+
+    private static func segmentsIntersect(
+        _ a: SIMD2<Double>, _ b: SIMD2<Double>,
+        _ c: SIMD2<Double>, _ d: SIMD2<Double>
+    ) -> Bool {
+        let epsilon = 0.000_001
+        func cross(_ p: SIMD2<Double>, _ q: SIMD2<Double>, _ r: SIMD2<Double>) -> Double {
+            let pq = q - p, pr = r - p
+            return pq.x * pr.y - pq.y * pr.x
+        }
+        func onSegment(_ p: SIMD2<Double>, _ q: SIMD2<Double>, _ r: SIMD2<Double>) -> Bool {
+            q.x >= min(p.x, r.x) - epsilon && q.x <= max(p.x, r.x) + epsilon &&
+                q.y >= min(p.y, r.y) - epsilon && q.y <= max(p.y, r.y) + epsilon
+        }
+        let abC = cross(a, b, c), abD = cross(a, b, d)
+        let cdA = cross(c, d, a), cdB = cross(c, d, b)
+        if abC * abD < -epsilon && cdA * cdB < -epsilon { return true }
+        if abs(abC) <= epsilon && onSegment(a, c, b) { return true }
+        if abs(abD) <= epsilon && onSegment(a, d, b) { return true }
+        if abs(cdA) <= epsilon && onSegment(c, a, d) { return true }
+        if abs(cdB) <= epsilon && onSegment(c, b, d) { return true }
+        return false
     }
 
     private static func pointInPolygon(_ point: SIMD2<Double>, _ polygon: [SIMD2<Double>]) -> Bool {

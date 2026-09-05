@@ -285,6 +285,63 @@ struct PackagePlacementProfile: Equatable {
     var measurementUncertaintyCM: PackageDimensions = .init(widthCM: 0, heightCM: 0, depthCM: 0)
 }
 
+enum PlacementWorkflowError: LocalizedError, Equatable {
+    case unsavedStorageScan
+    case noSavedStorageArea
+    case selectionChanged
+
+    var errorDescription: String? {
+        switch self {
+        case .unsavedStorageScan:
+            "Save the newly scanned storage area before calculating placement."
+        case .noSavedStorageArea:
+            "Select a saved storage area before calculating placement."
+        case .selectionChanged:
+            "The selected storage area changed while placement was calculated. Try again."
+        }
+    }
+}
+
+/// Pure guards and locale-aware parsing for the placement form. Keeping these
+/// rules outside SwiftUI makes stale-selection and malformed-input behavior
+/// deterministic and unit-testable.
+enum PlacementWorkflow {
+    static let maximumDimensionCM = 5_000.0
+    static let maximumWeightKG = 1_000_000.0
+
+    static func calculationShelfID(
+        selectedShelfID: String,
+        unsavedSpaceID: UUID?
+    ) throws -> String {
+        guard unsavedSpaceID == nil else { throw PlacementWorkflowError.unsavedStorageScan }
+        let value = selectedShelfID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { throw PlacementWorkflowError.noSavedStorageArea }
+        return value
+    }
+
+    static func positiveDecimal(
+        _ text: String,
+        locale: Locale = .current,
+        maximum: Double
+    ) -> Double? {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        let formatter = NumberFormatter()
+        formatter.locale = locale
+        formatter.numberStyle = .decimal
+        formatter.isLenient = false
+        var allowed = CharacterSet.decimalDigits
+        let decimalSeparator = formatter.decimalSeparator ?? "."
+        allowed.formUnion(CharacterSet(charactersIn: decimalSeparator))
+        let components = value.components(separatedBy: decimalSeparator)
+        guard components.count <= 2, components.allSatisfy({ !$0.isEmpty }),
+              value.unicodeScalars.allSatisfy(allowed.contains),
+              let parsed = formatter.number(from: value)?.doubleValue,
+              parsed.isFinite, parsed > 0, parsed <= maximum else { return nil }
+        return parsed
+    }
+}
+
 struct StorageLocation: Identifiable, Codable, Equatable {
     let id: String
     let label: String
@@ -589,6 +646,7 @@ struct HandlingPolicy: Equatable {
 }
 
 enum PlacementRejectionCode: String, Codable, Equatable {
+    case invalidDimensions = "REJECT_INVALID_DIMENSIONS"
     case outsideBoundary = "REJECT_OUTSIDE_BOUNDARY"
     case collision = "REJECT_COLLISION"
     case insufficientSupport = "REJECT_INSUFFICIENT_SUPPORT"

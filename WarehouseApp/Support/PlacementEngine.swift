@@ -46,7 +46,7 @@ enum ShelfStateOperations {
                 id: result.id, minimum: result.position, dimensions: result.orientedDimensions
             ),
             orientation: result.orientation,
-            weightKG: package.metadata.explicitValidWeightKG,
+            weightKG: package.weightKG,
             priority: package.metadata.retrievalPriority,
             retrievalFrequency: package.metadata.expectedRetrievalFrequency,
             stacking: package.metadata.stacking,
@@ -81,10 +81,21 @@ enum ShelfScanValidator {
 
     static func rejectionReasons(for shelf: ShelfState) -> [PlacementRejectionCode] {
         var reasons: [PlacementRejectionCode] = []
-        let dimensions = shelf.boundary.dimensions
         if !shelf.scanQuality.hasClosedBoundary || shelf.scanQuality.missingSurfaceCount > 0 ||
-            dimensions.widthCM <= 0 || dimensions.heightCM <= 0 || dimensions.depthCM <= 0 ||
-            shelf.compartments.contains(where: { $0.volume.dimensions.volumeCM3 <= 0 }) ||
+            !validVolume(shelf.boundary) ||
+            shelf.compartments.contains(where: {
+                !validVolume($0.volume) || !contains(shelf.boundary, $0.volume) ||
+                    $0.ratedWeightKG.map { !$0.isFinite || $0 <= 0 } == true
+            }) ||
+            shelf.obstacles.contains(where: { !validVolume($0.volume) }) ||
+            shelf.products.contains(where: {
+                !validVolume($0.volume) ||
+                    $0.weightKG.map { !$0.isFinite || $0 <= 0 } ?? true
+            }) ||
+            shelf.ratedWeightKG.map { !$0.isFinite || $0 <= 0 } == true ||
+            !shelf.scanQuality.confidence.isFinite ||
+            !(0...1).contains(shelf.scanQuality.confidence) ||
+            !shelf.scanQuality.trackingDriftCM.isFinite || shelf.scanQuality.trackingDriftCM < 0 ||
             hasOverlappingCompartments(shelf.compartments) ||
             shelf.obstacles.contains(where: { obstacle in
                 obstacle.compartmentID == nil && !shelf.compartments.isEmpty
@@ -110,8 +121,27 @@ enum ShelfScanValidator {
 
     static func validFrontDirection(_ direction: Vector3D) -> Bool {
         let vector = direction.normalized
-        return vector.x.isFinite && vector.y.isFinite && vector.z.isFinite && abs(vector.y) < 0.35 &&
-            hypot(vector.x, vector.z) > 0.9
+        // Placement paths are expressed with z=0 at the opening and +z going
+        // into storage. Reject a reversed or sideways opening instead of
+        // silently validating motion along the wrong axis.
+        return vector.x.isFinite && vector.y.isFinite && vector.z.isFinite &&
+            abs(vector.x) < 0.15 && abs(vector.y) < 0.15 && vector.z > 0.95
+    }
+
+    static func validCoordinateSystem(_ coordinateSystem: ShelfLocalCoordinateSystem) -> Bool {
+        let width = coordinateSystem.widthAxis.simd
+        let up = coordinateSystem.upAxis.simd
+        let depth = coordinateSystem.depthAxis.simd
+        let origin = coordinateSystem.anchorOrigin
+        guard origin.x.isFinite, origin.y.isFinite, origin.z.isFinite else { return false }
+        let vectors = [width, up, depth]
+        guard vectors.allSatisfy({ vector in
+            vector.x.isFinite && vector.y.isFinite && vector.z.isFinite &&
+                abs(simd_length(vector) - 1) < 0.05
+        }), abs(simd_dot(width, up)) < 0.1,
+            abs(simd_dot(width, depth)) < 0.1,
+            abs(simd_dot(up, depth)) < 0.1 else { return false }
+        return simd_dot(simd_cross(width, up), depth) > 0.9
     }
 
     private static func hasOverlappingCompartments(_ compartments: [ShelfCompartment]) -> Bool {
@@ -123,6 +153,16 @@ enum ShelfScanValidator {
             }
         }
         return false
+    }
+
+    private static func validVolume(_ volume: AxisAlignedVolume) -> Bool {
+        let values = [
+            volume.minimum.x, volume.minimum.y, volume.minimum.z,
+            volume.dimensions.widthCM, volume.dimensions.heightCM, volume.dimensions.depthCM
+        ]
+        return values.allSatisfy(\.isFinite) &&
+            volume.dimensions.widthCM > 0 && volume.dimensions.heightCM > 0 &&
+            volume.dimensions.depthCM > 0
     }
 
     private static func containsDuplicateProducts(_ products: [StoredProductPlacement]) -> Bool {
@@ -184,10 +224,16 @@ enum PlacementEngine {
         reach: ReachConfiguration = .warehouse,
         handling: HandlingPolicy = .warehouse
     ) -> PlacementCalculation {
-        guard let explicitWeight = package.metadata.explicitValidWeightKG else {
+        guard package.weightKG.isFinite, package.weightKG > 0,
+              package.weightKG <= PlacementWorkflow.maximumWeightKG else {
             return .init(recommendation: nil, alternatives: [], evaluations: [
                 .init(identifier: "product-weight", result: nil, rejectionReasons: [.weightLimit])
             ], failureMessage: "Enter a finite positive product weight before automatic placement.")
+        }
+        guard validDimensions(package.dimensions), validUncertainty(package.measurementUncertaintyCM) else {
+            return .init(recommendation: nil, alternatives: [], evaluations: [
+                .init(identifier: "product-dimensions", result: nil, rejectionReasons: [.invalidDimensions])
+            ], failureMessage: "Enter finite positive product dimensions no larger than 5000 cm. Measurement uncertainty cannot be negative.")
         }
         let liveReservations = activeReservations.filter { $0.shelfID == shelf.id && $0.expiresAt > Date() }
         guard liveReservations.isEmpty else {
@@ -197,16 +243,19 @@ enum PlacementEngine {
         }
         var package = package
         package.metadata = package.metadata.conservativeForAutomaticPlacement
-        // The persisted metadata is authoritative; the duplicate profile field
-        // exists only for compatibility with the earlier capacity-only API.
+        // The profile value is the worker's validated form entry for this run.
+        // Persisted metadata supplies the remaining handling rules only.
+        package.metadata.weightKG = package.weightKG
         package = PackagePlacementProfile(
             productId: package.productId, dimensions: package.dimensions,
-            weightKG: explicitWeight, demandVelocity: package.demandVelocity,
+            weightKG: package.weightKG, demandVelocity: package.demandVelocity,
             productType: package.productType, metadata: package.metadata,
             measurementUncertaintyCM: package.measurementUncertaintyCM
         )
         let scanReasons = ShelfScanValidator.rejectionReasons(for: shelf)
-        guard scanReasons.isEmpty, ShelfScanValidator.validFrontDirection(shelf.primaryFrontDirection) else {
+        guard scanReasons.isEmpty,
+              ShelfScanValidator.validFrontDirection(shelf.primaryFrontDirection),
+              ShelfScanValidator.validCoordinateSystem(shelf.coordinateSystem) else {
             let message = scanReasons.contains(.lowScanConfidence)
                 ? "The shelf scan may be incomplete or inaccurate. Rescan the highlighted area before calculating a placement."
                 : "The stored shelf state is inconsistent. Reconcile or rescan the shelf before calculating a placement."
@@ -254,8 +303,12 @@ enum PlacementEngine {
             return $0.id < $1.id
         }
         guard let best = valid.first else {
+            let reasons = actionableFailureReasons(
+                package: package, shelf: shelf, effectiveDimensions: effective,
+                orientations: orientations, evaluations: evaluations
+            )
             return .init(recommendation: nil, alternatives: [], evaluations: evaluations,
-                failureMessage: "No valid placement was found on this shelf. The remaining spaces are too small after tolerance, unsafe to support, obstructed, or lack a valid insertion and removal path.")
+                failureMessage: reasons.joined(separator: " "))
         }
         return .init(recommendation: best, alternatives: Array(valid.dropFirst().prefix(4)),
                      evaluations: evaluations, failureMessage: nil)
@@ -266,18 +319,152 @@ enum PlacementEngine {
         shelf: ShelfState,
         configuration: PlacementToleranceConfiguration
     ) -> PackageDimensions {
-        let confidence = min(shelf.scanQuality.confidence, package.metadata.weightKG == nil ? 0.7 : 1)
+        let confidence = shelf.scanQuality.confidence
         let multiplier = confidence < 0.75 ? configuration.lowConfidenceMultiplier : 1
         func axis(_ measured: Double, _ explicit: Double) -> Double {
             let inferred = (configuration.minimumLinearToleranceCM + measured * configuration.percentageTolerance) * multiplier
             // Explicit scan uncertainty replaces inferred uncertainty; clearance is added exactly once.
-            return measured + max(explicit, inferred) + max(package.metadata.requiredClearanceCM, 0)
+            let uncertainty = explicit.isFinite && explicit >= 0 ? max(explicit, inferred) : inferred
+            return measured + uncertainty + max(package.metadata.requiredClearanceCM, 0)
         }
         return PackageDimensions(
             widthCM: axis(package.dimensions.widthCM, package.measurementUncertaintyCM.widthCM),
             heightCM: axis(package.dimensions.heightCM, package.measurementUncertaintyCM.heightCM),
             depthCM: axis(package.dimensions.depthCM, package.measurementUncertaintyCM.depthCM)
         )
+    }
+
+    static func usableDimensions(of shelf: ShelfState) -> PackageDimensions {
+        let margin = max(shelf.geometry?.placementSafetyMarginCM ?? 0, 0)
+        return PackageDimensions(
+            widthCM: max(0, shelf.boundary.dimensions.widthCM - margin * 2),
+            heightCM: max(0, shelf.boundary.dimensions.heightCM),
+            depthCM: max(0, shelf.boundary.dimensions.depthCM - margin * 2)
+        )
+    }
+
+    private static func validDimensions(_ dimensions: PackageDimensions) -> Bool {
+        [dimensions.widthCM, dimensions.heightCM, dimensions.depthCM].allSatisfy {
+            $0.isFinite && $0 > 0 && $0 <= PlacementWorkflow.maximumDimensionCM
+        }
+    }
+
+    private static func validUncertainty(_ dimensions: PackageDimensions) -> Bool {
+        [dimensions.widthCM, dimensions.heightCM, dimensions.depthCM].allSatisfy {
+            $0.isFinite && $0 >= 0 && $0 <= PlacementWorkflow.maximumDimensionCM
+        }
+    }
+
+    private static func actionableFailureReasons(
+        package: PackagePlacementProfile,
+        shelf: ShelfState,
+        effectiveDimensions: PackageDimensions,
+        orientations: [ProductOrientation],
+        evaluations: [PlacementCandidateEvaluation]
+    ) -> [String] {
+        let rejected = evaluations.filter { $0.result == nil && !$0.rejectionReasons.isEmpty }
+        let minimumRejectionCount = rejected.map { $0.rejectionReasons.count }.min() ?? 0
+        // Explain the candidates closest to succeeding. Invalid generated
+        // origins often have several incidental failures and would otherwise
+        // drown out the actual blocker.
+        let codes = rejected
+            .filter { $0.rejectionReasons.count == minimumRejectionCount }
+            .flatMap(\.rejectionReasons)
+        let available = usableDimensions(of: shelf)
+        let fitsBoundingBox = orientations.contains { orientation in
+            let dimensions = orientation.orientedDimensions
+            return dimensions.widthCM <= available.widthCM + 0.0001 &&
+                dimensions.heightCM <= available.heightCM + 0.0001 &&
+                dimensions.depthCM <= available.depthCM + 0.0001
+        }
+        var counts = Dictionary(grouping: codes, by: { $0 }).mapValues(\.count)
+        if fitsBoundingBox,
+           (shelf.geometry == nil || evaluations.contains(where: {
+               !$0.rejectionReasons.contains(.outsideBoundary)
+           })) {
+            counts.removeValue(forKey: .outsideBoundary)
+            if counts.isEmpty {
+                let nonBoundaryCodes = rejected.flatMap(\.rejectionReasons).filter { $0 != .outsideBoundary }
+                counts = Dictionary(grouping: nonBoundaryCodes, by: { $0 }).mapValues(\.count)
+            }
+        }
+        var messages: [(PlacementRejectionCode, String)] = []
+
+        if counts[.outsideBoundary] != nil {
+            if !fitsBoundingBox {
+                let closest = orientations.min { lhs, rhs in
+                    overflow(lhs.orientedDimensions, available) < overflow(rhs.orientedDimensions, available)
+                }?.orientedDimensions ?? effectiveDimensions
+                let rotationNote = package.metadata.mayRotateAutomatically
+                    ? "" : " Automatic rotation is not permitted for this product."
+                messages.append((.outsideBoundary,
+                    "Product requires \(dimensionText(closest)) after uncertainty and clearance; selected usable space is \(dimensionText(available)).\(rotationNote)"))
+            } else {
+                messages.append((.outsideBoundary,
+                    "The product's rectangular footprint does not fit inside the approved boundary and safety margin."))
+            }
+        }
+        if counts[.noInsertionPath] != nil {
+            messages.append((.noInsertionPath,
+                "The product fits inside the space but cannot pass through the opening on the supported straight insertion path."))
+        }
+        let openingObstacle = shelf.obstacles.contains { [.door, .lip].contains($0.kind) }
+        if counts[.collision] != nil && !openingObstacle {
+            let message: String
+            if !shelf.products.isEmpty {
+                message = "The selected area contains recorded occupancy that blocks all candidates."
+            } else if !shelf.obstacles.isEmpty {
+                message = "A recorded divider, door, lip, or other obstacle blocks all candidates."
+            } else {
+                message = "Recorded geometry blocks all candidates."
+            }
+            messages.append((.collision, message))
+        }
+        if counts[.weightLimit] != nil {
+            let limit = shelf.compartments.compactMap(\.ratedWeightKG).min() ?? shelf.ratedWeightKG
+            let suffix = limit.map { " The applicable limit is \($0.formatted(.number.precision(.fractionLength(1)))) kg." } ?? ""
+            messages.append((.weightLimit,
+                "The entered \(package.weightKG.formatted(.number.precision(.fractionLength(1)))) kg weight exceeds a known load or support limit.\(suffix)"))
+        }
+        if counts[.insufficientSupport] != nil || counts[.unstable] != nil {
+            messages.append((.insufficientSupport,
+                "No candidate has enough verified support area with its centre of mass supported."))
+        }
+        if counts[.stackingRule] != nil {
+            messages.append((.stackingRule,
+                "The remaining candidates violate the product or supporting item's stacking rules."))
+        }
+        if counts[.criticalProductBlocked] != nil || counts[.noRemovalPath] != nil {
+            messages.append((.criticalProductBlocked,
+                "Every remaining candidate would block safe access to a recorded product."))
+        }
+
+        let priority: [PlacementRejectionCode] = [
+            .outsideBoundary, .collision, .noInsertionPath, .weightLimit,
+            .insufficientSupport, .stackingRule, .criticalProductBlocked
+        ]
+        let ordered = messages.sorted { first, second in
+            let firstIndex = priority.firstIndex(of: first.0) ?? priority.count
+            let secondIndex = priority.firstIndex(of: second.0) ?? priority.count
+            if firstIndex != secondIndex { return firstIndex < secondIndex }
+            return (counts[first.0] ?? 0) > (counts[second.0] ?? 0)
+        }.map(\.1)
+        return Array(ordered.prefix(3)).isEmpty
+            ? ["Review the permitted orientation, verified support, entered weight, and opening access; none of the current candidates satisfies every safety rule."]
+            : Array(ordered.prefix(3))
+    }
+
+    private static func overflow(_ product: PackageDimensions, _ available: PackageDimensions) -> Double {
+        max(product.widthCM - available.widthCM, 0) +
+            max(product.heightCM - available.heightCM, 0) +
+            max(product.depthCM - available.depthCM, 0)
+    }
+
+    private static func dimensionText(_ dimensions: PackageDimensions) -> String {
+        let format: (Double) -> String = { value in
+            value.formatted(.number.precision(.fractionLength(1)))
+        }
+        return "\(format(dimensions.widthCM)) × \(format(dimensions.heightCM)) × \(format(dimensions.depthCM)) cm (W × H × D)"
     }
 
     private static func allowedOrientations(
@@ -710,7 +897,15 @@ private func containsShelfGeometry(
         pointInPolygon($0, polygon: polygon)
             && distanceToPolygonBoundary($0, polygon: polygon) + 0.0001 >= margin
     }
-    guard insideOuter else { return false }
+    let crossesConcaveBoundary = corners.indices.contains { rectangleIndex in
+        polygon.indices.contains { polygonIndex in
+            segmentsCross(
+                corners[rectangleIndex], corners[(rectangleIndex + 1) % corners.count],
+                polygon[polygonIndex], polygon[(polygonIndex + 1) % polygon.count]
+            )
+        }
+    }
+    guard insideOuter, !crossesConcaveBoundary else { return false }
     let exclusions = shelf.geometry?.excludedRegions?.map {
         $0.map { SIMD2($0.x, $0.z) }
     } ?? []

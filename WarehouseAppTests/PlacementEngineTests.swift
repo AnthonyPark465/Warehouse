@@ -83,6 +83,8 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         )
         XCTAssertNil(result.recommendation)
         XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.outsideBoundary))
+        XCTAssertTrue(result.failureMessage?.contains("Product requires") == true)
+        XCTAssertFalse(result.failureMessage?.contains("No valid placement") == true)
     }
 
     func testRotationMakesProductFit() {
@@ -107,6 +109,19 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
             shelf: shelf(width: 25, height: 50, depth: 15)
         )
         XCTAssertNil(result.recommendation)
+    }
+
+    func testProhibitedYawExplainsThatRotationIsUnavailable() {
+        var rules = metadata()
+        rules.mayRotateAutomatically = false
+        rules.mustRemainUpright = true
+        let result = PlacementEngine.calculate(
+            package: package(dimensions: .init(widthCM: 35, heightCM: 10, depthCM: 20), metadata: rules),
+            shelf: shelf(width: 25, height: 50, depth: 40)
+        )
+
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.failureMessage?.contains("rotation is not permitted") == true)
     }
 
     func testUprightOnlyProductNeverUsesSideAsRestingFace() {
@@ -138,6 +153,10 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         )
         XCTAssertNil(result.recommendation)
         XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.collision))
+        XCTAssertTrue(
+            result.failureMessage?.contains("obstacle") == true,
+            result.failureMessage ?? "Missing failure message"
+        )
     }
 
     func testFrontLipCanBlockInsertionEvenWhenRearVolumeFits() {
@@ -149,6 +168,7 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         let result = PlacementEngine.calculate(package: package(), shelf: state)
         XCTAssertNil(result.recommendation)
         XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.noInsertionPath))
+        XCTAssertTrue(result.failureMessage?.contains("cannot pass through the opening") == true)
     }
 
     func testLowConfidenceScanRefusesPrecision() {
@@ -257,6 +277,7 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         )
         XCTAssertNil(result.recommendation)
         XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.insufficientSupport))
+        XCTAssertTrue(result.failureMessage?.contains("verified support area") == true)
     }
 
     func testUnsupportedCentreIsRejected() {
@@ -304,6 +325,7 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         let result = PlacementEngine.calculate(package: package(weight: 5, metadata: rules), shelf: state)
         XCTAssertNil(result.recommendation)
         XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.weightLimit))
+        XCTAssertTrue(result.failureMessage?.contains("entered 5.0 kg weight") == true)
     }
 
     func testCriticalRearProductCannotBeBlocked() {
@@ -326,9 +348,90 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
     }
 
     func testUnknownWeightRejectsAutomaticPlacement() {
-        let result = PlacementEngine.calculate(package: package(metadata: .conservative), shelf: shelf())
+        let result = PlacementEngine.calculate(package: package(weight: .nan), shelf: shelf())
         XCTAssertNil(result.recommendation)
         XCTAssertEqual(result.failureMessage, "Enter a finite positive product weight before automatic placement.")
+    }
+
+    func testCalculationUsesEditedProfileWeightInsteadOfSavedMetadataWeight() throws {
+        var savedMetadata = metadata()
+        savedMetadata.weightKG = 50
+        let editedProfile = package(weight: 5, metadata: savedMetadata)
+        let result = PlacementEngine.calculate(
+            package: editedProfile,
+            shelf: shelf(width: 60, height: 60, depth: 60, ratedWeight: 10)
+        )
+
+        let recommendation = try XCTUnwrap(result.recommendation)
+        let confirmed = try ShelfStateOperations.confirming(
+            result: recommendation, package: editedProfile,
+            in: shelf(width: 60, height: 60, depth: 60, ratedWeight: 10)
+        )
+        XCTAssertEqual(confirmed.products.first?.weightKG, 5)
+    }
+
+    func testAllowancesAreAppliedExactlyOnce() {
+        var rules = metadata()
+        rules.requiredClearanceCM = 2
+        let product = PackagePlacementProfile(
+            productId: "allowances",
+            dimensions: .init(widthCM: 10, heightCM: 10, depthCM: 10),
+            weightKG: 1,
+            demandVelocity: 0.5,
+            metadata: rules,
+            measurementUncertaintyCM: .init(widthCM: 1, heightCM: 1, depthCM: 1)
+        )
+        let effective = PlacementEngine.effectiveDimensions(
+            package: product, shelf: shelf(), configuration: .warehouse
+        )
+
+        XCTAssertEqual(effective, .init(widthCM: 13, heightCM: 13, depthCM: 13))
+        XCTAssertNotNil(PlacementEngine.calculate(
+            package: product, shelf: shelf(width: 13, height: 13, depth: 13)
+        ).recommendation)
+    }
+
+    func testInvalidCoordinateAxesAreRejectedConservatively() {
+        var state = shelf()
+        state.coordinateSystem = .init(
+            anchorOrigin: .init(0, 0, 0), widthAxis: .init(1, 0, 0),
+            upAxis: .init(1, 0, 0), depthAxis: .init(0, 0, 1)
+        )
+        let result = PlacementEngine.calculate(package: package(), shelf: state)
+
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.staleShelfState))
+    }
+
+    func testReversedOpeningDirectionIsRejected() {
+        var state = shelf()
+        state.primaryFrontDirection = .init(0, 0, -1)
+        let result = PlacementEngine.calculate(package: package(), shelf: state)
+
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.flatMap(\.rejectionReasons).contains(.staleShelfState))
+    }
+
+    func testInvalidDimensionsReturnSpecificDiagnosticWithoutNaNGeometry() {
+        let result = PlacementEngine.calculate(
+            package: package(dimensions: .init(widthCM: .infinity, heightCM: 10, depthCM: 10)),
+            shelf: shelf()
+        )
+
+        XCTAssertNil(result.recommendation)
+        XCTAssertEqual(result.evaluations.first?.rejectionReasons, [.invalidDimensions])
+        XCTAssertTrue(result.failureMessage?.contains("finite positive product dimensions") == true)
+    }
+
+    func testNonFiniteShelfGeometryIsRejectedWithoutCandidates() {
+        var state = shelf()
+        state.boundary = volume("invalid", 0, 0, 0, .nan, 60, 60)
+        state.compartments = []
+        let result = PlacementEngine.calculate(package: package(), shelf: state)
+
+        XCTAssertNil(result.recommendation)
+        XCTAssertEqual(result.evaluations.first?.rejectionReasons, [.staleShelfState])
+        XCTAssertTrue(result.evaluations.allSatisfy { $0.result == nil })
     }
 
     func testHighFrequencyProductPrefersFrontCandidate() {
@@ -431,7 +534,12 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         return value
     }
 
-    private func shelf(width: Double = 60, height: Double = 60, depth: Double = 60) -> ShelfState {
+    private func shelf(
+        width: Double = 60,
+        height: Double = 60,
+        depth: Double = 60,
+        ratedWeight: Double? = 100
+    ) -> ShelfState {
         let bounds = volume("bounds", 0, 0, 0, width, height, depth)
         return ShelfState(
             id: "shelf", label: "Shelf A", barcode: "LOC-A", version: 1,
@@ -439,11 +547,11 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
             coordinateSystem: .init(anchorOrigin: Vector3D(0, 0, 0), widthAxis: Vector3D(1, 0, 0),
                                     upAxis: Vector3D(0, 1, 0), depthAxis: Vector3D(0, 0, 1)),
             primaryFrontDirection: Vector3D(0, 0, 1), secondaryAccessDirections: [],
-            compartments: [.init(id: "main", label: "Main", volume: bounds, ratedWeightKG: 100)],
+            compartments: [.init(id: "main", label: "Main", volume: bounds, ratedWeightKG: ratedWeight)],
             obstacles: [], products: [],
             scanQuality: .init(hasClosedBoundary: true, missingSurfaceCount: 0, trackingDriftCM: 0,
                                confidence: 0.95, capturedAt: .now),
-            ratedWeightKG: 100, updatedAt: .now
+            ratedWeightKG: ratedWeight, updatedAt: .now
         )
     }
 
@@ -473,5 +581,38 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
             volume: volume, weightKG: 5, priority: priority, retrievalFrequency: 0.3,
             stacking: stacking, supportingProductIDs: supportingProductIDs, blockedProductIDs: []
         )
+    }
+}
+
+final class PlacementWorkflowTests: XCTestCase {
+    func testUnsavedScanCannotSilentlyUseOlderSelectedShelf() {
+        XCTAssertThrowsError(try PlacementWorkflow.calculationShelfID(
+            selectedShelfID: "older-shelf",
+            unsavedSpaceID: UUID()
+        )) {
+            XCTAssertEqual($0 as? PlacementWorkflowError, .unsavedStorageScan)
+        }
+    }
+
+    func testSavedSelectedScanIsUsedForCalculation() throws {
+        XCTAssertEqual(try PlacementWorkflow.calculationShelfID(
+            selectedShelfID: "newly-saved-scan",
+            unsavedSpaceID: nil
+        ), "newly-saved-scan")
+    }
+
+    func testLocaleDecimalInputIsParsedStrictly() {
+        let locale = Locale(identifier: "de_DE")
+        XCTAssertEqual(
+            PlacementWorkflow.positiveDecimal("12,5", locale: locale, maximum: 100),
+            12.5
+        )
+        XCTAssertNil(PlacementWorkflow.positiveDecimal("12kg", locale: locale, maximum: 100))
+        XCTAssertNil(PlacementWorkflow.positiveDecimal("NaN", locale: locale, maximum: 100))
+        XCTAssertNil(PlacementWorkflow.positiveDecimal("0", locale: locale, maximum: 100))
+        XCTAssertNil(PlacementWorkflow.positiveDecimal("1000", locale: locale, maximum: 100))
+        XCTAssertNil(PlacementWorkflow.positiveDecimal(
+            "1,2", locale: Locale(identifier: "en_US"), maximum: 100
+        ))
     }
 }

@@ -17,6 +17,7 @@ struct PlacementView: View {
     @State private var spaceSurfaceType: SpaceSurfaceType = .unknown
     @State private var scannedOpenSpace: ScannedSpaceGeometry?
     @State private var spaceSaveMessage: String?
+    @State private var isSavingSpace = false
     @State private var assumedHeight = "40"
     @State private var verification: PlacementVerification?
     @State private var showVerificationScanner = false
@@ -101,10 +102,19 @@ struct PlacementView: View {
             }
             TextField("Weight (kg)", text: $weight)
                 .keyboardType(.decimalPad)
-            if Double(weight).map({ !$0.isFinite || $0 <= 0 }) ?? true {
+            if parsedWeight == nil {
                 Text("A finite positive weight is required for automatic placement.")
                     .font(.caption)
                     .foregroundStyle(.orange)
+            }
+            if let packageProfile {
+                LabeledContent("Raw dimensions", value: dimensionText(packageProfile.dimensions))
+                if let shelf = activePlacementState {
+                    let effective = PlacementEngine.effectiveDimensions(
+                        package: packageProfile, shelf: shelf, configuration: .warehouse
+                    )
+                    LabeledContent("Effective dimensions", value: dimensionText(effective))
+                }
             }
             VStack(alignment: .leading) {
                 Text("Pick frequency")
@@ -122,10 +132,14 @@ struct PlacementView: View {
             } else {
                 Picker("Saved storage area", selection: $selectedShelfID) {
                     ForEach(operationalShelves) { shelf in
-                        Text(shelf.label).tag(shelf.id)
+                        Text(shelfSelectionLabel(shelf)).tag(shelf.id)
                     }
                 }
-                .disabled(placementReservation != nil)
+                .disabled(placementReservation != nil || scannedOpenSpace != nil || isSavingSpace || isCalculating)
+                if let shelf = activePlacementState {
+                    LabeledContent("Calculation uses", value: shelfSelectionLabel(shelf))
+                    LabeledContent("Selected usable space", value: dimensionText(PlacementEngine.usableDimensions(of: shelf)))
+                }
             }
             Button {
                 prepareNewMarkerScan()
@@ -133,6 +147,7 @@ struct PlacementView: View {
             } label: {
                 Label("Measure storage space", systemImage: "scope")
             }
+            .disabled(placementReservation != nil || isCalculating || isSavingSpace)
             Picker("Storage surface", selection: $spaceSurfaceType) {
                 ForEach(SpaceSurfaceType.allCases) { Text($0.title).tag($0) }
             }
@@ -143,18 +158,14 @@ struct PlacementView: View {
                 LabeledContent("Space type", value: space.surfaceType.title)
                 LabeledContent("Height", value: "\(format(space.heightCM)) cm")
                 LabeledContent("Geometry confidence", value: space.confidence.overall.formatted(.percent.precision(.fractionLength(0))))
+                Label("Unsaved scan — placement calculation is disabled until this area is saved and selected.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 Button("Save approved space") {
-                    Task { @MainActor in
-                        do {
-                            try await SpaceRepository.save(space, expectedVersion: nil)
-                            let shelf = try await PlacementRepository.initializeOperationalShelf(from: space)
-                            await loadOperationalShelves(selecting: shelf.id)
-                            spaceSaveMessage = "Space saved and operational occupancy initialized."
-                        } catch {
-                            spaceSaveMessage = error.localizedDescription
-                        }
-                    }
+                    saveApprovedSpace(space)
                 }
+                .disabled(isSavingSpace)
+                if isSavingSpace { ProgressView("Saving and selecting storage area…") }
                 if let spaceSaveMessage { Text(spaceSaveMessage).font(.caption) }
             }
             Text("Select the horizontal base surface, place four wall boundaries, then enter the usable storage height. All displayed dimensions are centimetres.")
@@ -167,7 +178,8 @@ struct PlacementView: View {
     private var recommendationsSection: some View {
         Section("4 · Recommended location") {
             Button("Calculate and reserve placement") { calculatePrecisePlacement() }
-                .disabled(packageProfile == nil || selectedShelfID.isEmpty || isCalculating || placementReservation != nil)
+                .disabled(packageProfile == nil || selectedShelfID.isEmpty || scannedOpenSpace != nil ||
+                          isSavingSpace || isCalculating || placementReservation != nil)
             if placementReservation != nil {
                 Button("Cancel reservation", role: .destructive) { cancelReservation() }
                     .disabled(isPersistingPlacement)
@@ -309,7 +321,6 @@ struct PlacementView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Finish") {
                         showSurfaceScanner = false
-                        calculatePrecisePlacement()
                     }
                     .disabled(markerStage != .complete || scannedOpenSpace == nil)
                 }
@@ -479,6 +490,16 @@ struct PlacementView: View {
         value.formatted(.number.precision(.fractionLength(1)))
     }
 
+    private func dimensionText(_ dimensions: PackageDimensions) -> String {
+        "\(format(dimensions.widthCM)) × \(format(dimensions.heightCM)) × \(format(dimensions.depthCM)) cm (W × H × D)"
+    }
+
+    private var parsedWeight: Double? {
+        PlacementWorkflow.positiveDecimal(
+            weight, maximum: PlacementWorkflow.maximumWeightKG
+        )
+    }
+
     private func dimensionField(_ label: String, text: Binding<String>) -> some View {
         TextField("\(label) (cm)", text: text)
             .keyboardType(.decimalPad)
@@ -486,17 +507,25 @@ struct PlacementView: View {
 
     private var packageProfile: PackagePlacementProfile? {
         guard let product = selectedProduct,
-              let width = Double(width), width > 0,
-              let height = Double(height), height > 0,
-              let depth = Double(depth), depth > 0,
-              let weight = Double(weight), weight > 0
+              let width = PlacementWorkflow.positiveDecimal(
+                width, maximum: PlacementWorkflow.maximumDimensionCM
+              ),
+              let height = PlacementWorkflow.positiveDecimal(
+                height, maximum: PlacementWorkflow.maximumDimensionCM
+              ),
+              let depth = PlacementWorkflow.positiveDecimal(
+                depth, maximum: PlacementWorkflow.maximumDimensionCM
+              ),
+              let weight = parsedWeight
         else { return nil }
         var metadata = product.placementMetadata ?? .conservative
-        metadata.weightKG = metadata.weightKG ?? weight
+        metadata.weightKG = weight
         if product.placementMetadata == nil, product.objectScan?.canBeRotated == true {
+            // Legacy scan records only establish yaw permission. They do not
+            // prove that tipping the product onto another face is safe.
             metadata.mayRotateAutomatically = true
-            metadata.mustRemainUpright = false
-            metadata.permittedRestingFaces = Set(RestingFace.allCases)
+            metadata.mustRemainUpright = true
+            metadata.permittedRestingFaces = [.bottom]
         }
         return PackagePlacementProfile(
             productId: product.id,
@@ -518,10 +547,24 @@ struct PlacementView: View {
         Section("5 · Placement guidance") {
             if isCalculating {
                 HStack { ProgressView(); Text("Calculating collision, support, insertion, and retrieval paths…") }
+            } else if let placement = selectedPrecisePlacement {
+                Label("Reserved safe placement", systemImage: "checkmark.seal.fill")
+                    .foregroundStyle(.green)
+                Text(placement.instructions)
+                ForEach(placement.warnings, id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             } else if let message = preciseCalculation?.failureMessage {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
-                Button("Rescan shelf") { showSurfaceScanner = true }
+                if shouldOfferRescan {
+                    Button("Rescan storage area") {
+                        prepareNewMarkerScan()
+                        showSurfaceScanner = true
+                    }
+                }
             } else {
                 Text("Complete the product and shelf scan to calculate a precise shelf-local placement.")
                     .foregroundStyle(.secondary)
@@ -530,9 +573,15 @@ struct PlacementView: View {
     }
 
     private var validManualSpaceHeight: Double? {
-        guard let value = Double(assumedHeight), value.isFinite,
-              value > 1, value <= 5_000 else { return nil }
+        guard let value = PlacementWorkflow.positiveDecimal(
+            assumedHeight, maximum: PlacementWorkflow.maximumDimensionCM
+        ), value > 1 else { return nil }
         return value
+    }
+
+    private var shouldOfferRescan: Bool {
+        let reasons = preciseCalculation?.evaluations.flatMap(\.rejectionReasons) ?? []
+        return reasons.contains(.lowScanConfidence) || reasons.contains(.staleShelfState)
     }
 
     private var activePlacementState: ShelfState? {
@@ -540,7 +589,12 @@ struct PlacementView: View {
     }
 
     private func prepareNewMarkerScan() {
+        selectedShelfID = ""
         scannedOpenSpace = nil
+        spaceSaveMessage = nil
+        preciseCalculation = nil
+        selectedPrecisePlacement = nil
+        verification = nil
         assumedHeight = ""
         markerDraft = nil
         markerStage = .selectSurface
@@ -632,23 +686,43 @@ struct PlacementView: View {
     }
 
     private func calculatePrecisePlacement() {
-        guard let packageProfile, !selectedShelfID.isEmpty,
-              let userID = auth.user?.uid else { return }
+        guard !isCalculating, placementReservation == nil,
+              let packageProfile, let userID = auth.user?.uid else { return }
+        let requestedShelfID: String
+        do {
+            requestedShelfID = try PlacementWorkflow.calculationShelfID(
+                selectedShelfID: selectedShelfID,
+                unsavedSpaceID: scannedOpenSpace?.id
+            )
+        } catch {
+            placementStatusMessage = error.localizedDescription
+            return
+        }
         isCalculating = true
         placementStatusMessage = nil
         selectedPrecisePlacement = nil
         Task { @MainActor in
             do {
-                guard let shelf = try await PlacementRepository.fetchShelf(id: selectedShelfID) else {
+                guard let shelf = try await PlacementRepository.fetchShelf(id: requestedShelfID) else {
                     throw PlacementPersistenceError.shelfMissing
                 }
+                guard selectedShelfID == requestedShelfID, scannedOpenSpace == nil else {
+                    throw PlacementWorkflowError.selectionChanged
+                }
+                replaceOperationalShelf(shelf)
                 if try await PlacementRepository.fetchActiveReservation(shelfID: shelf.id) != nil {
                     throw PlacementPersistenceError.reservationConflict
                 }
                 let result = await Task.detached(priority: .userInitiated) {
                     PlacementEngine.calculate(package: packageProfile, shelf: shelf)
                 }.value
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else {
+                    isCalculating = false
+                    return
+                }
+                guard selectedShelfID == requestedShelfID, scannedOpenSpace == nil else {
+                    throw PlacementWorkflowError.selectionChanged
+                }
                 preciseCalculation = result
                 guard let recommendation = result.recommendation else {
                     placementStatusMessage = result.failureMessage
@@ -661,7 +735,6 @@ struct PlacementView: View {
                 placementReservation = reservation
                 reservedPackageProfile = packageProfile
                 selectedPrecisePlacement = recommendation
-                replaceOperationalShelf(shelf)
                 // Arm the two-scan check: without this the Verify section can
                 // never leave its "Select a recommendation" state.
                 verification = PlacementVerification(
@@ -672,9 +745,42 @@ struct PlacementView: View {
                 isCalculating = false
             } catch {
                 placementStatusMessage = error.localizedDescription
+                if case .shelfMissing? = error as? PlacementPersistenceError {
+                    operationalShelves.removeAll { $0.id == requestedShelfID }
+                    if selectedShelfID == requestedShelfID { selectedShelfID = "" }
+                }
                 isCalculating = false
             }
         }
+    }
+
+    private func saveApprovedSpace(_ space: ScannedSpaceGeometry) {
+        guard !isSavingSpace, scannedOpenSpace?.id == space.id else { return }
+        isSavingSpace = true
+        spaceSaveMessage = nil
+        Task { @MainActor in
+            do {
+                let savedSpace = try await SpaceRepository.save(space, expectedVersion: nil)
+                let shelf = try await PlacementRepository.initializeOperationalShelf(from: savedSpace)
+                guard scannedOpenSpace?.id == space.id else {
+                    throw PlacementWorkflowError.selectionChanged
+                }
+                replaceOperationalShelf(shelf)
+                selectedShelfID = shelf.id
+                scannedOpenSpace = nil
+                spaceSaveMessage = "Saved and selected \(shelfSelectionLabel(shelf))."
+                placementStatusMessage = "Ready to calculate using \(shelfSelectionLabel(shelf))."
+            } catch {
+                selectedShelfID = ""
+                spaceSaveMessage = error.localizedDescription
+            }
+            isSavingSpace = false
+        }
+    }
+
+    private func shelfSelectionLabel(_ shelf: ShelfState) -> String {
+        let suffix = String(shelf.id.suffix(8))
+        return "\(shelf.label) · \(suffix)"
     }
 
     private func loadOperationalShelves(selecting shelfID: String? = nil) async {
@@ -700,13 +806,22 @@ struct PlacementView: View {
     }
 
     private func confirmPlacement() {
-        guard verification?.stage == .complete,
+        guard !isPersistingPlacement,
+              verification?.stage == .complete,
               let reservation = placementReservation,
               let result = selectedPrecisePlacement,
               let packageProfile = reservedPackageProfile else { return }
         isPersistingPlacement = true
         Task { @MainActor in
             do {
+                guard let currentShelf = try await PlacementRepository.fetchShelf(id: result.shelfID) else {
+                    throw PlacementPersistenceError.shelfMissing
+                }
+                guard currentShelf.version == result.shelfVersion else {
+                    throw PlacementPersistenceError.staleShelf(
+                        expected: result.shelfVersion, actual: currentShelf.version
+                    )
+                }
                 try await PlacementRepository.confirm(
                     reservation: reservation, result: result, package: packageProfile
                 )
