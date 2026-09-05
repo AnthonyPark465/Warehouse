@@ -1,4 +1,14 @@
 name: Warehouse
+# Per-machine overrides live in project.local.yml (gitignored; regen.sh creates
+# an empty one). Put your signing team there so it survives regeneration:
+#   targets:
+#     WarehouseApp:
+#       settings:
+#         base:
+#           DEVELOPMENT_TEAM: YOURTEAMID
+include:
+  - project.local.yml
+
 options:
   bundleIdPrefix: com.tetris
   deploymentTarget:

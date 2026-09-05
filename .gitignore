@@ -9,6 +9,9 @@ xcuserdata/
 # Generated project (regenerate with `xcodegen generate`)
 Warehouse.xcodeproj/
 
+# Per-machine XcodeGen overrides (signing team etc.)
+project.local.yml
+
 # SPM
 .build/
 .swiftpm/
