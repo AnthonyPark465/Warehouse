@@ -12,13 +12,22 @@ struct ScanView: View {
     @State private var foundProduct: Product?
     @State private var unknownBarcode: UnknownBarcode?
     @State private var manualValue = ""
+    @State private var isOnScreen = false
+    @Environment(\.scenePhase) private var scenePhase
+
+    /// The camera runs only while this screen is the one in front: not on
+    /// another tab, behind a product page or the registration sheet, or with
+    /// the app in the background.
+    private var scannerIsActive: Bool {
+        isOnScreen && unknownBarcode == nil && scenePhase == .active
+    }
 
     var body: some View {
         NavigationStack {
             Group {
                 if BarcodeScannerView.isSupported {
                     ZStack(alignment: .bottom) {
-                        BarcodeScannerView { handleScan($0) }
+                        BarcodeScannerView(isActive: scannerIsActive) { handleScan($0) }
                             .ignoresSafeArea(edges: .bottom)
                         if let foundProduct {
                             ScanResultCard(product: foundProduct, batches: store.batches) {
@@ -31,6 +40,8 @@ struct ScanView: View {
                     simulatorFallback
                 }
             }
+            .onAppear { isOnScreen = true }
+            .onDisappear { isOnScreen = false }
             .navigationTitle("Scan")
             .navigationDestination(for: String.self) { productId in
                 ProductDetailView(productId: productId)
@@ -64,8 +75,7 @@ struct ScanView: View {
     private func handleScan(_ value: String) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        // The live scanner keeps running behind the registration sheet;
-        // swapping the sheet's item while presented breaks the presentation.
+        // Swapping the sheet's item while presented breaks the presentation.
         guard unknownBarcode == nil else { return }
         if let product = store.products.first(where: { $0.barcode == trimmed }) {
             foundProduct = product

@@ -105,6 +105,7 @@ private struct AppleObjectCaptureView: View {
     @State private var shotsTaken = 0
     @State private var candidate: ObjectScanCapture?
     @State private var isReconstructing = false
+    @State private var observationTask: Task<Void, Never>?
     @State private var reconstructionProgress = 0.0
     @State private var errorMessage: String?
 
@@ -132,6 +133,8 @@ private struct AppleObjectCaptureView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
+                        // Also stops a reconstruction that is already running.
+                        observationTask?.cancel()
                         session?.cancel()
                         removeCaptureFiles()
                         dismiss()
@@ -341,7 +344,8 @@ private struct AppleObjectCaptureView: View {
 
     @MainActor
     private func observe(_ observedSession: ObjectCaptureSession) {
-        Task {
+        observationTask?.cancel()
+        observationTask = Task {
             async let stateObserver: Void = observeStates(observedSession)
             async let feedbackObserver: Void = observeFeedback(observedSession)
             async let shotObserver: Void = observeShots(observedSession)
@@ -448,6 +452,6 @@ private struct AppleObjectCaptureView: View {
     }
 
     private func format(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(2)))
+        value.formatted(.number.precision(.fractionLength(1)))
     }
 }

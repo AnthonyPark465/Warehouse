@@ -23,24 +23,32 @@ struct StorageMarkerScannerView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
-    func makeUIView(context: Context) -> ARView {
-        let view = ARView(frame: .zero)
+    /// Plane detection and the LiDAR mesh are only consulted while a surface
+    /// or wall is being picked. Review and height entry need nothing beyond
+    /// world tracking, so they run without either. Depth maps and mesh
+    /// classification are never read here and are not requested at all.
+    static func configuration(measuring: Bool) -> ARWorldTrackingConfiguration {
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
-        configuration.planeDetection = [.horizontal, .vertical]
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration.frameSemantics.insert(.sceneDepth)
+        if measuring {
+            configuration.planeDetection = [.horizontal, .vertical]
+            if hasLiDAR { configuration.sceneReconstruction = .mesh }
         }
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-            configuration.frameSemantics.insert(.smoothedSceneDepth)
-        }
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
-            configuration.sceneReconstruction = .meshWithClassification
-        } else if Self.hasLiDAR {
-            configuration.sceneReconstruction = .mesh
-        }
+        return configuration
+    }
+
+    func makeUIView(context: Context) -> ARView {
+        let view = ARView(frame: .zero)
+        // The session is configured here; RealityKit must not reconfigure it.
+        view.automaticallyConfigureSession = false
+        // Only unlit markers and lines are drawn over the camera image.
+        view.renderOptions = [
+            .disableMotionBlur, .disableDepthOfField, .disableHDR, .disableCameraGrain,
+            .disableGroundingShadows, .disableAREnvironmentLighting,
+            .disablePersonOcclusion, .disableFaceMesh
+        ]
         view.session.delegate = context.coordinator
-        view.session.run(configuration)
+        view.session.run(Self.configuration(measuring: true))
         context.coordinator.arView = view
 
         let coaching = ARCoachingOverlayView()
@@ -145,6 +153,10 @@ struct StorageMarkerScannerView: UIViewRepresentable {
         private var handledUndoRequestID: Int
         private var handledResetRequestID: Int
         private var handledPreviewRequestID: Int
+        private var sessionIsMeasuring = true
+        private var lastReticleUpdate: TimeInterval = 0
+        private var reticleUpdateIsPending = false
+        private var reticleIsReady = false
 
         init(parent: StorageMarkerScannerView) {
             self.parent = parent
@@ -157,17 +169,23 @@ struct StorageMarkerScannerView: UIViewRepresentable {
         @MainActor
         func update(parent: StorageMarkerScannerView) {
             self.parent = parent
-            if parent.placementRequestID != handledPlacementRequestID {
-                handledPlacementRequestID = parent.placementRequestID
-                performPlacement()
-            }
-            if parent.undoRequestID != handledUndoRequestID {
-                handledUndoRequestID = parent.undoRequestID
-                undo()
-            }
-            if parent.resetRequestID != handledResetRequestID {
-                handledResetRequestID = parent.resetRequestID
-                reset()
+            let placementRequested = parent.placementRequestID != handledPlacementRequestID
+            let undoRequested = parent.undoRequestID != handledUndoRequestID
+            let resetRequested = parent.resetRequestID != handledResetRequestID
+            handledPlacementRequestID = parent.placementRequestID
+            handledUndoRequestID = parent.undoRequestID
+            handledResetRequestID = parent.resetRequestID
+            if placementRequested || undoRequested || resetRequested {
+                // These write the stage, guidance and draft bindings. SwiftUI
+                // drops or delays state written during a representable
+                // update, so run them once this update has finished.
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if placementRequested { self.performPlacement() }
+                    if undoRequested { self.undo() }
+                    if resetRequested { self.reset() }
+                    self.updateSessionConfiguration()
+                }
             }
             if parent.previewRequestID != handledPreviewRequestID {
                 handledPreviewRequestID = parent.previewRequestID
@@ -175,40 +193,88 @@ struct StorageMarkerScannerView: UIViewRepresentable {
             } else if parent.stage == .review {
                 renderPreview(includeHeight: false)
             }
+            updateSessionConfiguration()
         }
 
+        /// Switches plane detection and mesh reconstruction off once all four
+        /// walls are placed, and back on if the worker returns to placing.
+        /// Running without reset options keeps the world origin and anchors.
+        @MainActor
+        private func updateSessionConfiguration() {
+            let measuring = parent.stage == .selectSurface || parent.stage == .placeBoundaries
+            guard measuring != sessionIsMeasuring, let arView else { return }
+            sessionIsMeasuring = measuring
+            arView.session.run(StorageMarkerScannerView.configuration(measuring: measuring))
+        }
+
+        /// Delivered on the main queue for every camera frame. The frame itself
+        /// is never kept: it owns the camera buffers. Base-surface samples are
+        /// averaged into the measurement, so that stage still takes every
+        /// frame; the wall reticle is only a hint and needs far fewer.
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
-            Task { @MainActor [weak self] in self?.updateReticle(frame: frame) }
+            let timestamp = frame.timestamp
+            let interval: TimeInterval
+            switch parent.stage {
+            case .selectSurface: interval = 0
+            case .placeBoundaries: interval = 0.1
+            case .review, .enterHeight, .preview, .complete: interval = 0.5
+            }
+            guard !reticleUpdateIsPending, timestamp - lastReticleUpdate >= interval else { return }
+            lastReticleUpdate = timestamp
+            reticleUpdateIsPending = true
+            let trackingIsNormal: Bool
+            if case .normal = frame.camera.trackingState {
+                trackingIsNormal = true
+            } else {
+                trackingIsNormal = false
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.reticleUpdateIsPending = false
+                self.updateReticle(timestamp: timestamp, trackingIsNormal: trackingIsNormal)
+            }
+        }
+
+        /// Writes a binding only when its value changes, so an unchanged
+        /// reticle does not invalidate the Place screen.
+        @MainActor
+        private func setCanPlace(_ value: Bool) {
+            if parent.canPlace != value { parent.canPlace = value }
         }
 
         @MainActor
-        private func updateReticle(frame: ARFrame) {
+        private func setGuidance(_ value: String) {
+            if parent.guidance != value { parent.guidance = value }
+        }
+
+        @MainActor
+        private func updateReticle(timestamp: TimeInterval, trackingIsNormal: Bool) {
             guard parent.stage == .selectSurface || parent.stage == .placeBoundaries else {
-                parent.canPlace = false
+                setCanPlace(false)
                 return
             }
-            guard case .normal = frame.camera.trackingState else {
+            guard trackingIsNormal else {
                 baseSamples.removeAll()
                 baseCandidate = nil
-                parent.canPlace = false
-                parent.guidance = "AR tracking is limited. Hold still and keep the measured surfaces visible."
+                setCanPlace(false)
+                setGuidance("AR tracking is limited. Hold still and keep the measured surfaces visible.")
                 setReticle(ready: false)
                 return
             }
             if parent.stage == .selectSurface {
-                updateBaseSurfaceCandidate(frame: frame)
+                updateBaseSurfaceCandidate(timestamp: timestamp)
             } else {
                 updateWallReadiness()
             }
         }
 
         @MainActor
-        private func updateBaseSurfaceCandidate(frame: ARFrame) {
+        private func updateBaseSurfaceCandidate(timestamp: TimeInterval) {
             guard let result = horizontalPlaneRaycast(), let plane = result.anchor as? ARPlaneAnchor else {
                 baseSamples.removeAll()
                 baseCandidate = nil
-                parent.canPlace = false
-                parent.guidance = "Aim at the horizontal surface where products will sit."
+                setCanPlace(false)
+                setGuidance("Stand at the front of the storage area, facing in, and aim at the surface where products will sit.")
                 setReticle(ready: false)
                 return
             }
@@ -218,24 +284,24 @@ struct StorageMarkerScannerView: UIViewRepresentable {
             guard deviation <= StorageMarkerGeometryBuilder.maximumHorizontalDeviationDegrees else {
                 baseSamples.removeAll()
                 baseCandidate = nil
-                parent.canPlace = false
-                parent.guidance = "This surface is tilted by \(String(format: "%.1f", deviation))°. Choose a horizontal surface."
+                setCanPlace(false)
+                setGuidance("This surface is tilted by \(String(format: "%.1f", deviation))°. Choose a horizontal surface.")
                 setReticle(ready: false)
                 return
             }
             let sample = BaseRaycastSample(
                 position: worldPosition(of: result), normal: normal, plane: plane,
-                horizontalDeviationDegrees: deviation, timestamp: frame.timestamp
+                horizontalDeviationDegrees: deviation, timestamp: timestamp
             )
             baseSamples.append(sample)
             baseSamples = baseSamples.filter {
-                frame.timestamp - $0.timestamp <= 0.8 && $0.plane.identifier == plane.identifier
+                timestamp - $0.timestamp <= 0.8 && $0.plane.identifier == plane.identifier
             }
             let required = StorageMarkerScannerView.hasLiDAR ? 7 : 10
             guard baseSamples.count >= required else {
                 baseCandidate = nil
-                parent.canPlace = false
-                parent.guidance = "Hold still while the base surface stabilizes (\(baseSamples.count)/\(required))."
+                setCanPlace(false)
+                setGuidance("Hold still while the base surface stabilizes (\(baseSamples.count)/\(required)).")
                 setReticle(ready: false)
                 return
             }
@@ -246,38 +312,38 @@ struct StorageMarkerScannerView: UIViewRepresentable {
             let maximumSpread = StorageMarkerScannerView.hasLiDAR ? 0.01 : 0.015
             guard spread <= maximumSpread else {
                 baseCandidate = nil
-                parent.canPlace = false
-                parent.guidance = "Hold still. The base estimate is moving by \(String(format: "%.1f", spread * 100)) cm."
+                setCanPlace(false)
+                setGuidance("Hold still. The base estimate is moving by \(String(format: "%.1f", spread * 100)) cm.")
                 setReticle(ready: false)
                 return
             }
             baseCandidate = BaseRaycastSample(
                 position: centre, normal: normal, plane: plane,
-                horizontalDeviationDegrees: deviation, timestamp: frame.timestamp
+                horizontalDeviationDegrees: deviation, timestamp: timestamp
             )
             baseConfidence = min(
                 0.62 + min(Double(baseSamples.count) / Double(required * 2), 1) * 0.28
                     + (StorageMarkerScannerView.hasLiDAR ? 0.08 : 0),
                 0.98
             )
-            parent.canPlace = true
-            parent.guidance = "Horizontal storage surface ready. Select this surface."
+            setCanPlace(true)
+            setGuidance("Horizontal storage surface ready. Select this surface.")
             setReticle(ready: true)
         }
 
         @MainActor
         private func updateWallReadiness() {
             if existingVerticalPlaneRaycast() != nil {
-                parent.canPlace = true
-                parent.guidance = "Ready to place boundary \(boundaries.count + 1) of 4 on this wall."
+                setCanPlace(true)
+                setGuidance("Ready to place boundary \(boundaries.count + 1) of 4 on this wall.")
                 setReticle(ready: true)
             } else if StorageMarkerScannerView.hasLiDAR, estimatedWallSeedRaycast() != nil {
-                parent.canPlace = true
-                parent.guidance = "Potential wall detected. Place Boundary to verify the local LiDAR surface."
+                setCanPlace(true)
+                setGuidance("Potential wall detected. Place Boundary to verify the local LiDAR surface.")
                 setReticle(ready: true)
             } else {
-                parent.canPlace = false
-                parent.guidance = "Aim at a wall or vertical limiting surface—not the selected base plane."
+                setCanPlace(false)
+                setGuidance("Aim at a wall or vertical limiting surface—not the selected base plane.")
                 setReticle(ready: false)
             }
         }
@@ -400,20 +466,53 @@ struct StorageMarkerScannerView: UIViewRepresentable {
             let rayDirection = normalized(seed - rayOrigin)
             var localTriangles: [LocalMeshTriangle] = []
             localTriangles.reserveCapacity(512)
+            let seedWorld = SIMD4<Float>(Float(seed.x), Float(seed.y), Float(seed.z), 1)
+            // Slightly wider than the 35 cm limit: this single-precision test
+            // only discards faces; the exact test below decides what is kept.
+            let earlyRejectSquared: Float = 0.36 * 0.36
             for anchor in frame.anchors.compactMap({ $0 as? ARMeshAnchor }) {
+                guard localTriangles.count < 12_000 else { break }
                 let anchorOrigin = SIMD3<Double>(
                     Double(anchor.transform.columns.3.x),
                     Double(anchor.transform.columns.3.y),
                     Double(anchor.transform.columns.3.z)
                 )
                 guard simd_distance(anchorOrigin, seed) <= 1.5 else { continue }
-                let geometry = anchor.geometry
-                for face in 0..<geometry.faces.count where localTriangles.count < 12_000 {
-                    let indices = meshVertexIndices(geometry, face: face)
-                    guard indices.count == 3 else { continue }
-                    let first = worldVertex(geometry, index: indices[0], transform: anchor.transform)
-                    let second = worldVertex(geometry, index: indices[1], transform: anchor.transform)
-                    let third = worldVertex(geometry, index: indices[2], transform: anchor.transform)
+                let faces = anchor.geometry.faces
+                let vertices = anchor.geometry.vertices
+                guard faces.indexCountPerPrimitive == 3 else { continue }
+                let faceBuffer = faces.buffer.contents()
+                let vertexBuffer = vertices.buffer.contents().advanced(by: vertices.offset)
+                let vertexStride = vertices.stride
+                let indicesAreNarrow = faces.bytesPerIndex == MemoryLayout<UInt16>.size
+                let transform = anchor.transform
+                // An anchor transform is rigid, so distance from the seed can be
+                // tested in the anchor's own coordinates. Almost every face
+                // fails, and those are never converted to world coordinates.
+                let seedInAnchor4 = transform.inverse * seedWorld
+                let seedInAnchor = SIMD3<Float>(seedInAnchor4.x, seedInAnchor4.y, seedInAnchor4.z)
+                func vertexIndex(_ position: Int) -> Int {
+                    indicesAreNarrow
+                        ? Int(faceBuffer.load(fromByteOffset: position * 2, as: UInt16.self))
+                        : Int(faceBuffer.load(fromByteOffset: position * 4, as: UInt32.self))
+                }
+                func vertex(_ index: Int) -> SIMD3<Float> {
+                    let pointer = vertexBuffer.advanced(by: vertexStride * index)
+                        .assumingMemoryBound(to: Float.self)
+                    return SIMD3<Float>(pointer[0], pointer[1], pointer[2])
+                }
+                func world(_ local: SIMD3<Float>) -> SIMD3<Double> {
+                    let value = transform * SIMD4(local.x, local.y, local.z, 1)
+                    return SIMD3(Double(value.x), Double(value.y), Double(value.z))
+                }
+                for face in 0..<faces.count {
+                    guard localTriangles.count < 12_000 else { break }
+                    let a = vertex(vertexIndex(face * 3))
+                    let b = vertex(vertexIndex(face * 3 + 1))
+                    let c = vertex(vertexIndex(face * 3 + 2))
+                    guard simd_distance_squared((a + b + c) / 3, seedInAnchor) <= earlyRejectSquared
+                    else { continue }
+                    let first = world(a), second = world(b), third = world(c)
                     let centre = (first + second + third) / 3
                     guard simd_distance(centre, seed) <= 0.35 else { continue }
                     let cross = simd_cross(second - first, third - first)
@@ -626,7 +725,7 @@ struct StorageMarkerScannerView: UIViewRepresentable {
                 basePlaneAnchor = nil
                 parent.markerCount = 0
                 parent.stage = .selectSurface
-                parent.guidance = "Aim at the horizontal surface where products will sit."
+                parent.guidance = "Stand at the front of the storage area, facing in, and aim at the surface where products will sit."
             }
             parent.canPlace = false
         }
@@ -650,7 +749,7 @@ struct StorageMarkerScannerView: UIViewRepresentable {
             parent.canPlace = false
             parent.errorMessage = nil
             parent.stage = .selectSurface
-            parent.guidance = "Aim at the horizontal surface where products will sit."
+            parent.guidance = "Stand at the front of the storage area, facing in, and aim at the surface where products will sit."
         }
 
         @MainActor
@@ -752,6 +851,8 @@ struct StorageMarkerScannerView: UIViewRepresentable {
 
         @MainActor
         private func setReticle(ready: Bool) {
+            guard ready != reticleIsReady else { return }
+            reticleIsReady = ready
             reticle?.layer.borderColor = (ready ? UIColor.systemGreen : UIColor.systemOrange).cgColor
         }
 
@@ -793,31 +894,6 @@ struct StorageMarkerScannerView: UIViewRepresentable {
                 Double(result.worldTransform.columns.1.y),
                 Double(result.worldTransform.columns.1.z)
             )
-        }
-
-        private func meshVertexIndices(_ geometry: ARMeshGeometry, face: Int) -> [UInt32] {
-            let faces = geometry.faces
-            let count = faces.indexCountPerPrimitive
-            return (0..<count).map { corner in
-                let offset = (face * count + corner) * faces.bytesPerIndex
-                let pointer = faces.buffer.contents().advanced(by: offset)
-                if faces.bytesPerIndex == MemoryLayout<UInt16>.size {
-                    return UInt32(pointer.assumingMemoryBound(to: UInt16.self).pointee)
-                }
-                return pointer.assumingMemoryBound(to: UInt32.self).pointee
-            }
-        }
-
-        private func worldVertex(
-            _ geometry: ARMeshGeometry, index: UInt32, transform: simd_float4x4
-        ) -> SIMD3<Double> {
-            let vertices = geometry.vertices
-            let pointer = vertices.buffer.contents().advanced(
-                by: vertices.offset + vertices.stride * Int(index)
-            )
-            let local = pointer.assumingMemoryBound(to: SIMD3<Float>.self).pointee
-            let world = transform * SIMD4(local.x, local.y, local.z, 1)
-            return SIMD3(Double(world.x), Double(world.y), Double(world.z))
         }
 
         private func rayTriangleDistance(

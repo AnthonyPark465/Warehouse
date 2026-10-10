@@ -20,9 +20,12 @@ and watch shelf life.
   tab shows units received per day, per product.
 - **Sorting & grouping** — sort by newest, stock amount, or name; group by
   product type or by shipment.
-- **Object scanning** — measure a product with native ARKit and optional LiDAR
-  inside Add Product, apply configurable measurement tolerance and storage
-  clearance, then review the object and storage bounding box in 3D.
+- **Object measurement** — measure a product from several iPhone LiDAR/depth
+  frames inside Add Product. The pipeline tries to isolate the product from
+  its support and neighbours, reports what evidence a scan lacks, and refuses or
+  qualifies a result it cannot support. Measurements are estimates and are
+  not yet validated against physical ground truth; see
+  [docs/manual-ar-measurement.md](docs/manual-ar-measurement.md).
 
 ## Stack
 

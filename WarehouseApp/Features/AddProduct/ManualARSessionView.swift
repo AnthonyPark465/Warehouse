@@ -25,6 +25,7 @@ struct ManualARSessionView: UIViewRepresentable {
         context.coordinator.handle(
             placementRequestID: state.placementRequestID,
             renderRevision: state.renderRevision,
+            detectedProductRevision: state.detectedProductRevision,
             productScanStartRequestID: state.productScanStartRequestID,
             productScanStopRequestID: state.productScanStopRequestID
         )
@@ -39,6 +40,14 @@ struct ManualARSessionView: UIViewRepresentable {
         private let state: ManualARMeasurementState
         private let previewNode = SCNNode()
         private let measurementGeometryNode = SCNNode()
+        /// Scan results change several times a second; the markers, boundary
+        /// and scan region around them do not. Each has its own node so a new
+        /// result does not rebuild the rest.
+        private let detectedProductNode = SCNNode()
+        private var renderedDetectedProductRevision = -1
+        private var dimensionLabelGeometry: [String: SCNText] = [:]
+        /// Read and written on the main queue only.
+        private var cornerPatchIsNeeded = true
         private var markerAnchors: [ARAnchor] = []
         private var renderedMarkerPositions: [SIMD3<Float>] = []
         private var lastPreviewUpdate: TimeInterval = 0
@@ -47,15 +56,20 @@ struct ManualARSessionView: UIViewRepresentable {
         private var handledProductScanStartRequestID = 0
         private var handledProductScanStopRequestID = 0
         private let fusionConfiguration = LiDARFusionConfiguration.smallObject
-        private var fusion = LiDARVoxelFusionEngine()
-        private var stabilizer = LiDARMeasurementStabilizer()
-        private var stableProductMeasurement: LiDARFusionMeasurement?
-        private var latestProductStatus = ManualProductScanStatus()
-        private var fusionFrameCount = 0
-        private var rejectedOutsideRegionCount = 0
+        /// Confined to `fusionQueue`.
+        private let measurementSession = LiDARMeasurementSession(configuration: .smallObject)
+        private struct ScanState {
+            var isActive = false
+            /// Incremented for every started scan so work queued by an
+            /// earlier scan can never publish into a later one.
+            var generation = 0
+        }
         // Read on the ARKit delegate thread and the fusion queue, written on
-        // the main actor — must be lock-protected, not a plain Bool.
-        private let productScanIsActive = OSAllocatedUnfairLock(initialState: false)
+        // the main actor — must be lock-protected.
+        private let scanState = OSAllocatedUnfairLock(initialState: ScanState())
+        /// Incremented whenever the session's world coordinate system may
+        /// have changed. Delegate callbacks arrive on the main queue.
+        private var coordinateEpoch = 0
         // Corner recognition: rolling reticle patch + current lock (main actor).
         private var cornerLockWindow = ObjectCornerLockWindow()
         private var lockedCorner: ObjectCornerLockWindow.Lock?
@@ -65,6 +79,8 @@ struct ManualARSessionView: UIViewRepresentable {
             label: "com.tetris.warehouse.manual-region-fusion",
             qos: .userInitiated
         )
+        /// Validation recording of the scan in progress. Fusion queue only.
+        private var recorder: LiDARScanRecorder?
 
         init(state: ManualARMeasurementState) {
             self.state = state
@@ -80,6 +96,7 @@ struct ManualARSessionView: UIViewRepresentable {
             view.automaticallyUpdatesLighting = false
             view.preferredFramesPerSecond = 60
             view.scene.rootNode.addChildNode(measurementGeometryNode)
+            view.scene.rootNode.addChildNode(detectedProductNode)
             installPreviewNode(in: view)
 
             guard ARWorldTrackingConfiguration.isSupported else {
@@ -110,6 +127,10 @@ struct ManualARSessionView: UIViewRepresentable {
 
         @MainActor
         func stop() {
+            // Closing the recording must not depend on the view still existing.
+            scanState.withLock { $0.isActive = false }
+            let shown = shownResult()
+            fusionQueue.sync { finishRecording(shown: shown) }
             guard let sceneView else { return }
             markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
             markerAnchors.removeAll()
@@ -123,6 +144,7 @@ struct ManualARSessionView: UIViewRepresentable {
         func handle(
             placementRequestID: Int,
             renderRevision: Int,
+            detectedProductRevision: Int,
             productScanStartRequestID: Int,
             productScanStopRequestID: Int
         ) {
@@ -138,11 +160,18 @@ struct ManualARSessionView: UIViewRepresentable {
             }
             if renderRevision != renderedRevision {
                 renderedRevision = renderRevision
+                renderedDetectedProductRevision = detectedProductRevision
                 rebuildPermanentGeometry()
+                rebuildDetectedProduct()
+            } else if detectedProductRevision != renderedDetectedProductRevision {
+                renderedDetectedProductRevision = detectedProductRevision
+                rebuildDetectedProduct()
             }
             if productScanStopRequestID != handledProductScanStopRequestID {
                 handledProductScanStopRequestID = productScanStopRequestID
-                productScanIsActive.withLock { $0 = false }
+                scanState.withLock { $0.isActive = false }
+                let shown = shownResult()
+                fusionQueue.async { [weak self] in self?.finishRecording(shown: shown) }
             }
             if productScanStartRequestID != handledProductScanStartRequestID {
                 handledProductScanStartRequestID = productScanStartRequestID
@@ -156,28 +185,30 @@ struct ManualARSessionView: UIViewRepresentable {
             // Throttle before crossing to the main actor. Do not capture the
             // ARFrame in the Task because it owns large camera buffers.
             let now = frame.timestamp
-            guard now - lastPreviewUpdate >= 0.1 else { return }
+            guard now - lastPreviewUpdate >= fusionConfiguration.frameIntervalSeconds else {
+                return
+            }
             lastPreviewUpdate = now
             let trackingState = frame.camera.trackingState
-            let shouldIntegrate: Bool
-            if case .normal = trackingState {
-                shouldIntegrate = productScanIsActive.withLock { $0 }
-            } else {
-                shouldIntegrate = false
-            }
-            let scanPoints = shouldIntegrate ? extractMeasurementPoints(from: frame) : []
-            let cornerPatch = extractCornerPatch(from: frame)
+            let scan = scanState.withLock { $0 }
+            // Frames with degraded tracking are still handed to the pipeline,
+            // without points, so it can reject them and decide whether the
+            // evidence gathered so far is still valid.
+            let depthFrame = scan.isActive ? makeDepthFrame(from: frame) : nil
+            // Corners are only recognised while boundary markers are placed.
+            let cornerPatch = cornerPatchIsNeeded ? extractCornerPatch(from: frame) : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                cornerPatchIsNeeded = state.stage == .boundary
                 state.updateTracking(trackingState)
                 let sample = raycastAtCentre()
                 state.updatePreview(sample)
                 updateCornerLock(sample: sample, patch: cornerPatch, timestamp: now)
                 updatePreview(sample)
             }
-            guard !scanPoints.isEmpty else { return }
+            guard let depthFrame else { return }
             fusionQueue.async { [weak self] in
-                self?.integrateProductPoints(scanPoints)
+                self?.integrateProductFrame(depthFrame, generation: scan.generation)
             }
         }
 
@@ -188,8 +219,19 @@ struct ManualARSessionView: UIViewRepresentable {
         }
 
         func sessionWasInterrupted(_ session: ARSession) {
-            Task { @MainActor [weak self] in
-                self?.state.errorMessage = "Measurement was interrupted. Keep the product in view while tracking recovers."
+            // The camera stopped; ARKit may resume with a different world
+            // origin, so everything fused so far is in a stale frame.
+            coordinateEpoch += 1
+            // Delegate callbacks arrive on the main queue. Revoke the scan
+            // here, not in a later task, so Finish cannot be pressed on
+            // evidence from before the interruption.
+            scanState.withLock { $0.isActive = false }
+            MainActor.assumeIsolated {
+                if state.productScanIsActive {
+                    state.handleTrackingReset()
+                } else {
+                    state.errorMessage = "Measurement was interrupted. Verify that every marker is still aligned before continuing."
+                }
             }
         }
 
@@ -229,6 +271,7 @@ struct ManualARSessionView: UIViewRepresentable {
             let options: ARSession.RunOptions = resetTracking
                 ? [.resetTracking, .removeExistingAnchors]
                 : []
+            coordinateEpoch += 1
             sceneView.session.run(makeConfiguration(), options: options)
         }
 
@@ -240,122 +283,165 @@ struct ManualARSessionView: UIViewRepresentable {
                 state.errorMessage = "The scanning region is incomplete. Set the polygon, bottom limit, and top limit again."
                 return
             }
-            productScanIsActive.withLock { $0 = false }
+            scanState.withLock { $0.isActive = false }
+            let recordingHeader = makeRecordingHeader(region: .polygonalPrism(region), seed: seed)
             fusionQueue.sync {
-                fusion.reset()
-                fusion.lockSelection(region: .polygonalPrism(region), seed: seed)
-                stabilizer.reset()
-                stableProductMeasurement = nil
-                latestProductStatus = ManualProductScanStatus()
-                fusionFrameCount = 0
-                rejectedOutsideRegionCount = 0
+                finishRecording(shown: nil)
+                measurementSession.begin(region: .polygonalPrism(region), seed: seed)
+                recorder = recordingHeader.flatMap {
+                    startRecording(header: $0, region: .polygonalPrism(region))
+                }
             }
-            productScanIsActive.withLock { $0 = true }
+            scanState.withLock {
+                $0.generation += 1
+                $0.isActive = true
+            }
         }
 
-        private func integrateProductPoints(_ points: [SIMD3<Float>]) {
-            guard productScanIsActive.withLock({ $0 }) else { return }
-            let result = fusion.integrate(framePoints: points)
-            fusionFrameCount += 1
-            rejectedOutsideRegionCount += result.rejectedOutsideVolumeCount
-
-            guard fusionFrameCount.isMultiple(of: 4),
-                  let measurement = fusion.measurement()
-            else {
-                var progress = latestProductStatus
-                progress.updateCaptureProgress(
-                    message: "Collecting product surfaces inside the scanning region…",
-                    integratedFrameCount: fusionFrameCount,
-                    capturedPointCount: fusion.voxelCount,
-                    rejectedOutsideRegionCount: rejectedOutsideRegionCount
-                )
-                publishProductStatus(progress)
+        private func integrateProductFrame(_ frame: LiDARDepthFrame, generation: Int) {
+            guard scanState.withLock({ $0.isActive && $0.generation == generation }) else {
                 return
             }
-
-            let decision = stabilizer.consider(measurement.dimensionsCM)
-            let dimensions: ObjectDimensions?
-            let isStable: Bool
-            let message: String
-            switch decision {
-            case .warmingUp:
-                dimensions = measurement.dimensionsCM
-                isStable = false
-                message = "Product detected. Scan more sides while dimensions stabilise."
-            case .accepted(let accepted):
-                dimensions = accepted
-                isStable = true
-                stableProductMeasurement = measurement
-                message = measurement.touchesRegionBoundary
-                    ? "The detected product touches the scanning limit. Expand the region."
-                    : "Detected product is stable. Scan the top and any unseen side."
-            case .frozen(let frozen, let reason):
-                dimensions = frozen
-                isStable = false
-                message = reason
+            record(frame)
+            let report = measurementSession.process(frame)
+            if report.frame?.evidenceWasInvalidated == true {
+                // The pipeline found the coordinate system unreliable
+                // (relocalization, prolonged limited tracking, a pose jump).
+                scanState.withLock {
+                    if $0.generation == generation { $0.isActive = false }
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.state.handleTrackingReset()
+                }
+                return
             }
-
-            let displayMeasurement = stableProductMeasurement ?? measurement
-            let confidence = productConfidence(
-                measurement: displayMeasurement,
-                dimensionsAreStable: isStable
-            )
-            // A complete orange product box means fusion has already retained
-            // enough repeated, connected surface points to form valid bounds.
-            // Let the user finish at that point; stability still improves the
-            // result but is no longer required to enable the button.
-            let canFinish = ManualProductScanStatus.finishIsAvailable(
-                dimensions: dimensions,
-                stablePointCount: displayMeasurement.fusedVoxelCount,
-                boundingBoxCornersWorld: displayMeasurement.boundingBoxCornersWorld
-            )
-            publishProductStatus(ManualProductScanStatus(
-                message: message,
-                integratedFrameCount: fusionFrameCount,
-                capturedPointCount: fusion.voxelCount,
-                stablePointCount: displayMeasurement.fusedVoxelCount,
-                rejectedOutsideRegionCount: rejectedOutsideRegionCount,
-                detectedDimensionsCM: dimensions,
-                detectedWorldPoints: displayMeasurement.worldPointsInMetres,
-                centredDisplayPoints: displayMeasurement.centredPointsInMetres,
-                boundingBoxCornersWorld: displayMeasurement.boundingBoxCornersWorld,
-                confidence: confidence,
-                dimensionsAreStable: isStable,
-                touchesBoundary: displayMeasurement.touchesRegionBoundary,
-                canFinish: canFinish
-            ))
-        }
-
-        private func productConfidence(
-            measurement: LiDARFusionMeasurement,
-            dimensionsAreStable: Bool
-        ) -> Double {
-            let frameScore = min(
-                Double(fusionFrameCount)
-                    / Double(fusionConfiguration.minimumFusedFrameCount * 2),
-                1
-            )
-            let voxelScore = min(
-                Double(measurement.fusedVoxelCount)
-                    / Double(fusionConfiguration.minimumStableVoxelCount * 6),
-                1
-            )
-            let observationScore = min(measurement.averageObservationsPerVoxel / 8, 1)
-            let stabilityScore = dimensionsAreStable ? 1.0 : 0.25
-            return min(
-                frameScore * 0.25
-                    + voxelScore * 0.25
-                    + observationScore * 0.20
-                    + stabilityScore * 0.30,
-                0.95
-            )
-        }
-
-        private func publishProductStatus(_ status: ManualProductScanStatus) {
-            latestProductStatus = status
+            let status = ManualProductScanStatus(report: report)
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.productScanIsActive.withLock({ $0 }) else { return }
+                guard let self,
+                      self.scanState.withLock({ $0.isActive && $0.generation == generation })
+                else { return }
                 self.state.updateProductScan(status)
+            }
+        }
+
+        // MARK: Validation recording
+
+        /// Nil unless recording was switched on (debug builds only).
+        @MainActor
+        private func makeRecordingHeader(
+            region: LiDARSpatialRegion,
+            seed: SIMD3<Float>
+        ) -> LiDARScanRecording.Header? {
+            #if DEBUG
+            let defaults = UserDefaults.standard
+            guard defaults.bool(forKey: LiDARScanRecordingSettings.enabledKey) else { return nil }
+            var systemInfo = utsname()
+            uname(&systemInfo)
+            let machine = withUnsafeBytes(of: &systemInfo.machine) { bytes in
+                String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            return LiDARScanRecording.Header(
+                label: defaults.string(forKey: LiDARScanRecordingSettings.productKey) ?? "",
+                step: defaults.string(forKey: LiDARScanRecordingSettings.stepKey) ?? "",
+                createdAt: ISO8601DateFormatter().string(from: Date()),
+                deviceModel: machine,
+                systemVersion: UIDevice.current.systemVersion,
+                region: LiDARScanRecording.Region(region),
+                seed: [seed.x, seed.y, seed.z]
+            )
+            #else
+            return nil
+            #endif
+        }
+
+        /// Fusion queue.
+        private func startRecording(
+            header: LiDARScanRecording.Header,
+            region: LiDARSpatialRegion
+        ) -> LiDARScanRecorder? {
+            let directory = LiDARScanRecordingSettings.directory
+            let date = Date()
+            do {
+                try FileManager.default.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: true
+                )
+                // A second scan within the same second gets its own name.
+                var attempt = 0
+                var url: URL
+                repeat {
+                    url = directory.appendingPathComponent(LiDARScanRecordingSettings.fileName(
+                        product: header.label,
+                        step: header.step,
+                        date: date,
+                        attempt: attempt
+                    ))
+                    attempt += 1
+                } while FileManager.default.fileExists(atPath: url.path) && attempt < 100
+                return try LiDARScanRecorder(
+                    url: url,
+                    header: header,
+                    region: region,
+                    margin: fusionConfiguration.cropMargin + 2 * fusionConfiguration.voxelSize
+                )
+            } catch {
+                noteRecording("Scan recording could not be started: \(error.localizedDescription)")
+                return nil
+            }
+        }
+
+        /// Fusion queue.
+        private func record(_ frame: LiDARDepthFrame) {
+            guard let recorder else { return }
+            guard !recorder.didFail,
+                  recorder.frameCount < LiDARScanRecordingSettings.maximumFrameCount
+            else {
+                if recorder.didFail {
+                    finishRecording(shown: nil)
+                    return
+                }
+                recorder.finish(result: nil)
+                try? FileManager.default.removeItem(at: recorder.url)
+                self.recorder = nil
+                noteRecording("Scan recording was dropped: the scan ran longer than five minutes.")
+                return
+            }
+            recorder.append(frame)
+        }
+
+        /// What the screen shows now, to store beside the pipeline's report.
+        @MainActor
+        private func shownResult() -> (dimensions: ObjectDimensions?, status: String) {
+            (
+                state.productScanStatus.detectedDimensionsCM,
+                state.productScanStatus.decision.status.rawValue
+            )
+        }
+
+        /// Fusion queue. Closes the recording with the app's own result.
+        private func finishRecording(shown: (dimensions: ObjectDimensions?, status: String)?) {
+            guard let recorder else { return }
+            self.recorder = nil
+            let report = measurementSession.report
+            let isComplete = recorder.finish(result: LiDARScanRecording.LiveResult(
+                reportedDimensionsCM: report.reportedDimensionsCM,
+                decision: report.decision,
+                evidence: report.evidence,
+                shownDimensionsCM: shown?.dimensions,
+                shownStatus: shown?.status
+            ))
+            guard isComplete else {
+                // An incomplete file would be replayed as a shorter scan.
+                try? FileManager.default.removeItem(at: recorder.url)
+                noteRecording("Scan recording failed and was deleted. Check free storage.")
+                return
+            }
+            noteRecording("Saved \(recorder.url.lastPathComponent) (\(recorder.frameCount) frames)")
+        }
+
+        private func noteRecording(_ message: String) {
+            DispatchQueue.main.async { [weak self] in
+                self?.state.noteRecording(message)
             }
         }
 
@@ -394,19 +480,13 @@ struct ManualARSessionView: UIViewRepresentable {
             let centreY = height / 2
             var points: [SIMD3<Float>] = []
             points.reserveCapacity(240)
+            let projection = ARDepthProjection(frame: frame, depthWidth: width, depthHeight: height)
             for y in stride(from: centreY - 14, through: centreY + 14, by: 2) {
                 for x in stride(from: centreX - 14, through: centreX + 14, by: 2) {
                     guard x >= 0, x < width, y >= 0, y < height else { continue }
                     let depth = depths[y * rowStride + x]
                     guard depth.isFinite, depth >= 0.10, depth <= 3 else { continue }
-                    points.append(worldPoint(
-                        x: x,
-                        y: y,
-                        depth: depth,
-                        depthWidth: width,
-                        depthHeight: height,
-                        frame: frame
-                    ))
+                    points.append(projection.worldPoint(x: x, y: y, depth: depth))
                 }
             }
             guard !points.isEmpty else { return nil }
@@ -475,19 +555,44 @@ struct ManualARSessionView: UIViewRepresentable {
             )
         }
 
-        private func extractMeasurementPoints(from frame: ARFrame) -> [SIMD3<Float>] {
-            if let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth {
-                return extractDepthPoints(depthData, frame: frame)
+        private func trackingQuality(
+            _ state: ARCamera.TrackingState
+        ) -> LiDARTrackingQuality {
+            switch state {
+            case .normal: .normal
+            case .notAvailable: .notAvailable
+            case .limited(.relocalizing): .relocalizing
+            case .limited: .limited
             }
-            // Non-LiDAR fallback: feature points remain spatially filtered by
-            // the same polygonal prism before entering fusion.
-            return frame.rawFeaturePoints.map { Array($0.points) } ?? []
+        }
+
+        private func makeDepthFrame(from frame: ARFrame) -> LiDARDepthFrame {
+            let camera = frame.camera.transform.columns.3
+            var depthFrame = LiDARDepthFrame(
+                points: [],
+                timestamp: frame.timestamp,
+                tracking: trackingQuality(frame.camera.trackingState),
+                coordinateEpoch: coordinateEpoch,
+                cameraPosition: SIMD3<Float>(camera.x, camera.y, camera.z)
+            )
+            guard depthFrame.tracking == .normal else { return depthFrame }
+            if let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth {
+                depthFrame.source = .sceneDepth
+                extractDepthPoints(depthData, frame: frame, into: &depthFrame)
+            } else {
+                // Non-LiDAR fallback: feature points remain spatially filtered
+                // by the same polygonal prism before entering fusion.
+                depthFrame.source = .featurePoints
+                depthFrame.points = frame.rawFeaturePoints.map { Array($0.points) } ?? []
+            }
+            return depthFrame
         }
 
         private func extractDepthPoints(
             _ depthData: ARDepthData,
-            frame: ARFrame
-        ) -> [SIMD3<Float>] {
+            frame: ARFrame,
+            into depthFrame: inout LiDARDepthFrame
+        ) {
             let depthMap = depthData.depthMap
             let confidenceMap = depthData.confidenceMap
             CVPixelBufferLockBaseAddress(depthMap, .readOnly)
@@ -500,7 +605,7 @@ struct ManualARSessionView: UIViewRepresentable {
                     CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
                 }
             }
-            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return [] }
+            guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return }
             let width = CVPixelBufferGetWidth(depthMap)
             let height = CVPixelBufferGetHeight(depthMap)
             let depthStride = CVPixelBufferGetBytesPerRow(depthMap)
@@ -510,28 +615,32 @@ struct ManualARSessionView: UIViewRepresentable {
                 .flatMap(CVPixelBufferGetBaseAddress)?
                 .assumingMemoryBound(to: UInt8.self)
             let confidenceStride = confidenceMap.map(CVPixelBufferGetBytesPerRow) ?? 0
+            let pixelStride = max(1, fusionConfiguration.depthPixelStride)
             var points: [SIMD3<Float>] = []
-            points.reserveCapacity(width * height / 4)
-            for y in stride(from: 0, to: height, by: 2) {
-                for x in stride(from: 0, to: width, by: 2) {
+            points.reserveCapacity(width * height / (pixelStride * pixelStride))
+            let projection = ARDepthProjection(frame: frame, depthWidth: width, depthHeight: height)
+            for y in stride(from: 0, to: height, by: pixelStride) {
+                for x in stride(from: 0, to: width, by: pixelStride) {
                     let depth = depths[y * depthStride + x]
-                    guard depth.isFinite, depth >= 0.10, depth <= 5 else { continue }
-                    if let confidence,
-                       confidence[y * confidenceStride + x]
-                        < ARConfidenceLevel.medium.rawValue {
-                        continue
-                    }
-                    points.append(worldPoint(
-                        x: x,
-                        y: y,
+                    depthFrame.examinedSampleCount += 1
+                    switch LiDARDepthSampleFilter.classify(
                         depth: depth,
-                        depthWidth: width,
-                        depthHeight: height,
-                        frame: frame
-                    ))
+                        confidenceLevel: confidence.map { Int($0[y * confidenceStride + x]) },
+                        configuration: fusionConfiguration
+                    ) {
+                    case .outOfRange:
+                        depthFrame.outOfRangeSampleCount += 1
+                        continue
+                    case .lowConfidence:
+                        depthFrame.lowConfidenceSampleCount += 1
+                        continue
+                    case .accepted(let isHighConfidence):
+                        if isHighConfidence { depthFrame.highConfidenceSampleCount += 1 }
+                    }
+                    points.append(projection.worldPoint(x: x, y: y, depth: depth))
                 }
             }
-            return points
+            depthFrame.points = points
         }
 
         private func worldPoint(
@@ -705,7 +814,9 @@ struct ManualARSessionView: UIViewRepresentable {
                     let depth = depths[y * stride + x]
                     let level = confidence.map { $0[y * confidenceStride + x] }
                         ?? minimumConfidence
-                    guard depth.isFinite, depth >= 0.10, depth <= 5,
+                    guard depth.isFinite,
+                          depth >= fusionConfiguration.minimumDepthMetres,
+                          depth <= fusionConfiguration.maximumDepthMetres,
                           level >= minimumConfidence
                     else { continue }
                     candidates.append((depth, x, y, level))
@@ -849,6 +960,11 @@ struct ManualARSessionView: UIViewRepresentable {
             if state.productScanRegion != nil {
                 addScanningPrism()
             }
+        }
+
+        @MainActor
+        private func rebuildDetectedProduct() {
+            detectedProductNode.childNodes.forEach { $0.removeFromParentNode() }
             addDetectedProduct()
         }
 
@@ -866,7 +982,8 @@ struct ManualARSessionView: UIViewRepresentable {
         private func addLine(
             from start: SIMD3<Float>,
             to end: SIMD3<Float>,
-            color: UIColor
+            color: UIColor,
+            in parent: SCNNode? = nil
         ) {
             let vector = end - start
             let length = simd_length(vector)
@@ -878,7 +995,7 @@ struct ManualARSessionView: UIViewRepresentable {
                 from: SIMD3<Float>(0, 1, 0),
                 to: simd_normalize(vector)
             )
-            measurementGeometryNode.addChildNode(line)
+            (parent ?? measurementGeometryNode).addChildNode(line)
         }
 
         @MainActor
@@ -965,7 +1082,7 @@ struct ManualARSessionView: UIViewRepresentable {
                 geometry.firstMaterial = material(
                     color: UIColor.systemGreen.withAlphaComponent(0.9)
                 )
-                measurementGeometryNode.addChildNode(SCNNode(geometry: geometry))
+                detectedProductNode.addChildNode(SCNNode(geometry: geometry))
             }
 
             let corners = status.boundingBoxCornersWorld
@@ -979,7 +1096,8 @@ struct ManualARSessionView: UIViewRepresentable {
                 addLine(
                     from: corners[$0.0],
                     to: corners[$0.1],
-                    color: .systemOrange
+                    color: .systemOrange,
+                    in: detectedProductNode
                 )
             }
             if let dimensions = status.detectedDimensionsCM {
@@ -987,15 +1105,15 @@ struct ManualARSessionView: UIViewRepresentable {
                     simd_distance(corners[0], corners[1])
                     >= simd_distance(corners[1], corners[2])
                 addDimensionLabel(
-                    "\(firstHorizontalIsLength ? "Length" : "Width"): \((firstHorizontalIsLength ? dimensions.length : dimensions.width).formatted(.number.precision(.fractionLength(2)))) cm",
+                    "\(firstHorizontalIsLength ? "Length" : "Width"): \((firstHorizontalIsLength ? dimensions.length : dimensions.width).formatted(.number.precision(.fractionLength(1)))) cm",
                     at: (corners[0] + corners[1]) / 2
                 )
                 addDimensionLabel(
-                    "\(firstHorizontalIsLength ? "Width" : "Length"): \((firstHorizontalIsLength ? dimensions.width : dimensions.length).formatted(.number.precision(.fractionLength(2)))) cm",
+                    "\(firstHorizontalIsLength ? "Width" : "Length"): \((firstHorizontalIsLength ? dimensions.width : dimensions.length).formatted(.number.precision(.fractionLength(1)))) cm",
                     at: (corners[1] + corners[2]) / 2
                 )
                 addDimensionLabel(
-                    "Height: \(dimensions.height.formatted(.number.precision(.fractionLength(2)))) cm",
+                    "Height: \(dimensions.height.formatted(.number.precision(.fractionLength(1)))) cm",
                     at: (corners[0] + corners[4]) / 2
                 )
             }
@@ -1003,15 +1121,24 @@ struct ManualARSessionView: UIViewRepresentable {
 
         @MainActor
         private func addDimensionLabel(_ text: String, at position: SIMD3<Float>) {
-            let textGeometry = SCNText(string: text, extrusionDepth: 0)
-            textGeometry.font = .systemFont(ofSize: 8, weight: .semibold)
-            textGeometry.flatness = 0.2
-            textGeometry.firstMaterial = material(color: .white)
+            // Text is tessellated when created; a reading shown to one decimal
+            // place repeats across most updates, so its geometry is kept.
+            let textGeometry: SCNText
+            if let cached = dimensionLabelGeometry[text] {
+                textGeometry = cached
+            } else {
+                textGeometry = SCNText(string: text, extrusionDepth: 0)
+                textGeometry.font = .systemFont(ofSize: 8, weight: .semibold)
+                textGeometry.flatness = 0.2
+                textGeometry.firstMaterial = material(color: .white)
+                if dimensionLabelGeometry.count >= 24 { dimensionLabelGeometry.removeAll() }
+                dimensionLabelGeometry[text] = textGeometry
+            }
             let node = SCNNode(geometry: textGeometry)
             node.scale = SCNVector3(0.002, 0.002, 0.002)
             node.simdPosition = position + SIMD3<Float>(0, 0.015, 0)
             node.constraints = [SCNBillboardConstraint()]
-            measurementGeometryNode.addChildNode(node)
+            detectedProductNode.addChildNode(node)
         }
 
         private func makeSphere(radius: CGFloat, color: UIColor) -> SCNNode {

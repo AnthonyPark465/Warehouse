@@ -4,6 +4,8 @@ import VisionKit
 /// Live camera barcode scanner. Only works on a real device —
 /// callers must check `isSupported` and provide a fallback.
 struct BarcodeScannerView: UIViewControllerRepresentable {
+    /// False stops the camera while the scanner is covered or off screen.
+    var isActive = true
     let onScan: (String) -> Void
 
     @MainActor
@@ -19,11 +21,22 @@ struct BarcodeScannerView: UIViewControllerRepresentable {
             isHighlightingEnabled: true
         )
         scanner.delegate = context.coordinator
-        try? scanner.startScanning()
         return scanner
     }
 
-    func updateUIViewController(_ uiViewController: DataScannerViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: DataScannerViewController, context: Context) {
+        if isActive {
+            if !uiViewController.isScanning { try? uiViewController.startScanning() }
+        } else if uiViewController.isScanning {
+            uiViewController.stopScanning()
+        }
+    }
+
+    static func dismantleUIViewController(
+        _ uiViewController: DataScannerViewController, coordinator: Coordinator
+    ) {
+        uiViewController.stopScanning()
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onScan: onScan)

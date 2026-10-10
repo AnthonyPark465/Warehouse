@@ -351,6 +351,144 @@ final class StorageMarkerGeometryTests: XCTestCase {
         XCTAssertTrue(tooTall.evaluations.flatMap(\.rejectionReasons).contains(.outsideBoundary))
     }
 
+    func testWallAlignmentAngleIsTheSmallestTurnThatSquaresTheFootprint() throws {
+        func rectangle(turnedBy degrees: Double) -> [SIMD2<Double>] {
+            let angle = degrees * .pi / 180
+            return [SIMD2(-0.3, -0.2), SIMD2(0.3, -0.2), SIMD2(0.3, 0.2), SIMD2(-0.3, 0.2)].map {
+                SIMD2($0.x * cos(angle) - $0.y * sin(angle), $0.x * sin(angle) + $0.y * cos(angle))
+            }
+        }
+        func degrees(_ polygon: [SIMD2<Double>]) throws -> Double {
+            try XCTUnwrap(StorageMarkerGeometryBuilder.wallAlignmentAngle(of: polygon)) * 180 / .pi
+        }
+
+        XCTAssertEqual(try degrees(rectangle(turnedBy: 0)), 0, accuracy: 0.000_001)
+        XCTAssertEqual(try degrees(rectangle(turnedBy: 17)), 17, accuracy: 0.000_001)
+        XCTAssertEqual(try degrees(rectangle(turnedBy: -30)), -30, accuracy: 0.000_001)
+        // Past 45° the nearer alignment is the other way round.
+        XCTAssertEqual(try degrees(rectangle(turnedBy: 70)), -20, accuracy: 0.000_001)
+        // The order the corners are listed in makes no difference.
+        XCTAssertEqual(try degrees(rectangle(turnedBy: 17).reversed()), 17, accuracy: 0.000_001)
+        XCTAssertNil(StorageMarkerGeometryBuilder.wallAlignmentAngle(of: []))
+    }
+
+    func testAligningToWallsSquaresTheFootprintWithoutMovingItInTheWorld() throws {
+        let captured = try turnedDraft(degrees: 20)
+        let aligned = captured.alignedToWalls(useCorrectedFootprint: true)
+
+        // Every edge of the stored footprint now runs along a local axis.
+        let footprint = try XCTUnwrap(aligned.correctedFootprint2D).map(\.simd)
+        for index in footprint.indices {
+            let edge = footprint[(index + 1) % footprint.count] - footprint[index]
+            XCTAssertEqual(min(abs(edge.x), abs(edge.y)), 0, accuracy: 0.000_001)
+        }
+        // The axes turned by the capture angle and are still a right-handed
+        // horizontal pair.
+        let width = aligned.localXAxisWorld.simd, depth = aligned.localDepthAxisWorld.simd
+        XCTAssertEqual(simd_length(width), 1, accuracy: 0.000_001)
+        XCTAssertEqual(simd_dot(width, depth), 0, accuracy: 0.000_001)
+        XCTAssertEqual(
+            abs(simd_dot(depth, captured.localDepthAxisWorld.simd)),
+            cos(20 * Double.pi / 180),
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            simd_dot(simd_cross(width, aligned.verticalAxisWorld.simd), depth),
+            simd_dot(
+                simd_cross(captured.localXAxisWorld.simd, captured.verticalAxisWorld.simd),
+                captured.localDepthAxisWorld.simd
+            ),
+            accuracy: 0.000_001
+        )
+        // The outline is where it was.
+        let before = try XCTUnwrap(captured.volumeOutline(useCorrectedFootprint: true, heightCM: 40))
+        let after = try XCTUnwrap(aligned.volumeOutline(useCorrectedFootprint: true, heightCM: 40))
+        for (a, b) in zip(before.bottomVerticesWorld, after.bottomVerticesWorld) {
+            XCTAssertEqual(simd_distance(a.simd, b.simd), 0, accuracy: 0.000_001)
+        }
+        XCTAssertEqual(after.floorAreaSquareMetres, before.floorAreaSquareMetres, accuracy: 0.000_001)
+        // Wall evidence is untouched, and the record still passes validation.
+        XCTAssertEqual(aligned.boundaries.map(\.hitPositionWorld), captured.boundaries.map(\.hitPositionWorld))
+        XCTAssertEqual(aligned.boundaries.map(\.wallPlane), captured.boundaries.map(\.wallPlane))
+        XCTAssertTrue(aligned.record(approvedCorrected: true, heightCM: 40).isValidForPlacement)
+        // Already aligned: nothing changes.
+        let again = aligned.alignedToWalls(useCorrectedFootprint: true)
+        for (a, b) in zip(again.correctedFootprint2D ?? [], aligned.correctedFootprint2D ?? []) {
+            XCTAssertEqual(simd_distance(a.simd, b.simd), 0, accuracy: 0.000_001)
+        }
+    }
+
+    func testProductIsPlacedSquareToTheWallsHoweverThePhoneWasHeld() throws {
+        // A 60 × 40 cm area scanned with the phone turned 20° from the walls.
+        let captured = try turnedDraft(degrees: 20)
+        let unaligned = try shelf(from: captured)
+        let aligned = try shelf(from: captured.alignedToWalls(useCorrectedFootprint: true))
+
+        // Unaligned, the local bounding box is larger than the area itself:
+        // products are set along axes that are not the walls'.
+        XCTAssertGreaterThan(
+            unaligned.boundary.dimensions.widthCM * unaligned.boundary.dimensions.depthCM,
+            60 * 40 * 1.3
+        )
+        // Aligned, the bounding box is the area.
+        let dimensions = [aligned.boundary.dimensions.widthCM, aligned.boundary.dimensions.depthCM].sorted()
+        XCTAssertEqual(dimensions[0], 40, accuracy: 0.01)
+        XCTAssertEqual(dimensions[1], 60, accuracy: 0.01)
+
+        // A 55 × 35 cm product only fits when set square to the walls.
+        let wide = PackagePlacementProfile(
+            productId: "wide",
+            dimensions: .init(widthCM: 55, heightCM: 10, depthCM: 35),
+            weightKG: 1, demandVelocity: 0.5,
+            metadata: package(heightCM: 10).metadata
+        )
+        var rotatable = wide
+        rotatable.metadata.mayRotateAutomatically = true
+        XCTAssertNil(PlacementEngine.calculate(package: rotatable, shelf: unaligned).recommendation)
+        XCTAssertNotNil(PlacementEngine.calculate(package: rotatable, shelf: aligned).recommendation)
+    }
+
+    /// Four walls of a 60 × 40 cm rectangle, measured in capture axes turned
+    /// `degrees` from the walls.
+    private func turnedDraft(degrees: Double) throws -> StorageMarkerDraft {
+        let angle = degrees * .pi / 180
+        func normal(_ x: Double, _ y: Double) -> SIMD2<Double> {
+            SIMD2(x * cos(angle) - y * sin(angle), x * sin(angle) + y * cos(angle))
+        }
+        let geometry = try StorageMarkerGeometryBuilder.build(boundaries: [
+            line(point: normal(-0.3, 0), normal: normal(1, 0)),
+            line(point: normal(0.3, 0), normal: normal(1, 0)),
+            line(point: normal(0, -0.2), normal: normal(0, 1)),
+            line(point: normal(0, 0.2), normal: normal(0, 1))
+        ])
+        XCTAssertNotNil(geometry.corrected)
+        return draft(from: geometry)
+    }
+
+    private func shelf(from draft: StorageMarkerDraft) throws -> ShelfState {
+        let record = draft.record(approvedCorrected: true, heightCM: 45)
+        func centimetres(_ points: [Vector2D]) -> [Vector2D] {
+            points.map { Vector2D($0.x * 100, $0.y * 100) }
+        }
+        return try OpenSpacePlacementAdapter.shelfState(from: ScannedSpaceGeometry(
+            id: draft.id, geometryType: .openSpace, surfaceType: .shelf,
+            rawBoundary2D: centimetres(record.rawFootprint2D),
+            suggestedBoundary2D: record.correctedFootprint2D.map(centimetres),
+            approvedBoundary2D: centimetres(record.approvedFootprint2D), excludedRegions2D: [],
+            localOrigin: draft.basePlaneOriginWorld, localXAxis: draft.localXAxisWorld,
+            localYAxis: draft.localDepthAxisWorld, localVerticalAxis: draft.verticalAxisWorld,
+            bottomPlane: CodablePlane(origin: draft.basePlaneOriginWorld, normal: draft.verticalAxisWorld),
+            topDefinition: .manualLimitCM(45), heightCM: 45,
+            accessDirections: [Vector3D(0, 0, 1)],
+            confidence: .init(baseSurface: 0.9, boundary: 0.9, corners: 0.9,
+                              walls: nil, surfaceEdges: 0.9, height: 1),
+            approval: .approved, geometryVersion: 9,
+            createdAt: .now, updatedAt: .now,
+            measurementMethod: .markerBoundaries,
+            markerMeasurement: record
+        ))
+    }
+
     private var base: StorageBasePlaneCoordinateSystem {
         .init(
             originWorld: Vector3D(0, 0, 0),

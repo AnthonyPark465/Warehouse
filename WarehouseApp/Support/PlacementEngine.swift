@@ -38,6 +38,16 @@ enum ShelfStateOperations {
         guard candidates.contains(where: { $0.id == result.id }) else {
             throw ShelfStateOperationError.invalidPlacement
         }
+        return applying(result: result, package: package, to: shelf)
+    }
+
+    /// Records `result` as occupancy without re-validating it. Callers must
+    /// already hold a result calculated against exactly this shelf state.
+    static func applying(
+        result: ProductPlacementResult,
+        package: PackagePlacementProfile,
+        to shelf: ShelfState
+    ) -> ShelfState {
         var next = shelf
         next.products.append(StoredProductPlacement(
             id: result.id, productID: package.productId, productType: package.productType,
@@ -92,7 +102,7 @@ enum ShelfScanValidator {
                 !validVolume($0.volume) ||
                     $0.weightKG.map { !$0.isFinite || $0 <= 0 } ?? true
             }) ||
-            shelf.ratedWeightKG.map { !$0.isFinite || $0 <= 0 } == true ||
+            shelf.ratedWeightKG.map({ !$0.isFinite || $0 <= 0 }) == true ||
             !shelf.scanQuality.confidence.isFinite ||
             !(0...1).contains(shelf.scanQuality.confidence) ||
             !shelf.scanQuality.trackingDriftCM.isFinite || shelf.scanQuality.trackingDriftCM < 0 ||
@@ -314,6 +324,66 @@ enum PlacementEngine {
                      evaluations: evaluations, failureMessage: nil)
     }
 
+    /// Searches every storage area and recommends the best area and position
+    /// together. Each area is calculated independently by the single-area
+    /// engine, so every safety rule applies unchanged.
+    static func calculate(
+        package: PackagePlacementProfile,
+        shelves: [ShelfState],
+        activeReservations: [PlacementReservation] = [],
+        tolerance: PlacementToleranceConfiguration = .warehouse,
+        reach: ReachConfiguration = .warehouse,
+        handling: HandlingPolicy = .warehouse
+    ) -> CrossAreaPlacementCalculation {
+        var calculations: [String: PlacementCalculation] = [:]
+        var best: (shelf: ShelfState, result: ProductPlacementResult)?
+        for shelf in shelves.sorted(by: { $0.id < $1.id }) {
+            let calculation = calculate(
+                package: package, shelf: shelf, activeReservations: activeReservations,
+                tolerance: tolerance, reach: reach, handling: handling
+            )
+            calculations[shelf.id] = calculation
+            guard let result = calculation.recommendation else { continue }
+            if let current = best, !prefersArea(shelf, result, over: current.shelf, current.result) { continue }
+            best = (shelf, result)
+        }
+        guard best == nil else {
+            return .init(calculations: calculations, recommendedShelfID: best?.shelf.id, failureMessage: nil)
+        }
+        guard !shelves.isEmpty else {
+            return .init(calculations: [:], recommendedShelfID: nil,
+                         failureMessage: "No saved storage areas are available. Measure and save one first.")
+        }
+        let reasons = shelves.map { shelf in
+            "\(shelf.displayLabel): \(calculations[shelf.id]?.failureMessage ?? "No valid position.")"
+        }
+        return .init(calculations: calculations, recommendedShelfID: nil,
+                     failureMessage: (["No saved storage area accepts this product."] + reasons).joined(separator: "\n"))
+    }
+
+    /// Cross-area order. A position's rank is only meaningful inside its own
+    /// area, so areas are compared first on the products that would have to be
+    /// moved, then on how little free room the area has left, which keeps the
+    /// larger areas open for products that fit nowhere else. Comparing distance
+    /// from the front between areas was tried and did not help on
+    /// `docs/placement-evaluation-synthetic.md`.
+    static func prefersArea(
+        _ shelf: ShelfState, _ result: ProductPlacementResult,
+        over otherShelf: ShelfState, _ other: ProductPlacementResult
+    ) -> Bool {
+        let rank = result.rank, otherRank = other.rank
+        if rank.criticalProductBlockingCount != otherRank.criticalProductBlockingCount {
+            return rank.criticalProductBlockingCount < otherRank.criticalProductBlockingCount
+        }
+        if rank.requiredMoveCount != otherRank.requiredMoveCount {
+            return rank.requiredMoveCount < otherRank.requiredMoveCount
+        }
+        let free = shelf.freeVolumeCM3, otherFree = otherShelf.freeVolumeCM3
+        if free != otherFree { return free < otherFree }
+        if rank != otherRank { return rank > otherRank }
+        return shelf.id < otherShelf.id
+    }
+
     static func effectiveDimensions(
         package: PackagePlacementProfile,
         shelf: ShelfState,
@@ -531,11 +601,13 @@ enum PlacementEngine {
             zs.formUnion([product.volume.minimum.z, product.volume.maximum.z - orientation.depthCM])
         }
         var result: [Vector3D] = []
+        var seen: Set<Vector3D> = []
+        let sortedXs = xs.sorted(), sortedZs = zs.sorted()
         for y in ys.sorted() {
-            for z in zs.sorted() {
-                for x in xs.sorted() {
+            for z in sortedZs {
+                for x in sortedXs {
                     let value = Vector3D(rounded(x), rounded(y), rounded(z))
-                    if !result.contains(value) { result.append(value) }
+                    if seen.insert(value).inserted { result.append(value) }
                 }
             }
         }
@@ -633,7 +705,7 @@ enum PlacementEngine {
         if package.metadata.isFragile == nil { warnings.append("Fragility is unknown; stacking above this product is disabled.") }
         if shelf.ratedWeightKG == nil && compartment.ratedWeightKG == nil { warnings.append("Shelf load rating is unknown.") }
         let rotation = orientation.yawQuarterTurns
-        let supportText = support.supportingProducts.first.map { " Set it on top of product \($0.id)." } ?? " Set it directly on the shelf surface."
+        let supportText = support.supportingProducts.first.map { " Set it on top of product \($0.id)." } ?? " Set it directly on the storage surface."
         let instructions = placementInstructions(
             shelf: shelf, compartment: compartment, origin: origin,
             orientation: orientation, supportText: supportText
@@ -748,16 +820,18 @@ enum PlacementEngine {
                 guard swept.minimum.x >= compartment.volume.minimum.x,
                       swept.maximum.x <= compartment.volume.maximum.x,
                       swept.minimum.y >= compartment.volume.minimum.y,
-                      swept.maximum.y <= compartment.volume.maximum.y,
-                      containsShelfGeometry(shelf, swept)
+                      swept.maximum.y <= compartment.volume.maximum.y
                 else { return nil }
             }
+            guard sweepClearsFootprintWalls(shelf, swept) else { return nil }
             path.append(swept.minimum)
         }
         return path
     }
 
-    private static func productsBlockedBy(
+    /// Stored products that cannot be taken out through the front while
+    /// `newVolume` is in place: same lane, further back.
+    static func productsBlockedBy(
         _ newVolume: AxisAlignedVolume,
         in shelf: ShelfState,
         gripClearance: Double
@@ -821,15 +895,20 @@ enum PlacementEngine {
         supportText: String
     ) -> String {
         let fromFront = max(origin.z - compartment.volume.minimum.z, 0)
-        let fromLeft = max(origin.x - compartment.volume.minimum.x, 0)
-        let fromRight = max(compartment.volume.maximum.x
+        // Width, up, and depth form a right-handed frame, so shelf-local width
+        // increases toward the left of someone facing in from the front.
+        let fromRight = max(origin.x - compartment.volume.minimum.x, 0)
+        let fromLeft = max(compartment.volume.maximum.x
             - (origin.x + orientation.orientedDimensions.widthCM), 0)
         let horizontal = fromLeft <= fromRight
-            ? "\(fromLeft.formatted(.number.precision(.fractionLength(0)))) cm from the left boundary"
-            : "\(fromRight.formatted(.number.precision(.fractionLength(0)))) cm from the right boundary"
-        return "Place the product in \(shelf.label), \(compartment.label).\(supportText) "
-            + "Put the \(orientation.restingFace.rawValue) face down and the \(orientation.forwardFace.rawValue) face toward the opening. "
-            + "Position its front \(fromFront.formatted(.number.precision(.fractionLength(0)))) cm behind the opening and \(horizontal)."
+            ? "\(fromLeft.formatted(.number.precision(.fractionLength(0)))) cm from the left side"
+            : "\(fromRight.formatted(.number.precision(.fractionLength(0)))) cm from the right side"
+        // A single compartment is the whole storage area; naming it adds nothing.
+        let destination = shelf.compartments.count > 1
+            ? "\(shelf.displayLabel), \(compartment.label)" : shelf.displayLabel
+        return "Place the product in \(destination).\(supportText) "
+            + "Put its \(orientation.restingFace.rawValue) face down and its \(orientation.forwardFace.rawValue) face toward the front edge. "
+            + "Facing in from the front edge, leave \(fromFront.formatted(.number.precision(.fractionLength(0)))) cm in front of the product and keep it \(horizontal)."
     }
 
     /// Explainable MVP fragmentation metric: penalize narrow side/rear gaps
@@ -880,6 +959,49 @@ private func approvedFootprint(_ shelf: ShelfState) -> [SIMD2<Double>]? {
     return geometry.approvedBoundary.map { SIMD2($0.x, $0.z) }
 }
 
+/// Footprint edges that face the front. These form the opening a product
+/// passes through on a straight insertion; every other edge is a wall.
+private func openingEdgeIndices(of polygon: [SIMD2<Double>]) -> Set<Int> {
+    let doubledArea = polygon.indices.reduce(0.0) { value, index in
+        let next = polygon[(index + 1) % polygon.count]
+        return value + polygon[index].x * next.y - next.x * polygon[index].y
+    }
+    func edge(_ index: Int) -> SIMD2<Double> { polygon[(index + 1) % polygon.count] - polygon[index] }
+    // The outward normal of a front-facing edge points toward smaller depth. An
+    // edge that runs mostly front to back is a side wall, however it is skewed.
+    let facingFront = polygon.indices.filter { edge($0).x * doubledArea > 0 }
+    let opening = facingFront.filter { abs(edge($0).x) >= abs(edge($0).y) }
+    if !opening.isEmpty { return Set(opening) }
+    // A steeply skewed footprint still has a front: its most front-facing edge.
+    let frontmost = facingFront.max {
+        abs(edge($0).x) / simd_length(edge($0)) < abs(edge($1).x) / simd_length(edge($1))
+    }
+    return Set([frontmost].compactMap { $0 })
+}
+
+extension ShelfState {
+    /// Usable footprint in shelf-local centimetres, as (width, depth) points.
+    var footprintPolygon: [SIMD2<Double>] {
+        approvedFootprint(self) ?? [
+            SIMD2(boundary.minimum.x, boundary.minimum.z),
+            SIMD2(boundary.maximum.x, boundary.minimum.z),
+            SIMD2(boundary.maximum.x, boundary.maximum.z),
+            SIMD2(boundary.minimum.x, boundary.maximum.z)
+        ]
+    }
+
+    /// Indices of the `footprintPolygon` edges that make up the front opening.
+    var footprintOpeningEdgeIndices: Set<Int> { openingEdgeIndices(of: footprintPolygon) }
+
+    /// Bounding volume not yet claimed by stored products or obstacles.
+    var freeVolumeCM3: Double {
+        let claimed = (products.map(\.volume) + obstacles.map(\.volume)).reduce(0.0) {
+            $0 + $1.dimensions.volumeCM3
+        }
+        return max(boundary.dimensions.volumeCM3 - claimed, 0)
+    }
+}
+
 private func containsShelfGeometry(
     _ shelf: ShelfState,
     _ volume: AxisAlignedVolume
@@ -906,6 +1028,46 @@ private func containsShelfGeometry(
         }
     }
     guard insideOuter, !crossesConcaveBoundary else { return false }
+    let exclusions = shelf.geometry?.excludedRegions?.map {
+        $0.map { SIMD2($0.x, $0.z) }
+    } ?? []
+    return !exclusions.contains { excluded in
+        polygonsOverlap(corners, excluded)
+            || corners.contains { distanceToPolygonBoundary($0, polygon: excluded) < margin }
+    }
+}
+
+/// Footprint test for one step of a straight insertion. Edges of the approved
+/// footprint that face the front are the opening: the product crosses them on
+/// the way in, so neither containment nor the safety margin applies to them
+/// until the product has reached its final position. Every other edge is a wall.
+private func sweepClearsFootprintWalls(
+    _ shelf: ShelfState,
+    _ volume: AxisAlignedVolume
+) -> Bool {
+    guard let polygon = approvedFootprint(shelf) else { return true }
+    let margin = max(shelf.geometry?.placementSafetyMarginCM ?? 0, 0)
+    let corners = [
+        SIMD2(volume.minimum.x, volume.minimum.z),
+        SIMD2(volume.maximum.x, volume.minimum.z),
+        SIMD2(volume.maximum.x, volume.maximum.z),
+        SIMD2(volume.minimum.x, volume.maximum.z)
+    ]
+    let opening = openingEdgeIndices(of: polygon)
+    let walls = polygon.indices.filter { !opening.contains($0) }.map {
+        (polygon[$0], polygon[($0 + 1) % polygon.count])
+    }
+    let crossesWall = corners.indices.contains { index in
+        walls.contains {
+            segmentsCross(corners[index], corners[(index + 1) % corners.count], $0.0, $0.1)
+        }
+    }
+    let crowdsWall = corners.contains { corner in
+        pointInPolygon(corner, polygon: polygon) && walls.contains {
+            distanceToSegment(corner, $0.0, $0.1) + 0.0001 < margin
+        }
+    }
+    guard !crossesWall, !crowdsWall else { return false }
     let exclusions = shelf.geometry?.excludedRegions?.map {
         $0.map { SIMD2($0.x, $0.z) }
     } ?? []

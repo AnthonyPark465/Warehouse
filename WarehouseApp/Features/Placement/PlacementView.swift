@@ -16,6 +16,7 @@ struct PlacementView: View {
     @State private var showSurfaceScanner = false
     @State private var spaceSurfaceType: SpaceSurfaceType = .unknown
     @State private var scannedOpenSpace: ScannedSpaceGeometry?
+    @State private var spaceName = ""
     @State private var spaceSaveMessage: String?
     @State private var isSavingSpace = false
     @State private var assumedHeight = "40"
@@ -28,7 +29,7 @@ struct PlacementView: View {
     @State private var markerDraft: StorageMarkerDraft?
     @State private var markerCount = 0
     @State private var markerCanPlace = false
-    @State private var markerGuidance = "Aim at the horizontal surface where products will sit."
+    @State private var markerGuidance = "Stand at the front of the storage area, facing in, and aim at the surface where products will sit."
     @State private var markerError: String?
     @State private var markerPlacementRequestID = 0
     @State private var markerUndoRequestID = 0
@@ -37,6 +38,7 @@ struct PlacementView: View {
     @State private var markerUseCorrectedFootprint = true
     @State private var operationalShelves: [ShelfState] = []
     @State private var selectedShelfID = ""
+    @State private var searchAllAreas = true
     @State private var placementReservation: PlacementReservation?
     @State private var reservedPackageProfile: PackagePlacementProfile?
     @State private var placementStatusMessage: String?
@@ -130,13 +132,20 @@ struct PlacementView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
+                if operationalShelves.count > 1 {
+                    Toggle("Choose the best storage area automatically", isOn: $searchAllAreas)
+                        .disabled(placementReservation != nil || isCalculating)
+                }
                 Picker("Saved storage area", selection: $selectedShelfID) {
                     ForEach(operationalShelves) { shelf in
                         Text(shelfSelectionLabel(shelf)).tag(shelf.id)
                     }
                 }
-                .disabled(placementReservation != nil || scannedOpenSpace != nil || isSavingSpace || isCalculating)
-                if let shelf = activePlacementState {
+                .disabled(placementReservation != nil || scannedOpenSpace != nil || isSavingSpace
+                          || isCalculating || usesAreaSearch)
+                if usesAreaSearch, placementReservation == nil {
+                    LabeledContent("Calculation uses", value: "Best of \(operationalShelves.count) saved areas")
+                } else if let shelf = activePlacementState {
                     LabeledContent("Calculation uses", value: shelfSelectionLabel(shelf))
                     LabeledContent("Selected usable space", value: dimensionText(PlacementEngine.usableDimensions(of: shelf)))
                 }
@@ -151,6 +160,11 @@ struct PlacementView: View {
             Picker("Storage surface", selection: $spaceSurfaceType) {
                 ForEach(SpaceSurfaceType.allCases) { Text($0.title).tag($0) }
             }
+            .disabled(isSavingSpace)
+            .onChange(of: spaceSurfaceType) { _, surface in
+                // The unsaved scan copied the surface when it was finalized.
+                scannedOpenSpace?.surfaceType = surface
+            }
             if let space = scannedOpenSpace {
                 SpaceVolumePreview(space: space)
                     .frame(height: 190)
@@ -161,8 +175,13 @@ struct PlacementView: View {
                 Label("Unsaved scan — placement calculation is disabled until this area is saved and selected.", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
+                TextField("Storage area name (e.g. Back room floor)", text: $spaceName)
+                    .disabled(isSavingSpace)
                 Button("Save approved space") {
-                    saveApprovedSpace(space)
+                    var named = space
+                    named.name = spaceName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    scannedOpenSpace = named
+                    saveApprovedSpace(named)
                 }
                 .disabled(isSavingSpace)
                 if isSavingSpace { ProgressView("Saving and selecting storage area…") }
@@ -178,7 +197,7 @@ struct PlacementView: View {
     private var recommendationsSection: some View {
         Section("4 · Recommended location") {
             Button("Calculate and reserve placement") { calculatePrecisePlacement() }
-                .disabled(packageProfile == nil || selectedShelfID.isEmpty || scannedOpenSpace != nil ||
+                .disabled(packageProfile == nil || (selectedShelfID.isEmpty && !usesAreaSearch) || scannedOpenSpace != nil ||
                           isSavingSpace || isCalculating || placementReservation != nil)
             if placementReservation != nil {
                 Button("Cancel reservation", role: .destructive) { cancelReservation() }
@@ -209,7 +228,7 @@ struct PlacementView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(placedProductName(entry.placement.productID))
-                            Text(entry.shelf.label)
+                            Text(entry.shelf.displayLabel)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -238,7 +257,7 @@ struct PlacementView: View {
                     expectedShelfVersion: shelf.version
                 )
                 await loadOperationalShelves(selecting: shelf.id)
-                placementStatusMessage = "Removed \(placedProductName(placement.productID)) from \(shelf.label)."
+                placementStatusMessage = "Removed \(placedProductName(placement.productID)) from \(shelf.displayLabel)."
             } catch {
                 placementStatusMessage = error.localizedDescription
             }
@@ -248,7 +267,7 @@ struct PlacementView: View {
 
     private var verificationSection: some View {
         Section("6 · Verify placement") {
-            if let destination = selectedPrecisePlacement == nil ? nil : activePlacementState?.label {
+            if let destination = selectedPrecisePlacement == nil ? nil : activePlacementState?.displayLabel {
                 LabeledContent("Destination", value: destination)
                 switch verification?.stage {
                 case .scanProduct:
@@ -520,6 +539,8 @@ struct PlacementView: View {
         else { return nil }
         var metadata = product.placementMetadata ?? .conservative
         metadata.weightKG = weight
+        // The engine reads pick frequency from the handling rules.
+        metadata.expectedRetrievalFrequency = velocity
         if product.placementMetadata == nil, product.objectScan?.canBeRotated == true {
             // Legacy scan records only establish yaw permission. They do not
             // prove that tipping the product onto another face is safe.
@@ -550,6 +571,9 @@ struct PlacementView: View {
             } else if let placement = selectedPrecisePlacement {
                 Label("Reserved safe placement", systemImage: "checkmark.seal.fill")
                     .foregroundStyle(.green)
+                if let shelf = activePlacementState {
+                    PlacementGuide3DView(shelf: shelf, placement: placement)
+                }
                 Text(placement.instructions)
                 ForEach(placement.warnings, id: \.self) { warning in
                     Label(warning, systemImage: "exclamationmark.triangle")
@@ -584,6 +608,11 @@ struct PlacementView: View {
         return reasons.contains(.lowScanConfidence) || reasons.contains(.staleShelfState)
     }
 
+    /// With a single saved area there is nothing to search.
+    private var usesAreaSearch: Bool {
+        searchAllAreas && operationalShelves.count > 1
+    }
+
     private var activePlacementState: ShelfState? {
         operationalShelves.first { $0.id == selectedShelfID }
     }
@@ -591,6 +620,7 @@ struct PlacementView: View {
     private func prepareNewMarkerScan() {
         selectedShelfID = ""
         scannedOpenSpace = nil
+        spaceName = ""
         spaceSaveMessage = nil
         preciseCalculation = nil
         selectedPrecisePlacement = nil
@@ -600,7 +630,7 @@ struct PlacementView: View {
         markerStage = .selectSurface
         markerCount = 0
         markerCanPlace = false
-        markerGuidance = "Aim at the horizontal surface where products will sit."
+        markerGuidance = "Stand at the front of the storage area, facing in, and aim at the surface where products will sit."
         markerError = nil
         markerUseCorrectedFootprint = true
         markerPlacementRequestID = 0
@@ -610,10 +640,13 @@ struct PlacementView: View {
     }
 
     private func finalizeMarkerSpace() {
-        guard let draft = markerDraft, let height = validManualSpaceHeight else {
+        guard let captured = markerDraft, let height = validManualSpaceHeight else {
             markerError = "The footprint or storage height is incomplete."
             return
         }
+        // Stored axes run along the walls, so products are placed square to
+        // them whatever angle the phone was held at during the scan.
+        let draft = captured.alignedToWalls(useCorrectedFootprint: markerUseCorrectedFootprint)
         let record = draft.record(
             approvedCorrected: markerUseCorrectedFootprint,
             heightCM: height
@@ -688,6 +721,10 @@ struct PlacementView: View {
     private func calculatePrecisePlacement() {
         guard !isCalculating, placementReservation == nil,
               let packageProfile, let userID = auth.user?.uid else { return }
+        guard !usesAreaSearch else {
+            calculateAcrossAreas(package: packageProfile, userID: userID)
+            return
+        }
         let requestedShelfID: String
         do {
             requestedShelfID = try PlacementWorkflow.calculationShelfID(
@@ -720,27 +757,17 @@ struct PlacementView: View {
                     isCalculating = false
                     return
                 }
-                guard selectedShelfID == requestedShelfID, scannedOpenSpace == nil else {
+                guard selectedShelfID == requestedShelfID, scannedOpenSpace == nil,
+                      self.packageProfile == packageProfile else {
                     throw PlacementWorkflowError.selectionChanged
                 }
                 preciseCalculation = result
                 guard let recommendation = result.recommendation else {
-                    placementStatusMessage = result.failureMessage
+                    // The guidance section already presents the failure.
                     isCalculating = false
                     return
                 }
-                let reservation = try await PlacementRepository.reserve(
-                    result: recommendation, userID: userID
-                )
-                placementReservation = reservation
-                reservedPackageProfile = packageProfile
-                selectedPrecisePlacement = recommendation
-                // Arm the two-scan check: without this the Verify section can
-                // never leave its "Select a recommendation" state.
-                verification = PlacementVerification(
-                    expectedProductBarcode: selectedProduct?.barcode ?? "",
-                    expectedLocationBarcode: shelf.barcode
-                )
+                try await reserve(recommendation, in: shelf, package: packageProfile, userID: userID)
                 placementStatusMessage = "Storage area reserved for two minutes. Verify both barcodes, place the product, then confirm."
                 isCalculating = false
             } catch {
@@ -749,6 +776,80 @@ struct PlacementView: View {
                     operationalShelves.removeAll { $0.id == requestedShelfID }
                     if selectedShelfID == requestedShelfID { selectedShelfID = "" }
                 }
+                isCalculating = false
+            }
+        }
+    }
+
+    private func reserve(
+        _ recommendation: ProductPlacementResult,
+        in shelf: ShelfState,
+        package: PackagePlacementProfile,
+        userID: String
+    ) async throws {
+        placementReservation = try await PlacementRepository.reserve(result: recommendation, userID: userID)
+        reservedPackageProfile = package
+        selectedPrecisePlacement = recommendation
+        // Arm the two-scan check: without this the Verify section can
+        // never leave its "Select a recommendation" state.
+        verification = PlacementVerification(
+            expectedProductBarcode: selectedProduct?.barcode ?? "",
+            expectedLocationBarcode: shelf.barcode
+        )
+    }
+
+    /// Searches every saved area that no other worker currently holds and
+    /// reserves the best area and position together.
+    private func calculateAcrossAreas(package: PackagePlacementProfile, userID: String) {
+        guard scannedOpenSpace == nil else {
+            placementStatusMessage = PlacementWorkflowError.unsavedStorageScan.localizedDescription
+            return
+        }
+        isCalculating = true
+        placementStatusMessage = nil
+        selectedPrecisePlacement = nil
+        Task { @MainActor in
+            do {
+                let shelves = try await PlacementRepository.fetchShelves()
+                operationalShelves = shelves
+                if !shelves.contains(where: { $0.id == selectedShelfID }) {
+                    selectedShelfID = shelves.first?.id ?? ""
+                }
+                var available: [ShelfState] = []
+                for shelf in shelves {
+                    if try await PlacementRepository.fetchActiveReservation(shelfID: shelf.id) == nil {
+                        available.append(shelf)
+                    }
+                }
+                guard !available.isEmpty || shelves.isEmpty else {
+                    throw PlacementPersistenceError.reservationConflict
+                }
+                let result = await Task.detached(priority: .userInitiated) {
+                    PlacementEngine.calculate(package: package, shelves: available)
+                }.value
+                // The form may have been edited while the areas were fetched and searched.
+                guard searchAllAreas, scannedOpenSpace == nil, self.packageProfile == package else {
+                    throw PlacementWorkflowError.selectionChanged
+                }
+                guard let recommendation = result.recommendation,
+                      let shelf = available.first(where: { $0.id == result.recommendedShelfID }) else {
+                    preciseCalculation = PlacementCalculation(
+                        recommendation: nil, alternatives: [], evaluations: [],
+                        failureMessage: result.failureMessage
+                    )
+                    isCalculating = false
+                    return
+                }
+                selectedShelfID = shelf.id
+                preciseCalculation = result.calculations[shelf.id]
+                try await reserve(recommendation, in: shelf, package: package, userID: userID)
+                let skipped = shelves.count - available.count
+                placementStatusMessage = "Chose \(shelf.displayLabel) from \(available.count) storage areas"
+                    + (skipped > 0 ? " (\(skipped) in use by another placement)" : "")
+                    + ". Reserved for two minutes. Verify both barcodes, place the product, then confirm."
+                isCalculating = false
+            } catch {
+                placementStatusMessage = error.localizedDescription
                 isCalculating = false
             }
         }
@@ -780,7 +881,7 @@ struct PlacementView: View {
 
     private func shelfSelectionLabel(_ shelf: ShelfState) -> String {
         let suffix = String(shelf.id.suffix(8))
-        return "\(shelf.label) · \(suffix)"
+        return "\(shelf.displayLabel) · \(suffix)"
     }
 
     private func loadOperationalShelves(selecting shelfID: String? = nil) async {
@@ -870,6 +971,11 @@ struct PlacementView: View {
             width = String(scan.rawWidth)
             height = String(scan.rawHeight)
             depth = String(scan.rawLength)
+        } else {
+            // Never carry another product's dimensions into this calculation.
+            width = ""
+            height = ""
+            depth = ""
         }
         if let savedWeight = selectedProduct?.placementMetadata?.weightKG {
             weight = String(savedWeight)

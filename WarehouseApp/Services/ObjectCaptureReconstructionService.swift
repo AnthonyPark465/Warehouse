@@ -56,6 +56,19 @@ final class ObjectCaptureReconstructionService {
         )
         try session.process(requests: [.bounds, .pointCloud])
 
+        // Reconstruction is the most expensive work in the app. Stop it as
+        // soon as the caller's task is cancelled instead of running to the end.
+        return try await withTaskCancellationHandler {
+            try await collect(from: session, onProgress: onProgress)
+        } onCancel: {
+            session.cancel()
+        }
+    }
+
+    private func collect(
+        from session: PhotogrammetrySession,
+        onProgress: @escaping @Sendable (Double) async -> Void
+    ) async throws -> ObjectCaptureReconstructionResult {
         var bounds: BoundingBox?
         var points: [SIMD3<Float>] = []
 

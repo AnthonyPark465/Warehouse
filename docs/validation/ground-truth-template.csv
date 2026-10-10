@@ -1,0 +1,5 @@
+product,length_cm,width_cm,height_cm,notes
+# One row per product. The name must match the "Product name" typed in the app.
+# Measure each side three times with calipers and enter the average.
+# Length and width can be in either order. Lines starting with # are ignored.
+tea-box,8.02,4.98,6.01,example row: replace with your own

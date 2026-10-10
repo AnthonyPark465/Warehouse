@@ -2,13 +2,42 @@ import XCTest
 @testable import WarehouseApp
 
 final class ManualMeasurementGeometryTests: XCTestCase {
-    func testCompleteOrangeBoxAllowsFinishBeforeStability() {
+    private let acceptedDecision = LiDARAcceptanceDecision(
+        status: .accepted,
+        failures: [],
+        warnings: [],
+        fallbacks: []
+    )
+
+    func testFinishIsAvailableForAnAcceptedOrQualifiedMeasurement() {
         let dimensions = ObjectDimensions(length: 20, width: 10, height: 15)
         let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 8)
+        var qualified = acceptedDecision
+        qualified.status = .qualified
+        qualified.warnings = [.nearbyObjectClose]
 
-        XCTAssertTrue(ManualProductScanStatus.finishIsAvailable(
+        for decision in [acceptedDecision, qualified] {
+            XCTAssertTrue(ManualProductScanStatus.finishIsAvailable(
+                decision: decision,
+                dimensions: dimensions,
+                boundingBoxCornersWorld: corners
+            ))
+        }
+    }
+
+    func testFinishIsRefusedWhenAcceptanceRefusesEvenWithACompleteBox() {
+        let dimensions = ObjectDimensions(length: 20, width: 10, height: 15)
+        let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 8)
+        let refused = LiDARAcceptanceDecision(
+            status: .refused,
+            failures: [.regionBoundaryContact],
+            warnings: [],
+            fallbacks: []
+        )
+
+        XCTAssertFalse(ManualProductScanStatus.finishIsAvailable(
+            decision: refused,
             dimensions: dimensions,
-            stablePointCount: ObjectScanValidation.minimumPointCount,
             boundingBoxCornersWorld: corners
         ))
     }
@@ -18,8 +47,8 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 7)
 
         XCTAssertFalse(ManualProductScanStatus.finishIsAvailable(
+            decision: acceptedDecision,
             dimensions: dimensions,
-            stablePointCount: ObjectScanValidation.minimumPointCount,
             boundingBoxCornersWorld: corners
         ))
     }
@@ -28,15 +57,16 @@ final class ManualMeasurementGeometryTests: XCTestCase {
     func testFinishProductScanTransitionsToReview() {
         let dimensions = ObjectDimensions(length: 20, width: 10, height: 15)
         let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 8)
-        var status = ManualProductScanStatus(
+        let status = ManualProductScanStatus(
             stablePointCount: ObjectScanValidation.minimumPointCount,
             detectedDimensionsCM: dimensions,
             boundingBoxCornersWorld: corners,
-            touchesBoundary: true
+            canFinish: true,
+            decision: acceptedDecision
         )
-        status.canFinish = true
 
         let state = ManualARMeasurementState()
+        state.updateTracking(.normal)
         state.updateProductScan(status)
         state.finishProductScan()
 
@@ -44,33 +74,108 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         XCTAssertNil(state.errorMessage)
     }
 
-    func testCaptureProgressPreservesLatestDetectedGeometry() {
-        let dimensions = ObjectDimensions(length: 20, width: 10, height: 15)
-        let points = [SIMD3<Float>(0, 0.1, 0)]
-        let corners = Array(repeating: SIMD3<Float>(0, 0, 0), count: 8)
-        var status = ManualProductScanStatus(
-            message: "Detected",
-            integratedFrameCount: 4,
-            capturedPointCount: 300,
-            stablePointCount: 150,
-            detectedDimensionsCM: dimensions,
-            detectedWorldPoints: points,
-            boundingBoxCornersWorld: corners,
-            confidence: 0.8
+    @MainActor
+    func testFinishProductScanIsRejectedWhileTrackingIsNotNormal() {
+        let status = ManualProductScanStatus(
+            detectedDimensionsCM: ObjectDimensions(length: 20, width: 10, height: 15),
+            boundingBoxCornersWorld: Array(repeating: SIMD3<Float>(0, 0, 0), count: 8),
+            canFinish: true,
+            decision: acceptedDecision
+        )
+        let state = ManualARMeasurementState()
+        state.updateTracking(.limited(.excessiveMotion))
+        state.updateProductScan(status)
+        state.finishProductScan()
+
+        XCTAssertNotEqual(state.stage, .review)
+        XCTAssertNotNil(state.errorMessage)
+    }
+
+    @MainActor
+    func testTrackingResetStopsTheScanAndDiscardsItsResult() {
+        let state = stateReadyToScan()
+        state.startProductScan()
+        state.updateProductScan(ManualProductScanStatus(
+            detectedDimensionsCM: ObjectDimensions(length: 20, width: 10, height: 15),
+            boundingBoxCornersWorld: Array(repeating: SIMD3<Float>(0, 0, 0), count: 8),
+            canFinish: true,
+            decision: acceptedDecision
+        ))
+        XCTAssertTrue(state.productScanIsActive)
+
+        state.handleTrackingReset()
+
+        XCTAssertFalse(state.productScanIsActive)
+        XCTAssertNil(state.productScanStatus.detectedDimensionsCM)
+        XCTAssertFalse(state.productScanStatus.canFinish)
+        XCTAssertEqual(state.stage, .productScan)
+        XCTAssertNotNil(state.errorMessage)
+    }
+
+    @MainActor
+    func testContinuingFromReviewClearsThePreviousResult() {
+        let state = stateReadyToScan()
+        state.startProductScan()
+        state.updateProductScan(ManualProductScanStatus(
+            detectedDimensionsCM: ObjectDimensions(length: 20, width: 10, height: 15),
+            boundingBoxCornersWorld: Array(repeating: SIMD3<Float>(0, 0, 0), count: 8),
+            canFinish: true,
+            decision: acceptedDecision
+        ))
+        state.finishProductScan()
+        XCTAssertEqual(state.stage, .review)
+
+        state.continueProductScan()
+
+        XCTAssertEqual(state.stage, .productScan)
+        XCTAssertTrue(state.productScanIsActive)
+        XCTAssertNil(state.productScanStatus.detectedDimensionsCM)
+        XCTAssertFalse(state.productScanStatus.canFinish)
+    }
+
+    @MainActor
+    func testFinishProductScanIsRejectedWithTheMissingEvidence() {
+        let guidance = LiDARMeasurementGuidance.message(for: .insufficientViewpoints)
+        let status = ManualProductScanStatus(
+            detectedDimensionsCM: ObjectDimensions(length: 20, width: 10, height: 15),
+            boundingBoxCornersWorld: Array(repeating: SIMD3<Float>(0, 0, 0), count: 8),
+            decision: LiDARAcceptanceDecision(
+                status: .refused,
+                failures: [.insufficientViewpoints],
+                warnings: [],
+                fallbacks: []
+            ),
+            guidance: [guidance]
         )
 
-        status.updateCaptureProgress(
-            message: "Collecting",
-            integratedFrameCount: 5,
-            capturedPointCount: 340,
-            rejectedOutsideRegionCount: 12
-        )
+        let state = ManualARMeasurementState()
+        state.updateProductScan(status)
+        state.finishProductScan()
 
-        XCTAssertEqual(status.capturedPointCount, 340)
-        XCTAssertEqual(status.stablePointCount, 150)
-        XCTAssertEqual(status.detectedDimensionsCM, dimensions)
-        XCTAssertEqual(status.detectedWorldPoints, points)
-        XCTAssertEqual(status.boundingBoxCornersWorld, corners)
+        XCTAssertNotEqual(state.stage, .review)
+        XCTAssertEqual(state.errorMessage, guidance)
+    }
+
+    func testInteriorPointOfConcaveBoundaryLiesInsideIt() throws {
+        // A "C" whose vertex mean and area centroid both fall in the notch.
+        let polygon: [SIMD2<Double>] = [
+            SIMD2(0, 0), SIMD2(0.30, 0), SIMD2(0.30, 0.05), SIMD2(0.05, 0.05),
+            SIMD2(0.05, 0.25), SIMD2(0.30, 0.25), SIMD2(0.30, 0.30), SIMD2(0, 0.30)
+        ]
+        let mean = polygon.reduce(SIMD2<Double>.zero, +) / Double(polygon.count)
+        XCTAssertFalse(ManualMeasurementGeometry.contains(mean, in: polygon))
+
+        let interior = try XCTUnwrap(ManualMeasurementGeometry.interiorPoint(of: polygon))
+        XCTAssertTrue(ManualMeasurementGeometry.contains(interior, in: polygon))
+    }
+
+    func testInteriorPointOfConvexBoundaryIsItsCentroid() throws {
+        let square: [SIMD2<Double>] = [
+            SIMD2(-0.1, -0.1), SIMD2(0.1, -0.1), SIMD2(0.1, 0.1), SIMD2(-0.1, 0.1)
+        ]
+        let interior = try XCTUnwrap(ManualMeasurementGeometry.interiorPoint(of: square))
+        XCTAssertEqual(interior.x, 0, accuracy: 1e-9)
+        XCTAssertEqual(interior.y, 0, accuracy: 1e-9)
     }
 
     @MainActor
@@ -227,6 +332,23 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         let indices = ManualMeasurementGeometry.triangulationIndices(for: polygon)
         XCTAssertEqual(indices.count, (polygon.count - 2) * 3)
         XCTAssertTrue(indices.allSatisfy { Int($0) < polygon.count })
+    }
+
+    /// A state with a 40 × 30 cm region and 20 cm of height, at Scan Product.
+    @MainActor
+    private func stateReadyToScan() -> ManualARMeasurementState {
+        let state = ManualARMeasurementState()
+        let first = sample([0, 0, 0])
+        state.updatePreview(first)
+        state.updateTracking(.normal)
+        [first, sample([0.4, 0, 0]), sample([0.4, 0, 0.3]), sample([0, 0, 0.3])]
+            .forEach(state.place)
+        state.closeBoundary()
+        state.confirmBase()
+        state.place(sample([0.1, 0, 0.1]))
+        state.place(sample([0.1, 0.2, 0.1]))
+        XCTAssertEqual(state.stage, .productScan)
+        return state
     }
 
     private func horizontalBoundary() throws -> BoundaryMeasurement {

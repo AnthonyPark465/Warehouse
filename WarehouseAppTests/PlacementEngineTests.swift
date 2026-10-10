@@ -512,6 +512,78 @@ final class ShelfAwarePlacementEngineTests: XCTestCase {
         XCTAssertTrue(ShelfScanValidator.rejectionReasons(for: state).contains(.staleShelfState))
     }
 
+    // MARK: Cross-area search
+
+    func testAreaSearchSkipsAreasThatAreTooSmall() {
+        let result = PlacementEngine.calculate(package: package(), shelves: [
+            area("small", width: 15, depth: 15), area("large", width: 80, depth: 80)
+        ])
+        XCTAssertEqual(result.recommendedShelfID, "large")
+        XCTAssertEqual(result.recommendation?.shelfID, "large")
+        XCTAssertNil(result.calculations["small"]?.recommendation)
+        XCTAssertNil(result.failureMessage)
+    }
+
+    func testAreaSearchPrefersTheTightestAreaThatAccepts() {
+        let areas = [area("a-large", width: 120, depth: 120), area("b-snug", width: 40, depth: 40)]
+        XCTAssertEqual(PlacementEngine.calculate(package: package(), shelves: areas).recommendedShelfID, "b-snug")
+        XCTAssertEqual(
+            PlacementEngine.calculate(package: package(), shelves: areas.reversed()).recommendedShelfID, "b-snug"
+        )
+    }
+
+    func testAreaSearchAvoidsBlockingAStoredProductEvenInATighterArea() {
+        var snug = area("snug", width: 30, depth: 60)
+        snug.products = [storedProduct(
+            id: "rear", volume: volume("rear", 0, 0, 35, 30, 20, 20), stacking: .conservative
+        )]
+        XCTAssertEqual(PlacementEngine.calculate(package: package(), shelf: snug).recommendation?.requiredMoves, ["rear"])
+
+        let result = PlacementEngine.calculate(
+            package: package(), shelves: [snug, area("open", width: 120, depth: 120)]
+        )
+        XCTAssertEqual(result.recommendedShelfID, "open")
+        XCTAssertEqual(result.recommendation?.requiredMoves, [])
+    }
+
+    func testAreaSearchSkipsAnAreaHeldByAnotherPlacement() {
+        let reservation = PlacementReservation(
+            id: "lock", shelfID: "b-snug", productID: "other", shelfVersion: 1,
+            volume: volume("reserved", 0, 0, 0, 10, 10, 10),
+            expiresAt: Date().addingTimeInterval(60), createdBy: "worker"
+        )
+        let result = PlacementEngine.calculate(
+            package: package(),
+            shelves: [area("a-large", width: 120, depth: 120), area("b-snug", width: 40, depth: 40)],
+            activeReservations: [reservation]
+        )
+        XCTAssertEqual(result.recommendedShelfID, "a-large")
+    }
+
+    func testAreaSearchExplainsEveryRefusal() throws {
+        let result = PlacementEngine.calculate(package: package(), shelves: [
+            area("one", width: 15, depth: 15), area("two", width: 10, depth: 80)
+        ])
+        XCTAssertNil(result.recommendedShelfID)
+        XCTAssertNil(result.recommendation)
+        let message = try XCTUnwrap(result.failureMessage)
+        XCTAssertTrue(message.contains("Area one: "), message)
+        XCTAssertTrue(message.contains("Area two: "), message)
+    }
+
+    func testAreaSearchWithNoAreasAsksForOne() {
+        let result = PlacementEngine.calculate(package: package(), shelves: [])
+        XCTAssertNil(result.recommendedShelfID)
+        XCTAssertEqual(result.failureMessage, "No saved storage areas are available. Measure and save one first.")
+    }
+
+    private func area(_ id: String, width: Double, depth: Double) -> ShelfState {
+        var state = shelf(width: width, height: 60, depth: depth)
+        state.id = id
+        state.label = "Area \(id)"
+        return state
+    }
+
     private func package(
         dimensions: PackageDimensions = .init(widthCM: 20, heightCM: 15, depthCM: 20),
         weight: Double = 5,

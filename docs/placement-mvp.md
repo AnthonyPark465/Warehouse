@@ -21,6 +21,24 @@ The `Place` tab implements one complete operational path:
 The placement engine is pure Swift and does not depend on ARKit, SwiftUI, or
 Firebase. Its rules can be tested locally and later executed on a server.
 
+## Choosing the storage area
+
+With more than one saved area, the `Place` tab searches all of them by default
+(`PlacementEngine.calculate(package:shelves:)`) and reserves the best area and
+position together. Each area is calculated by the single-area engine, so every
+safety rule applies unchanged. Areas are then compared on the products that
+would have to be moved, and after that on how little free room the area has
+left. Areas held by another placement are skipped. Turning the toggle off
+restores manual selection of one area.
+
+## Synthetic evaluation
+
+`./scripts/evaluate-placement.sh` replays generated receive and pick sequences
+through the engine under several area-selection policies and writes
+[`placement-evaluation-synthetic.md`](placement-evaluation-synthetic.md). The
+workload is invented; the figures compare policies on that generator and are
+not measurements of a real stock room.
+
 ## Important limits
 
 - LiDAR observes visible geometry; it does not reliably measure occluded space.

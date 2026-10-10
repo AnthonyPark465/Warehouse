@@ -48,6 +48,12 @@ targets:
         TARGETED_DEVICE_FAMILY: 1
         SWIFT_VERSION: 5.10
         CODE_SIGN_STYLE: Automatic
+      configs:
+        # Development builds expose Documents in the Files app so validation
+        # scan recordings (Documents/ScanRecordings) can be copied to a Mac.
+        Debug:
+          INFOPLIST_KEY_UIFileSharingEnabled: YES
+          INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
 
   WarehouseAppTests:
     type: bundle.unit-test

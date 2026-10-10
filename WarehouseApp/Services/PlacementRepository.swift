@@ -67,6 +67,7 @@ enum PlacementRepository {
                     nextGeometry?.version = (stored.geometry?.version ?? 0) + 1
                     // Geometry is replaceable; operational facts are not. In
                     // particular, products and obstacles are preserved exactly.
+                    stored.label = proposed.label
                     stored.boundary = proposed.boundary
                     stored.coordinateSystem = proposed.coordinateSystem
                     stored.primaryFrontDirection = proposed.primaryFrontDirection

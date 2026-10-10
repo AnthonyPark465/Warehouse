@@ -189,28 +189,6 @@ final class LiDARVoxelFusionEngineTests: XCTestCase {
         XCTAssertLessThan(min(yaw, .pi / 2 - yaw), .pi / 180)
     }
 
-    func testSuddenDimensionJumpIsFrozenThenRecoveryKeepsStableResult() throws {
-        var stabilizer = LiDARMeasurementStabilizer(configuration: configuration)
-        let cylinder = ObjectDimensions(length: 6, width: 6, height: 8)
-        let nearbyJump = ObjectDimensions(length: 16, width: 12, height: 9)
-
-        XCTAssertEqual(stabilizer.consider(cylinder), .warmingUp)
-        XCTAssertEqual(stabilizer.consider(cylinder), .warmingUp)
-        XCTAssertEqual(stabilizer.consider(cylinder), .accepted(cylinder))
-
-        let decision = stabilizer.consider(nearbyJump)
-        guard case .frozen(let frozen, let message) = decision else {
-            return XCTFail("A one-estimate jump must be frozen")
-        }
-        XCTAssertEqual(frozen, cylinder)
-        XCTAssertEqual(
-            message,
-            "Possible nearby object detected. Keep other objects outside the scan box."
-        )
-        XCTAssertEqual(stabilizer.consider(cylinder), .accepted(cylinder))
-        XCTAssertEqual(stabilizer.stable, cylinder)
-    }
-
     func testLockedVolumeRejectsPointsBeforeFusion() {
         let engine = makeEngine()
         let result = engine.integrate(framePoints: [

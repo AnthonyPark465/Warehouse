@@ -68,7 +68,8 @@ enum ObjectDimensionCalculator {
             fixedToleranceCM: policy.fixedToleranceCM,
             usesAdjustedDimensions: useAdjustedDimensions,
             measurementQuality: quality(for: capture.confidence),
-            manualMeasurement: capture.manualMeasurement
+            manualMeasurement: capture.manualMeasurement,
+            measurementEvidence: capture.measurementEvidence
         )
     }
 
@@ -97,9 +98,19 @@ enum DimensionUnitConverter {
         }
     }
 
+    /// Dimensions are shown to the nearest millimetre in either unit. Depth
+    /// fusion works on a 3 mm grid, so finer digits would imply precision
+    /// the measurement does not have.
+    static func fractionDigits(for unit: DimensionDisplayUnit) -> Int {
+        switch unit {
+        case .centimetres: 1
+        case .metres: 3
+        }
+    }
+
     static func formatted(_ centimetres: Double, unit: DimensionDisplayUnit) -> String {
         let value = displayValue(centimetres, unit: unit)
-        return "\(value.formatted(.number.precision(.fractionLength(2)))) \(unit.rawValue)"
+        return "\(value.formatted(.number.precision(.fractionLength(fractionDigits(for: unit))))) \(unit.rawValue)"
     }
 }
 

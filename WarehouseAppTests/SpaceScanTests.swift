@@ -118,6 +118,79 @@ final class SpaceGeometryTests: XCTestCase {
         XCTAssertNotNil(PlacementEngine.calculate(package: product, shelf: state).recommendation)
     }
 
+    func testSkewedScannedQuadrilateralStillAdmitsStraightInsertion() throws {
+        var metadata = ProductPlacementMetadata.conservative
+        metadata.weightKG = 0.5
+        metadata.mayRotateAutomatically = true
+        let book = PackagePlacementProfile(
+            productId: "book",
+            dimensions: .init(widthCM: 21.8, heightCM: 1.6, depthCM: 27.9),
+            weightKG: 0.5,
+            demandVelocity: 0.5,
+            metadata: metadata,
+            measurementUncertaintyCM: .init(widthCM: 0, heightCM: 0, depthCM: 0)
+        )
+        // A hand-placed boundary is never exactly aligned with the local axes.
+        for degrees in [-5.0, -2, -0.5, 0, 0.5, 1, 2, 5, 10] {
+            let angle = degrees * .pi / 180
+            let quadrilateral = [(0.0, 0.0), (137.9, 0.0), (137.9, 162.0), (0.0, 162.0)].map {
+                Vector2D($0.0 * cos(angle) - $0.1 * sin(angle), $0.0 * sin(angle) + $0.1 * cos(angle))
+            }
+            let state = try OpenSpacePlacementAdapter.shelfState(from: space(boundary: quadrilateral))
+            let result = PlacementEngine.calculate(package: book, shelf: state)
+            XCTAssertNotNil(result.recommendation, "\(degrees)°: \(result.failureMessage ?? "")")
+        }
+    }
+
+    func testPocketBehindFootprintWallHasNoStraightInsertionPath() throws {
+        // The notch at x 40...100, z 30...60 closes off the rear strip from the front.
+        let footprint = [
+            Vector2D(0, 0), Vector2D(100, 0), Vector2D(100, 30), Vector2D(40, 30),
+            Vector2D(40, 60), Vector2D(100, 60), Vector2D(100, 100), Vector2D(0, 100)
+        ]
+        let state = try OpenSpacePlacementAdapter.shelfState(from: space(boundary: footprint))
+        var metadata = ProductPlacementMetadata.conservative
+        metadata.weightKG = 2
+        metadata.mayRotateAutomatically = false
+        let product = PackagePlacementProfile(
+            productId: "wide-product",
+            dimensions: .init(widthCM: 45, heightCM: 10, depthCM: 31),
+            weightKG: 2,
+            demandVelocity: 0.5,
+            metadata: metadata,
+            measurementUncertaintyCM: .init(widthCM: 0, heightCM: 0, depthCM: 0)
+        )
+
+        let result = PlacementEngine.calculate(package: product, shelf: state)
+        XCTAssertNil(result.recommendation)
+        XCTAssertTrue(result.evaluations.contains { $0.rejectionReasons == [.noInsertionPath] })
+    }
+
+    func testSlantedSideWallIsNotTreatedAsPartOfTheOpening() throws {
+        // A sheared area: both side walls lean 60 cm to one side over 100 cm of depth.
+        let footprint = [Vector2D(0, 0), Vector2D(40, 0), Vector2D(100, 100), Vector2D(60, 100)]
+        let state = try OpenSpacePlacementAdapter.shelfState(from: space(boundary: footprint))
+        var metadata = ProductPlacementMetadata.conservative
+        metadata.weightKG = 2
+        metadata.mayRotateAutomatically = false
+        let product = PackagePlacementProfile(
+            productId: "small-product",
+            dimensions: .init(widthCM: 18, heightCM: 10, depthCM: 18),
+            weightKG: 2,
+            demandVelocity: 0.5,
+            metadata: metadata,
+            measurementUncertaintyCM: .init(widthCM: 0, heightCM: 0, depthCM: 0)
+        )
+
+        let result = PlacementEngine.calculate(package: product, shelf: state)
+        XCTAssertNotNil(result.recommendation, result.failureMessage ?? "")
+        // Pushed straight in from the 0...40 cm front edge, nothing can end up beyond x = 40.
+        for placement in result.evaluations.compactMap(\.result) {
+            XCTAssertLessThanOrEqual(placement.position.x + placement.orientedDimensions.widthCM, 40)
+        }
+        XCTAssertTrue(result.evaluations.contains { $0.rejectionReasons == [.noInsertionPath] })
+    }
+
     func testProductTouchingSafetyMarginExactlyFits() throws {
         let state = try OpenSpacePlacementAdapter.shelfState(from: space())
         var metadata = ProductPlacementMetadata.conservative
@@ -171,8 +244,10 @@ final class SpaceGeometryTests: XCTestCase {
         XCTAssertEqual(decoded.measuredCorners?.first?.sampleCount, 12)
     }
 
-    private func space(surface: SpaceSurfaceType = .floor) -> ScannedSpaceGeometry {
-        let boundary = [Vector2D(0, 0), Vector2D(100, 0), Vector2D(100, 100), Vector2D(0, 100)]
+    private func space(
+        surface: SpaceSurfaceType = .floor,
+        boundary: [Vector2D] = [Vector2D(0, 0), Vector2D(100, 0), Vector2D(100, 100), Vector2D(0, 100)]
+    ) -> ScannedSpaceGeometry {
         return ScannedSpaceGeometry(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000099")!,
             geometryType: .openSpace, surfaceType: surface,

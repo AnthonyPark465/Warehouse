@@ -51,6 +51,9 @@ struct ProductObjectScan: Codable, Equatable {
     let usesAdjustedDimensions: Bool?
     let measurementQuality: MeasurementQuality?
     let manualMeasurement: ManualARMeasurementMetadata?
+    /// Technical record of how a depth-fusion measurement was produced.
+    /// Absent for manual entry, Object Capture, and earlier documents.
+    let measurementEvidence: LiDARMeasurementEvidence?
 }
 
 struct ObjectDimensions: Codable, Equatable {
@@ -74,6 +77,7 @@ struct ObjectScanCapture: Equatable {
     let confidence: Double
     let timestamp: Date
     let manualMeasurement: ManualARMeasurementMetadata?
+    let measurementEvidence: LiDARMeasurementEvidence?
 
     init(
         id: UUID,
@@ -84,7 +88,8 @@ struct ObjectScanCapture: Equatable {
         hasLiDAR: Bool,
         confidence: Double,
         timestamp: Date,
-        manualMeasurement: ManualARMeasurementMetadata? = nil
+        manualMeasurement: ManualARMeasurementMetadata? = nil,
+        measurementEvidence: LiDARMeasurementEvidence? = nil
     ) {
         self.id = id
         self.rawDimensionsCM = rawDimensionsCM
@@ -95,5 +100,6 @@ struct ObjectScanCapture: Equatable {
         self.confidence = confidence
         self.timestamp = timestamp
         self.manualMeasurement = manualMeasurement
+        self.measurementEvidence = measurementEvidence
     }
 }

@@ -333,6 +333,43 @@ struct StorageMarkerDraft: Equatable {
         )
     }
 
+    /// The same measurement expressed in axes that run along the walls.
+    ///
+    /// The capture axes come from where the phone pointed when the base
+    /// surface was chosen, so a rectangular footprint is usually stored
+    /// turned by some angle. Placement works in boxes aligned to the local
+    /// axes: with turned axes it sets every product askew to the walls and
+    /// wastes the corners. Here the axes are turned about the vertical by
+    /// the smallest angle (at most 45°) that lines them up with the
+    /// footprint, so depth still points the way the user was facing and the
+    /// front stays the side they stood at. Nothing moves in the world.
+    func alignedToWalls(useCorrectedFootprint: Bool) -> StorageMarkerDraft {
+        let footprint = (useCorrectedFootprint ? correctedFootprint2D ?? rawFootprint2D : rawFootprint2D)
+            .map(\.simd)
+        guard let angle = StorageMarkerGeometryBuilder.wallAlignmentAngle(of: footprint) else {
+            return self
+        }
+        let cosine = cos(angle), sine = sin(angle)
+        func turned(_ vector: Vector2D) -> Vector2D {
+            Vector2D(vector.x * cosine + vector.y * sine, -vector.x * sine + vector.y * cosine)
+        }
+        let width = localXAxisWorld.normalized.simd
+        let depth = localDepthAxisWorld.normalized.simd
+        var aligned = self
+        aligned.localXAxisWorld = Vector3D(simd_normalize(width * cosine + depth * sine))
+        aligned.localDepthAxisWorld = Vector3D(simd_normalize(depth * cosine - width * sine))
+        aligned.rawFootprint2D = rawFootprint2D.map(turned)
+        aligned.correctedFootprint2D = correctedFootprint2D?.map(turned)
+        aligned.boundaries = boundaries.map { boundary in
+            var boundary = boundary
+            boundary.rawPoint2D = turned(boundary.rawPoint2D)
+            boundary.rawNormal2D = turned(boundary.rawNormal2D)
+            boundary.correctedNormal2D = boundary.correctedNormal2D.map(turned)
+            return boundary
+        }
+        return aligned
+    }
+
     func record(approvedCorrected: Bool, heightCM: Double) -> StorageMarkerMeasurementRecord {
         StorageMarkerMeasurementRecord(
             schemaVersion: 3,
@@ -548,6 +585,25 @@ enum StorageMarkerGeometryBuilder {
             interior: rawSolution.interior,
             maximumCorrection: maximumCorrection
         )
+    }
+
+    /// Angle, within ±45°, by which the footprint's edges are turned from
+    /// the local axes. Edges vote by length, with directions a quarter turn
+    /// apart counted as the same, so the four sides of a rectangle agree
+    /// exactly and a slightly skewed one gets its best fit.
+    static func wallAlignmentAngle(of polygon: [SIMD2<Double>]) -> Double? {
+        guard polygon.count >= 3 else { return nil }
+        var sum = SIMD2<Double>.zero
+        for index in polygon.indices {
+            let edge = polygon[(index + 1) % polygon.count] - polygon[index]
+            let length = simd_length(edge)
+            guard length.isFinite, length > 0 else { continue }
+            let direction = 4 * atan2(edge.y, edge.x)
+            sum += SIMD2(cos(direction), sin(direction)) * length
+        }
+        // No preferred direction (a regular octagon, say): leave the axes be.
+        guard simd_length(sum) > 0.000_001 else { return nil }
+        return atan2(sum.y, sum.x) / 4
     }
 
     static func contains(_ point: SIMD2<Double>, polygon: [SIMD2<Double>]) -> Bool {

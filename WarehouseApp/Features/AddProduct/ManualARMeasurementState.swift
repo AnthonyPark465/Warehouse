@@ -49,19 +49,27 @@ struct ManualProductScanStatus: Equatable {
     var detectedWorldPoints: [SIMD3<Float>] = []
     var centredDisplayPoints: [SIMD3<Float>] = []
     var boundingBoxCornersWorld: [SIMD3<Float>] = []
+    /// Application-level coverage and stability indicator, not accuracy.
     var confidence = 0.0
     var dimensionsAreStable = false
     var touchesBoundary = false
     var canFinish = false
+    /// Outcome of the pipeline's final acceptance stage.
+    var decision = LiDARAcceptanceDecision.notStarted
+    /// What the scan still needs, most important first.
+    var guidance: [String] = []
+    var evidence: LiDARMeasurementEvidence?
 
+    /// Finishing requires a measurement the acceptance stage did not refuse,
+    /// a complete box to show, and dimensions inside the storable range.
     static func finishIsAvailable(
+        decision: LiDARAcceptanceDecision,
         dimensions: ObjectDimensions?,
-        stablePointCount: Int,
         boundingBoxCornersWorld: [SIMD3<Float>]
     ) -> Bool {
-        guard let dimensions,
-              boundingBoxCornersWorld.count == 8,
-              stablePointCount >= ObjectScanValidation.minimumPointCount
+        guard decision.allowsFinish,
+              let dimensions,
+              boundingBoxCornersWorld.count == 8
         else { return false }
         return dimensions.values.allSatisfy {
             $0.isFinite
@@ -69,17 +77,45 @@ struct ManualProductScanStatus: Equatable {
                 && $0 <= ObjectScanValidation.maximumDimensionCM
         }
     }
+}
 
-    mutating func updateCaptureProgress(
-        message: String,
-        integratedFrameCount: Int,
-        capturedPointCount: Int,
-        rejectedOutsideRegionCount: Int
-    ) {
-        self.message = message
-        self.integratedFrameCount = integratedFrameCount
-        self.capturedPointCount = capturedPointCount
-        self.rejectedOutsideRegionCount = rejectedOutsideRegionCount
+extension ManualProductScanStatus {
+    init(report: LiDARMeasurementReport) {
+        let measurement = report.measurement
+        self.init(
+            message: Self.message(for: report),
+            integratedFrameCount: report.evidence.frames.acceptedFrameCountSinceReset,
+            capturedPointCount: report.totalVoxelCount,
+            stablePointCount: measurement?.fusedVoxelCount ?? 0,
+            rejectedOutsideRegionCount: report.evidence.frames.outsideRegionSampleCount,
+            detectedDimensionsCM: report.reportedDimensionsCM,
+            detectedWorldPoints: measurement?.worldPointsInMetres ?? [],
+            centredDisplayPoints: measurement?.centredPointsInMetres ?? [],
+            boundingBoxCornersWorld: measurement?.boundingBoxCornersWorld ?? [],
+            confidence: report.coverageScore,
+            dimensionsAreStable: report.dimensionsAreStable,
+            touchesBoundary: measurement?.touchesRegionBoundary ?? false,
+            canFinish: Self.finishIsAvailable(
+                decision: report.decision,
+                dimensions: report.reportedDimensionsCM,
+                boundingBoxCornersWorld: measurement?.boundingBoxCornersWorld ?? []
+            ),
+            decision: report.decision,
+            guidance: report.guidance,
+            evidence: report.evidence
+        )
+    }
+
+    private static func message(for report: LiDARMeasurementReport) -> String {
+        switch report.decision.status {
+        case .accepted:
+            "All scan checks passed. You can finish."
+        case .qualified:
+            report.guidance.first.map { "You can finish, with a caution: \($0)" }
+                ?? "You can finish, with cautions."
+        case .refused:
+            report.guidance.first ?? "Collecting product surfaces inside the scanning region…"
+        }
     }
 }
 
@@ -96,11 +132,16 @@ final class ManualARMeasurementState: ObservableObject {
     @Published private(set) var trackingMessage = "Initialising AR tracking…"
     @Published private(set) var trackingIsNormal = false
     @Published private(set) var renderRevision = 0
+    /// Bumped when only the detected product's points or box changed, so the
+    /// AR view can redraw those without rebuilding the markers and boundary.
+    @Published private(set) var detectedProductRevision = 0
     @Published private(set) var placementRequestID = 0
     @Published private(set) var productScanStartRequestID = 0
     @Published private(set) var productScanStopRequestID = 0
     @Published private(set) var productScanStatus = ManualProductScanStatus()
     @Published private(set) var productScanIsActive = false
+    /// Outcome of the last validation recording, when recording is on.
+    @Published private(set) var recordingNote: String?
     @Published var errorMessage: String?
     @Published var percentageTolerance = ObjectDimensionPolicy.default.percentageTolerance
     @Published var fixedToleranceCM = ObjectDimensionPolicy.default.fixedToleranceCM
@@ -137,35 +178,42 @@ final class ManualARMeasurementState: ObservableObject {
         ObjectDimensionCalculator.quality(for: confidence)
     }
 
+    // These two run ten times a second. A published property announces a
+    // change on every assignment, so each is assigned only when it differs.
+
     func updatePreview(_ sample: CentreRaycastSample?) {
-        currentSample = sample
+        if currentSample != sample { currentSample = sample }
     }
 
     func updateTracking(_ state: ARCamera.TrackingState) {
+        let isNormal: Bool
+        let message: String
         switch state {
         case .normal:
-            trackingIsNormal = true
-            trackingMessage = "Tracking ready"
-            if stage == .environment, currentSample != nil {
-                stage = .boundary
-            }
+            isNormal = true
+            message = "Tracking ready"
         case .notAvailable:
-            trackingIsNormal = false
-            trackingMessage = "Tracking unavailable. Check camera access and restart."
+            isNormal = false
+            message = "Tracking unavailable. Check camera access and restart."
         case .limited(let reason):
-            trackingIsNormal = false
+            isNormal = false
             switch reason {
             case .initializing:
-                trackingMessage = "Initialising—move the phone slowly around the product."
+                message = "Initialising—move the phone slowly around the product."
             case .excessiveMotion:
-                trackingMessage = "Excessive motion—move the phone more slowly."
+                message = "Excessive motion—move the phone more slowly."
             case .insufficientFeatures:
-                trackingMessage = "Not enough surface detail—add light or aim at a textured area."
+                message = "Not enough surface detail—add light or aim at a textured area."
             case .relocalizing:
-                trackingMessage = "Relocalising—return the phone to the scanned area."
+                message = "Relocalising—return the phone to the scanned area."
             @unknown default:
-                trackingMessage = "Tracking is limited. Move slowly and improve lighting."
+                message = "Tracking is limited. Move slowly and improve lighting."
             }
+        }
+        if trackingIsNormal != isNormal { trackingIsNormal = isNormal }
+        if trackingMessage != message { trackingMessage = message }
+        if isNormal, stage == .environment, currentSample != nil {
+            stage = .boundary
         }
     }
 
@@ -352,14 +400,23 @@ final class ManualARMeasurementState: ObservableObject {
         )
     }
 
+    /// The seed sits this far above the lower limit so it lies inside the
+    /// product rather than on the supporting surface.
+    static let seedHeightAboveLowerLimitMetres: Float = 0.02
+
+    /// The point the product is expected to surround: an interior point of
+    /// the marked polygon. The user selects the object by drawing the region
+    /// around it, so the region's middle stands in for an aim point.
     var productSeed: SIMD3<Float>? {
-        guard let region = productScanRegion, !region.polygon.isEmpty else { return nil }
-        let centre = region.polygon.reduce(SIMD2<Float>.zero, +)
-            / Float(region.polygon.count)
+        guard let region = productScanRegion,
+              let centre = ManualMeasurementGeometry.interiorPoint(
+                of: region.polygon.map { SIMD2<Double>($0) }
+              )
+        else { return nil }
         return region.origin
-            + region.axisU * centre.x
-            + region.axisV * centre.y
-            + region.normal * (region.lowerOffset + 0.02)
+            + region.axisU * Float(centre.x)
+            + region.axisV * Float(centre.y)
+            + region.normal * (region.lowerOffset + Self.seedHeightAboveLowerLimitMetres)
     }
 
     func startProductScan() {
@@ -375,6 +432,10 @@ final class ManualARMeasurementState: ObservableObject {
         productScanStartRequestID += 1
     }
 
+    func noteRecording(_ message: String) {
+        recordingNote = message
+    }
+
     func stopProductScan() {
         guard productScanIsActive else { return }
         productScanIsActive = false
@@ -383,12 +444,16 @@ final class ManualARMeasurementState: ObservableObject {
 
     func finishProductScan() {
         let canFinishNow = ManualProductScanStatus.finishIsAvailable(
+            decision: productScanStatus.decision,
             dimensions: productScanStatus.detectedDimensionsCM,
-            stablePointCount: productScanStatus.stablePointCount,
             boundingBoxCornersWorld: productScanStatus.boundingBoxCornersWorld
         )
         guard canFinishNow else {
             reject(scanCompletionProblem)
+            return
+        }
+        guard trackingIsNormal else {
+            reject(LiDARMeasurementGuidance.message(for: .trackingNotNormal))
             return
         }
         stopProductScan()
@@ -397,10 +462,25 @@ final class ManualARMeasurementState: ObservableObject {
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
+    /// The AR coordinate system may have changed mid-scan. The fused data is
+    /// already discarded; the marked region was placed in the old coordinates
+    /// too, so the scan stops until the user has checked it.
+    func handleTrackingReset() {
+        guard stage == .productScan, productScanIsActive else { return }
+        stopProductScan()
+        clearDetectedProduct()
+        renderRevision += 1
+        reject("Tracking was interrupted, so the scan was stopped and its data discarded. Check that the cyan region still surrounds the product, re-mark it if it has shifted, then start the scan again.")
+    }
+
+    /// Returns from review to scanning. Capture restarts from empty, so the
+    /// previous result is cleared rather than left on screen as if current.
     func continueProductScan() {
         stage = .productScan
+        clearDetectedProduct()
         productScanIsActive = true
         productScanStartRequestID += 1
+        renderRevision += 1
     }
 
     func updateProductScan(_ status: ManualProductScanStatus) {
@@ -410,21 +490,13 @@ final class ManualARMeasurementState: ObservableObject {
                 != status.boundingBoxCornersWorld
         productScanStatus = status
         if detectedGeometryChanged {
-            renderRevision += 1
+            detectedProductRevision += 1
         }
     }
 
     private var scanCompletionProblem: String {
-        if productScanStatus.touchesBoundary {
-            return "The detected product touches the scanning limit. Expand the boundary or limits and rescan."
-        }
-        if productScanStatus.stablePointCount < LiDARFusionConfiguration.smallObject.minimumStableVoxelCount {
-            return "Too little product geometry was collected. Scan the front, sides, and top."
-        }
-        if !productScanStatus.dimensionsAreStable {
-            return "The calculated dimensions are still changing. Continue scanning slowly."
-        }
-        return "More scan coverage is required before finishing."
+        productScanStatus.guidance.first
+            ?? "More scan coverage is required before finishing."
     }
 
     private func clearDetectedProduct() {
@@ -465,7 +537,8 @@ final class ManualARMeasurementState: ObservableObject {
             hasLiDAR: ObjectScannerCapabilities.hasLiDAR,
             confidence: confidence,
             timestamp: .now,
-            manualMeasurement: metadata
+            manualMeasurement: metadata,
+            measurementEvidence: productScanStatus.evidence
         )
     }
 

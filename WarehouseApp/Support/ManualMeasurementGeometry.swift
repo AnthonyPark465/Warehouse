@@ -247,6 +247,52 @@ enum ManualMeasurementGeometry {
         return false
     }
 
+    /// A point guaranteed to lie inside a simple polygon: its area centroid
+    /// when that is interior, otherwise the centroid of its largest
+    /// triangle. The vertex mean of a concave outline can fall outside it.
+    static func interiorPoint(of polygon: [SIMD2<Double>]) -> SIMD2<Double>? {
+        guard polygon.count >= 3 else { return nil }
+        let signedArea = polygonArea(polygon)
+        if abs(signedArea) > 1e-12 {
+            var centroid = SIMD2<Double>.zero
+            for index in polygon.indices {
+                let current = polygon[index]
+                let next = polygon[(index + 1) % polygon.count]
+                centroid += (current + next) * cross(current, next)
+            }
+            centroid /= 6 * signedArea
+            if contains(centroid, in: polygon) { return centroid }
+        }
+        let indices = triangulationIndices(for: polygon)
+        var best: (area: Double, centre: SIMD2<Double>)?
+        for start in stride(from: 0, to: indices.count - 2, by: 3) {
+            let a = polygon[Int(indices[start])]
+            let b = polygon[Int(indices[start + 1])]
+            let c = polygon[Int(indices[start + 2])]
+            let area = abs(cross(b - a, c - a)) / 2
+            if best == nil || area > best!.area {
+                best = (area, (a + b + c) / 3)
+            }
+        }
+        return best?.centre
+    }
+
+    /// Even-odd point-in-polygon test.
+    static func contains(_ point: SIMD2<Double>, in polygon: [SIMD2<Double>]) -> Bool {
+        var inside = false
+        var previous = polygon.count - 1
+        for current in polygon.indices {
+            let a = polygon[current]
+            let b = polygon[previous]
+            if (a.y > point.y) != (b.y > point.y),
+               point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x {
+                inside.toggle()
+            }
+            previous = current
+        }
+        return inside
+    }
+
     /// Ear-clipping triangulation preserves concave footprint boundaries, so
     /// the translucent AR fill never extends outside the user's polygon.
     static func triangulationIndices(for polygon: [SIMD2<Double>]) -> [UInt32] {

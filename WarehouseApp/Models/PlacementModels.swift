@@ -615,6 +615,12 @@ struct ShelfState: Codable, Equatable, Identifiable {
     var geometry: ShelfGeometryRecord? = nil
     var ratedWeightKG: Double?
     var updatedAt: Date
+
+    /// Label shown to warehouse staff. Areas saved before a surface or name was
+    /// required carry the unhelpful "Scanned Not sure".
+    var displayLabel: String {
+        label == "Scanned \(SpaceSurfaceType.unknown.title)" ? "Storage area" : label
+    }
 }
 
 struct PlacementToleranceConfiguration: Equatable {
@@ -727,6 +733,19 @@ struct PlacementCalculation: Equatable {
     var alternatives: [ProductPlacementResult]
     var evaluations: [PlacementCandidateEvaluation]
     var failureMessage: String?
+}
+
+/// Result of searching several storage areas for one product.
+struct CrossAreaPlacementCalculation: Equatable {
+    /// The single-area calculation for every area searched, keyed by shelf ID.
+    var calculations: [String: PlacementCalculation]
+    /// Nil when no area accepts the product.
+    var recommendedShelfID: String?
+    var failureMessage: String?
+
+    var recommendation: ProductPlacementResult? {
+        recommendedShelfID.flatMap { calculations[$0]?.recommendation }
+    }
 }
 
 struct PlacementReservation: Codable, Equatable, Identifiable {

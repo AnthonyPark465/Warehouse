@@ -226,6 +226,6 @@ struct LiDARFusionCaptureView: View {
     }
 
     private func format(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(2)))
+        value.formatted(.number.precision(.fractionLength(1)))
     }
 }

@@ -7,6 +7,11 @@ struct ManualARMeasurementView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var state = ManualARMeasurementState()
     @State private var showsManualEntry = false
+    #if DEBUG
+    @AppStorage(LiDARScanRecordingSettings.enabledKey) private var recordsRawScans = false
+    @AppStorage(LiDARScanRecordingSettings.productKey) private var recordingProduct = ""
+    @AppStorage(LiDARScanRecordingSettings.stepKey) private var recordingStep = ""
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -213,34 +218,69 @@ struct ManualARMeasurementView: View {
                 )
                 .font(.caption.monospacedDigit())
             }
-            if state.productScanStatus.touchesBoundary {
-                Label(
-                    "Product reaches the scan boundary. You can finish, but enlarging the region and rescanning will be more accurate.",
-                    systemImage: "exclamationmark.triangle.fill"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-            }
-            if state.productScanStatus.canFinish {
-                Label(
-                    state.productScanStatus.dimensionsAreStable
-                        ? "Scan is stable. Finish Product Scan is ready."
-                        : "Orange product box detected. You can finish now, or keep scanning for a more stable result.",
-                    systemImage: "checkmark.circle.fill"
-                )
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.green)
-            }
+            scanGuidance
             if state.productScanIsActive {
                 Button("Finish Product Scan") { state.finishProductScan() }
                     .buttonStyle(.borderedProminent)
                     .frame(maxWidth: .infinity)
-                    .disabled(!state.productScanStatus.canFinish)
+                    .disabled(!state.productScanStatus.canFinish || !state.trackingIsNormal)
             } else {
                 Button("Start Product Scan") { state.startProductScan() }
                     .buttonStyle(.borderedProminent)
                     .frame(maxWidth: .infinity)
+                #if DEBUG
+                recordingControls
+                #endif
             }
+        }
+    }
+
+    #if DEBUG
+    /// Saves the raw frames of each scan so it can be replayed off the
+    /// device (`scripts/replay-measurement.sh`). Development builds only.
+    private var recordingControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("Save raw scan for validation", isOn: $recordsRawScans)
+                .font(.caption)
+            if recordsRawScans {
+                TextField("Product name, e.g. tea-box", text: $recordingProduct)
+                TextField("Test, e.g. accuracy or neighbour-10mm", text: $recordingStep)
+                if let note = state.recordingNote {
+                    Text(note).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .font(.caption)
+        .textFieldStyle(.roundedBorder)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+    }
+    #endif
+
+    /// Says what evidence the scan still lacks. Failures block finishing;
+    /// cautions are carried into the saved record.
+    @ViewBuilder
+    private var scanGuidance: some View {
+        let status = state.productScanStatus
+        let failureCount = status.decision.failures.count
+        // The first item is already the headline message above.
+        ForEach(
+            Array(status.guidance.enumerated().dropFirst().prefix(2)),
+            id: \.offset
+        ) { index, text in
+            Label(
+                text,
+                systemImage: index < failureCount
+                    ? "exclamationmark.circle.fill"
+                    : "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(index < failureCount ? .yellow : .orange)
+        }
+        if status.decision.status == .accepted {
+            Label("All scan checks passed.", systemImage: "checkmark.circle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.green)
         }
     }
 
@@ -257,7 +297,7 @@ struct ManualARMeasurementView: View {
     private var reviewPanel: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                Text("AR measurements are estimates. Verify high-precision inventory with a tape measure.")
+                Text("AR measurements are estimates, not guaranteed dimensions. Check anything that needs precision with a tape measure.")
                     .font(.caption)
                     .foregroundStyle(.orange)
 
@@ -284,14 +324,27 @@ struct ManualARMeasurementView: View {
                             .percent.precision(.fractionLength(0))
                         )
                     )
-                    LabeledContent(
-                        "Supporting surface",
-                        value: "Removed during segmentation"
-                    )
-                    LabeledContent(
-                        "Region overflow",
-                        value: state.productScanStatus.touchesBoundary ? "Detected" : "None"
-                    )
+                    if let uncertainty = state.productScanStatus.evidence?.uncertaintyCM {
+                        LabeledContent(
+                            "Estimated uncertainty",
+                            value: "about ±\((uncertainty.values.max() ?? 0).formatted(.number.precision(.fractionLength(1)))) cm"
+                        )
+                        Text("A heuristic from scan evidence, not a calibrated or guaranteed error bound.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    LabeledContent("Scan checks", value: decisionName)
+                    ForEach(
+                        Array(state.productScanStatus.guidance.enumerated()),
+                        id: \.offset
+                    ) { _, text in
+                        Label(text, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    if let evidence = state.productScanStatus.evidence {
+                        evidenceDetails(evidence)
+                    }
                     LabeledContent("Quality", value: qualityName)
                     LabeledContent("LiDAR", value: ObjectScannerCapabilities.hasLiDAR ? "Available" : "Unavailable")
                 }
@@ -323,6 +376,14 @@ struct ManualARMeasurementView: View {
                     Button("Replace top point") { state.replaceTop() }
                 }
 
+                #if DEBUG
+                if recordsRawScans, let note = state.recordingNote {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                #endif
+
                 HStack {
                     Button("Restart", role: .destructive) { state.reset() }
                     Button("Enter Manually") { showsManualEntry = true }
@@ -342,9 +403,9 @@ struct ManualARMeasurementView: View {
     private func reviewDimensions(_ title: String, _ dimensions: ObjectDimensions) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.headline)
-            LabeledContent("Length", value: "\(dimensions.length.formatted(.number.precision(.fractionLength(2)))) cm")
-            LabeledContent("Width", value: "\(dimensions.width.formatted(.number.precision(.fractionLength(2)))) cm")
-            LabeledContent("Height", value: "\(dimensions.height.formatted(.number.precision(.fractionLength(2)))) cm")
+            LabeledContent("Length", value: "\(dimensions.length.formatted(.number.precision(.fractionLength(1)))) cm")
+            LabeledContent("Width", value: "\(dimensions.width.formatted(.number.precision(.fractionLength(1)))) cm")
+            LabeledContent("Height", value: "\(dimensions.height.formatted(.number.precision(.fractionLength(1)))) cm")
         }
     }
 
@@ -357,6 +418,54 @@ struct ManualARMeasurementView: View {
             width: value(raw.width),
             height: value(raw.height)
         )
+    }
+
+    private var decisionName: String {
+        switch state.productScanStatus.decision.status {
+        case .accepted: "Passed"
+        case .qualified: "Passed with cautions"
+        case .refused: "Not passed"
+        }
+    }
+
+    private func evidenceDetails(_ evidence: LiDARMeasurementEvidence) -> some View {
+        DisclosureGroup("Scan evidence") {
+            LabeledContent(
+                "Frames used / captured",
+                value: "\(evidence.frames.acceptedFrameCountSinceReset) / \(evidence.frames.capturedFrameCount)"
+            )
+            LabeledContent("Repeated surface points", value: "\(evidence.voxels.stableVoxelCount)")
+            if let support = evidence.supportPlane {
+                LabeledContent(
+                    "Supporting surface",
+                    value: support.method == LiDARSupportPlaneEstimate.Method.histogramPeak.rawValue
+                        ? "Detected; kept as the height base"
+                        : "Not detected"
+                )
+            }
+            if let components = evidence.components {
+                LabeledContent(
+                    "Gap bridging",
+                    value: components.connectivityMode
+                        == LiDARComponentSelection.Mode.expanded.rawValue ? "Used" : "Not needed"
+                )
+                LabeledContent(
+                    "Other geometry excluded",
+                    value: "\(components.rejectedComponentCount) piece\(components.rejectedComponentCount == 1 ? "" : "s")"
+                )
+            }
+            if let span = evidence.coverage?.viewpointSpanDegrees {
+                LabeledContent(
+                    "Viewing arc",
+                    value: "\(span.formatted(.number.precision(.fractionLength(0))))°"
+                )
+            }
+            LabeledContent(
+                "Region boundary",
+                value: evidence.boundaryContacts.isEmpty ? "Not touched" : "Touched"
+            )
+        }
+        .font(.caption)
     }
 
     private var qualityName: String {

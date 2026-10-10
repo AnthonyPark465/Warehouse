@@ -88,6 +88,8 @@ struct ScannedSpaceGeometry: Codable, Equatable, Identifiable {
     var scannedBoundary: ScannedStorageBoundary? = nil
     /// Selected base-plane provenance plus exactly four wall boundaries.
     var markerMeasurement: StorageMarkerMeasurementRecord? = nil
+    /// Staff-facing name such as "Back room floor". Older records decode with nil.
+    var name: String? = nil
 
     var isApprovedForPlacement: Bool {
         approval == .approved && approvedBoundary2D.count >= 3 && heightCM.isFinite && heightCM > 0
@@ -265,14 +267,19 @@ enum OpenSpacePlacementAdapter {
             placementSafetyMarginCM: 1, measurementMetadata: metadata,
             excludedRegions: space.excludedRegions2D.map { $0.map { Vector3D($0.x, 0, $0.y) } }
         )
+        let name = space.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let surfaceLabel = space.surfaceType == .unknown ? "Storage area" : "Scanned \(space.surfaceType.title)"
         return ShelfState(
-            id: space.id.uuidString, label: "Scanned \(space.surfaceType.title)", barcode: "SPACE-\(space.id)",
+            id: space.id.uuidString, label: name.isEmpty ? surfaceLabel : name, barcode: "SPACE-\(space.id)",
             version: max(space.geometryVersion, 2), boundary: boundary,
             coordinateSystem: ShelfLocalCoordinateSystem(anchorOrigin: space.localOrigin,
                 widthAxis: space.localXAxis, upAxis: space.localVerticalAxis, depthAxis: space.localYAxis),
             primaryFrontDirection: space.accessDirections.first ?? Vector3D(0, 0, 1),
             secondaryAccessDirections: Array(space.accessDirections.dropFirst()),
-            compartments: [.init(id: "open", label: space.surfaceType.title, volume: boundary, ratedWeightKG: nil)],
+            compartments: [.init(
+                id: "open", label: space.surfaceType == .unknown ? "Open area" : space.surfaceType.title,
+                volume: boundary, ratedWeightKG: nil
+            )],
             obstacles: [], products: [],
             scanQuality: .init(hasClosedBoundary: true, missingSurfaceCount: 0, trackingDriftCM: 0,
                 confidence: space.confidence.overall, capturedAt: space.createdAt),

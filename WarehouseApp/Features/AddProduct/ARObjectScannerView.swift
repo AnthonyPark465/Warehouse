@@ -47,11 +47,19 @@ struct ARObjectScannerView: UIViewRepresentable {
     func makeUIView(context: Context) -> ARView {
         let view = ARView(frame: .zero)
         context.coordinator.arView = view
+        // The session is configured here; RealityKit must not reconfigure it.
+        view.automaticallyConfigureSession = false
+        // Only the unlit selection box is drawn over the camera image.
+        view.renderOptions = [
+            .disableMotionBlur, .disableDepthOfField, .disableHDR, .disableCameraGrain,
+            .disableGroundingShadows, .disableAREnvironmentLighting,
+            .disablePersonOcclusion, .disableFaceMesh
+        ]
+        // The measurement reads depth maps only. Mesh reconstruction and
+        // plane detection are never consulted, so they are left off.
         let configuration = ARWorldTrackingConfiguration()
         configuration.environmentTexturing = .none
-        configuration.sceneReconstruction = .mesh
         configuration.frameSemantics.insert(.smoothedSceneDepth)
-        configuration.planeDetection = [.horizontal]
         view.session.delegate = context.coordinator
         // All coordinator state is confined to the fusion queue; delegate
         // callbacks are delivered there so no state crosses threads.
@@ -76,19 +84,29 @@ struct ARObjectScannerView: UIViewRepresentable {
     final class Coordinator: NSObject, ARSessionDelegate {
         weak var arView: ARView?
 
-        private let configuration = LiDARFusionConfiguration.smallObject
+        /// The shared pipeline defaults, with the depth range narrowed to
+        /// the arm's-length distance this capture mode is used at.
+        private let configuration: LiDARFusionConfiguration = {
+            var configuration = LiDARFusionConfiguration.smallObject
+            configuration.minimumDepthMetres = 0.15
+            configuration.maximumDepthMetres = 1.20
+            return configuration
+        }()
         private let onStatus: (ObjectScanLiveStatus) -> Void
         private let onCapture: (ObjectScanCapture?, String?) -> Void
         private var isScanning: Bool
         private var resetToken: Int
         private var selectionSettings: ObjectScanSelectionSettings
-        private var fusion: LiDARVoxelFusionEngine
-        private var stabilizer: LiDARMeasurementStabilizer
+        private let measurementSession: LiDARMeasurementSession
+        private var latestReport = LiDARMeasurementReport()
+        /// Incremented when the session's world coordinate system may have
+        /// changed, so the pipeline discards evidence from the old one.
+        private var coordinateEpoch = 0
         private var currentStatus = ObjectScanLiveStatus()
+        private var publishedStatus: ObjectScanLiveStatus?
         private var lastProcessedTime: TimeInterval = 0
         private var awaitingSelectionLock = false
         private var selectionAnchorEntity: AnchorEntity?
-        private var stableMeasurement: LiDARFusionMeasurement?
         let fusionQueue = DispatchQueue(
             label: "com.tetris.warehouse.lidar-fusion",
             qos: .userInitiated
@@ -106,8 +124,7 @@ struct ARObjectScannerView: UIViewRepresentable {
             self.selectionSettings = selectionSettings
             self.onStatus = onStatus
             self.onCapture = onCapture
-            fusion = LiDARVoxelFusionEngine(configuration: configuration)
-            stabilizer = LiDARMeasurementStabilizer(configuration: configuration)
+            measurementSession = LiDARMeasurementSession(configuration: configuration)
             awaitingSelectionLock = isScanning
         }
 
@@ -150,13 +167,34 @@ struct ARObjectScannerView: UIViewRepresentable {
                 publishStatus()
                 return
             }
+            guard frame.timestamp - lastProcessedTime >= configuration.frameIntervalSeconds else {
+                return
+            }
+            lastProcessedTime = frame.timestamp
+            let cameraColumn = frame.camera.transform.columns.3
+            var depthFrame = LiDARDepthFrame(
+                points: [],
+                timestamp: frame.timestamp,
+                tracking: trackingQuality(frame.camera.trackingState),
+                coordinateEpoch: coordinateEpoch,
+                cameraPosition: SIMD3<Float>(cameraColumn.x, cameraColumn.y, cameraColumn.z),
+                source: .sceneDepth
+            )
             guard trackingIsNormal else {
+                // Let the pipeline see the degraded frame so it can decide
+                // whether the evidence gathered so far is still valid.
+                if !awaitingSelectionLock {
+                    let report = measurementSession.process(depthFrame)
+                    if report.frame?.evidenceWasInvalidated == true {
+                        restartAfterTrackingReset()
+                        return
+                    }
+                    apply(report)
+                }
                 currentStatus.message = trackingMessage(frame.camera.trackingState)
                 publishStatus()
                 return
             }
-            guard frame.timestamp - lastProcessedTime >= 0.08 else { return }
-            lastProcessedTime = frame.timestamp
 
             autoreleasepool {
                 if awaitingSelectionLock {
@@ -166,7 +204,7 @@ struct ARObjectScannerView: UIViewRepresentable {
                         return
                     }
                     let volume = makeLockedVolume(seed: seed, cameraTransform: frame.camera.transform)
-                    fusion.lockSelection(volume: volume, seed: seed)
+                    measurementSession.begin(volume: volume, seed: seed)
                     awaitingSelectionLock = false
                     currentStatus.selectionIsLocked = true
                     currentStatus.message = "Selection locked. Move slowly around the object."
@@ -175,26 +213,35 @@ struct ARObjectScannerView: UIViewRepresentable {
                     return
                 }
 
-                guard let points = extractSelectedDepthPoints(from: frame), !points.isEmpty else {
-                    currentStatus.message = "No medium/high-confidence depth inside the scan box."
-                    publishStatus()
+                guard isScanning else { return }
+                // An empty frame is still processed: the pipeline must know
+                // the object is no longer in view.
+                extractSelectedDepthPoints(from: frame, into: &depthFrame)
+                let report = measurementSession.process(depthFrame)
+                if report.frame?.evidenceWasInvalidated == true {
+                    restartAfterTrackingReset()
                     return
                 }
-
-                guard isScanning else { return }
-                let result = fusion.integrate(framePoints: points)
-                currentStatus.integratedFrameCount += 1
-                currentStatus.rejectedPointCount += result.rejectedOutsideVolumeCount
-                updateEstimate()
-                if result.rejectedOutsideVolumeCount > 0 {
-                    currentStatus.message =
-                        "\(result.rejectedOutsideVolumeCount) outside-volume samples rejected this frame."
-                } else {
-                    currentStatus.message =
-                        "Fusing selected object… capture the front, sides, top, and back."
+                apply(report)
+                if depthFrame.points.isEmpty {
+                    currentStatus.message = "No medium/high-confidence depth inside the scan box."
                 }
                 publishStatus()
             }
+        }
+
+        /// Delivered on the fusion queue. The locked volume was placed in
+        /// the old coordinate system, so the scan starts over and re-locks.
+        func sessionWasInterrupted(_ session: ARSession) {
+            coordinateEpoch += 1
+            if isScanning { restartAfterTrackingReset() }
+        }
+
+        private func restartAfterTrackingReset() {
+            reset()
+            currentStatus.message =
+                "Tracking was lost, so the scan restarted. Aim at the object to lock it again."
+            publishStatus()
         }
 
         func session(_ session: ARSession, didFailWithError error: Error) {
@@ -205,9 +252,8 @@ struct ARObjectScannerView: UIViewRepresentable {
 
         /// Runs on the fusion queue; RealityKit entities are touched on main.
         private func reset() {
-            fusion.reset()
-            stabilizer.reset()
-            stableMeasurement = nil
+            measurementSession.reset()
+            latestReport = LiDARMeasurementReport()
             DispatchQueue.main.async { [weak self] in
                 self?.selectionAnchorEntity?.removeFromParent()
                 self?.selectionAnchorEntity = nil
@@ -221,58 +267,54 @@ struct ARObjectScannerView: UIViewRepresentable {
             publishStatus()
         }
 
-        private func updateEstimate() {
-            guard currentStatus.integratedFrameCount.isMultiple(of: 4),
-                  let measurement = fusion.measurement()
-            else { return }
-
-            switch stabilizer.consider(measurement.dimensionsCM) {
-            case .warmingUp:
-                currentStatus.measurementIsStable = false
-                currentStatus.message = "Verifying measurement stability…"
-            case .accepted(let dimensions):
-                stableMeasurement = measurement
-                currentStatus.dimensionsCM = dimensions
-                currentStatus.measurementIsStable = true
-            case .frozen(let dimensions, let message):
-                currentStatus.dimensionsCM = dimensions
-                currentStatus.measurementIsStable = false
-                currentStatus.message = message
-            }
-
-            currentStatus.pointCount = measurement.fusedVoxelCount
-            currentStatus.confidence = confidence(
-                measurement: measurement,
-                frameCount: currentStatus.integratedFrameCount
-            )
+        /// Copies the pipeline's report into the published status. Finishing
+        /// is offered only when the acceptance stage did not refuse.
+        private func apply(_ report: LiDARMeasurementReport) {
+            latestReport = report
+            let frames = report.evidence.frames
+            currentStatus.integratedFrameCount = frames.acceptedFrameCountSinceReset
+            currentStatus.rejectedPointCount = frames.outsideRegionSampleCount
+            currentStatus.dimensionsCM = report.reportedDimensionsCM
+            currentStatus.measurementIsStable = report.dimensionsAreStable
+            currentStatus.pointCount = report.measurement?.fusedVoxelCount ?? 0
+            currentStatus.confidence = report.coverageScore
             currentStatus.canFinish =
                 currentStatus.selectionIsLocked
-                && currentStatus.measurementIsStable
-                && currentStatus.integratedFrameCount >= configuration.minimumFusedFrameCount
-                && currentStatus.pointCount >= configuration.minimumStableVoxelCount
-                && currentStatus.confidence >= ObjectScanValidation.minimumConfidence
+                && report.measurement != nil
+                && report.decision.allowsFinish
+                && report.coverageScore >= ObjectScanValidation.minimumConfidence
+            switch report.decision.status {
+            case .accepted:
+                currentStatus.message = "All scan checks passed. You can finish."
+            case .qualified:
+                currentStatus.message = report.guidance.first
+                    .map { "You can finish, with a caution: \($0)" }
+                    ?? "You can finish, with cautions."
+            case .refused:
+                currentStatus.message = report.guidance.first
+                    ?? "Fusing selected object… capture the front, sides, top, and back."
+            }
         }
 
         private func finishCapture() {
+            // Re-run the geometric stages on everything fused so far before
+            // deciding; this runs on the fusion queue.
+            if currentStatus.selectionIsLocked {
+                apply(measurementSession.refresh())
+            }
+            let report = latestReport
             guard currentStatus.canFinish,
-                  let measurement = stableMeasurement,
-                  let stableDimensions = stabilizer.stable
+                  let measurement = report.measurement,
+                  let dimensions = report.reportedDimensionsCM
             else {
-                DispatchQueue.main.async {
-                    self.onCapture(
-                        nil,
-                        "Coverage or stability is incomplete. Continue until Finish Scan is enabled."
-                    )
-                }
+                let reason = report.guidance.first
+                    ?? "Coverage or stability is incomplete. Continue until Finish Scan is enabled."
+                DispatchQueue.main.async { self.onCapture(nil, reason) }
                 return
             }
-            let confidence = confidence(
-                measurement: measurement,
-                frameCount: currentStatus.integratedFrameCount
-            )
             if let validation = ObjectScanValidation.message(
-                dimensions: stableDimensions,
-                confidence: confidence,
+                dimensions: dimensions,
+                confidence: report.coverageScore,
                 pointCount: measurement.fusedVoxelCount
             ) {
                 DispatchQueue.main.async { self.onCapture(nil, validation) }
@@ -281,43 +323,35 @@ struct ARObjectScannerView: UIViewRepresentable {
 
             let capture = ObjectScanCapture(
                 id: UUID(),
-                rawDimensionsCM: stableDimensions,
+                rawDimensionsCM: dimensions,
                 pointsInMetres: measurement.centredPointsInMetres,
                 scanMethod: .lidar,
                 deviceModel: ObjectScannerCapabilities.deviceModelIdentifier,
                 hasLiDAR: true,
-                confidence: confidence,
-                timestamp: .now
+                confidence: report.coverageScore,
+                timestamp: .now,
+                measurementEvidence: report.evidence
             )
             DispatchQueue.main.async { self.onCapture(capture, nil) }
         }
 
-        private func confidence(
-            measurement: LiDARFusionMeasurement,
-            frameCount: Int
-        ) -> Double {
-            let frameScore = min(
-                Double(frameCount) / Double(configuration.minimumFusedFrameCount * 2),
-                1
-            )
-            let voxelScore = min(
-                Double(measurement.fusedVoxelCount)
-                    / Double(configuration.minimumStableVoxelCount * 6),
-                1
-            )
-            let observationScore = min(measurement.averageObservationsPerVoxel / 8, 1)
-            let stabilityScore = currentStatus.measurementIsStable ? 1.0 : 0.25
-            return min(
-                frameScore * 0.25
-                    + voxelScore * 0.25
-                    + observationScore * 0.20
-                    + stabilityScore * 0.30,
-                0.95
-            )
+        private func trackingQuality(
+            _ state: ARCamera.TrackingState
+        ) -> LiDARTrackingQuality {
+            switch state {
+            case .normal: .normal
+            case .notAvailable: .notAvailable
+            case .limited(.relocalizing): .relocalizing
+            case .limited: .limited
+            }
         }
 
+        /// Called for every camera frame while idle; only a changed status
+        /// is worth a main-queue hop and a SwiftUI update.
         private func publishStatus() {
             let status = currentStatus
+            guard status != publishedStatus else { return }
+            publishedStatus = status
             DispatchQueue.main.async { self.onStatus(status) }
         }
 
@@ -362,55 +396,64 @@ struct ARObjectScannerView: UIViewRepresentable {
                 guard !centreDepths.isEmpty else { return nil }
                 centreDepths.sort()
                 let depth = centreDepths[centreDepths.count / 2]
-                return self.worldPoint(
-                    x: centreX,
-                    y: centreY,
-                    depth: depth,
-                    depthWidth: width,
-                    depthHeight: height,
-                    frame: frame
-                )
+                return ARDepthProjection(frame: frame, depthWidth: width, depthHeight: height)
+                    .worldPoint(x: centreX, y: centreY, depth: depth)
             }
         }
 
-        private func extractSelectedDepthPoints(from frame: ARFrame) -> [SIMD3<Float>]? {
-            guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+        /// Reads the screen selection through the shared per-sample filter,
+        /// recording how many samples it examined and rejected.
+        private func extractSelectedDepthPoints(
+            from frame: ARFrame,
+            into depthFrame: inout LiDARDepthFrame
+        ) {
+            guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return }
             let depthMap = depthData.depthMap
             let confidenceMap = depthData.confidenceMap
-            return withLockedDepthMaps(depthMap: depthMap, confidenceMap: confidenceMap) {
-                depths, depthStride, confidence, confidenceStride, width, height in
+            let extracted: LiDARDepthFrame? = withLockedDepthMaps(
+                depthMap: depthMap,
+                confidenceMap: confidenceMap
+            ) { depths, depthStride, confidence, confidenceStride, width, height in
                 let halfWidth = Int(Float(width) * self.selectionSettings.screenWidthFraction / 2)
                 let halfHeight = Int(Float(height) * self.selectionSettings.screenHeightFraction / 2)
                 let minX = max(width / 2 - halfWidth, 0)
                 let maxX = min(width / 2 + halfWidth, width)
                 let minY = max(height / 2 - halfHeight, 0)
                 let maxY = min(height / 2 + halfHeight, height)
+                let pixelStride = max(1, self.configuration.depthPixelStride)
+                let projection = ARDepthProjection(frame: frame, depthWidth: width, depthHeight: height)
 
-                var points: [SIMD3<Float>] = []
-                points.reserveCapacity(2_000)
-                for y in stride(from: minY, to: maxY, by: 2) {
-                    for x in stride(from: minX, to: maxX, by: 2) {
+                var result = LiDARDepthFrame(points: [], timestamp: frame.timestamp)
+                result.points.reserveCapacity(2_000)
+                for y in stride(from: minY, to: maxY, by: pixelStride) {
+                    for x in stride(from: minX, to: maxX, by: pixelStride) {
                         let depth = depths[y * depthStride + x]
-                        guard depth.isFinite, depth >= 0.15, depth <= 1.20 else { continue }
-                        if let confidence,
-                           confidence[y * confidenceStride + x]
-                            < ARConfidenceLevel.medium.rawValue {
+                        result.examinedSampleCount += 1
+                        switch LiDARDepthSampleFilter.classify(
+                            depth: depth,
+                            confidenceLevel: confidence.map { Int($0[y * confidenceStride + x]) },
+                            configuration: self.configuration
+                        ) {
+                        case .outOfRange:
+                            result.outOfRangeSampleCount += 1
                             continue
+                        case .lowConfidence:
+                            result.lowConfidenceSampleCount += 1
+                            continue
+                        case .accepted(let isHighConfidence):
+                            if isHighConfidence { result.highConfidenceSampleCount += 1 }
                         }
-                        points.append(
-                            self.worldPoint(
-                                x: x,
-                                y: y,
-                                depth: depth,
-                                depthWidth: width,
-                                depthHeight: height,
-                                frame: frame
-                            )
-                        )
+                        result.points.append(projection.worldPoint(x: x, y: y, depth: depth))
                     }
                 }
-                return points
+                return result
             }
+            guard let extracted else { return }
+            depthFrame.points = extracted.points
+            depthFrame.examinedSampleCount = extracted.examinedSampleCount
+            depthFrame.outOfRangeSampleCount = extracted.outOfRangeSampleCount
+            depthFrame.lowConfidenceSampleCount = extracted.lowConfidenceSampleCount
+            depthFrame.highConfidenceSampleCount = extracted.highConfidenceSampleCount
         }
 
         private func withLockedDepthMaps<Result>(
@@ -451,32 +494,6 @@ struct ARObjectScannerView: UIViewRepresentable {
                 width,
                 height
             )
-        }
-
-        private func worldPoint(
-            x: Int,
-            y: Int,
-            depth: Float,
-            depthWidth: Int,
-            depthHeight: Int,
-            frame: ARFrame
-        ) -> SIMD3<Float> {
-            let resolution = frame.camera.imageResolution
-            let scaleX = Float(depthWidth) / Float(resolution.width)
-            let scaleY = Float(depthHeight) / Float(resolution.height)
-            let intrinsics = frame.camera.intrinsics
-            let fx = intrinsics.columns.0.x * scaleX
-            let fy = intrinsics.columns.1.y * scaleY
-            let cx = intrinsics.columns.2.x * scaleX
-            let cy = intrinsics.columns.2.y * scaleY
-            let cameraPoint = SIMD4<Float>(
-                (Float(x) - cx) * depth / fx,
-                -(Float(y) - cy) * depth / fy,
-                -depth,
-                1
-            )
-            let world = frame.camera.transform * cameraPoint
-            return SIMD3<Float>(world.x, world.y, world.z)
         }
 
         private func makeLockedVolume(
