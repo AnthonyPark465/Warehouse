@@ -203,7 +203,29 @@ struct ARObjectScannerView: UIViewRepresentable {
                         publishStatus()
                         return
                     }
-                    let volume = makeLockedVolume(seed: seed, cameraTransform: frame.camera.transform)
+                    // Highest detected horizontal plane below the aim point:
+                    // the volume stretches down to it so the support surface
+                    // is always inside the scan region.
+                    let floorY = frame.anchors
+                        .compactMap { $0 as? ARPlaneAnchor }
+                        .filter { $0.alignment == .horizontal }
+                        .map { $0.transform.columns.3.y }
+                        .filter { $0 < seed.y - 0.02 }
+                        .max()
+                    let camera = frame.camera.transform
+                    let volume = LockedVolumePlanning.volume(
+                        seed: seed,
+                        cameraRight: SIMD3<Float>(
+                            camera.columns.0.x, camera.columns.0.y, camera.columns.0.z
+                        ),
+                        cameraForward: -SIMD3<Float>(
+                            camera.columns.2.x, camera.columns.2.y, camera.columns.2.z
+                        ),
+                        floorY: floorY,
+                        width: selectionSettings.volumeWidth,
+                        height: selectionSettings.volumeHeight,
+                        depth: selectionSettings.volumeDepth
+                    )
                     measurementSession.begin(volume: volume, seed: seed)
                     awaitingSelectionLock = false
                     currentStatus.selectionIsLocked = true
@@ -346,9 +368,24 @@ struct ARObjectScannerView: UIViewRepresentable {
             }
         }
 
+        private var lastPublishedStatus: ObjectScanLiveStatus?
+        private var lastPublishUptime: UInt64 = 0
+
         /// Called for every camera frame while idle; only a changed status
         /// is worth a main-queue hop and a SwiftUI update.
         private func publishStatus() {
+            // SwiftUI re-renders per publish; ~12 Hz of identical statuses
+            // just contends with frame processing. Publish immediately on
+            // meaningful transitions, at ~6 Hz otherwise.
+            let now = DispatchTime.now().uptimeNanoseconds
+            let significant = currentStatus.canFinish != lastPublishedStatus?.canFinish
+                || currentStatus.selectionIsLocked != lastPublishedStatus?.selectionIsLocked
+                || currentStatus.dimensionsCM != lastPublishedStatus?.dimensionsCM
+            guard significant
+                || lastPublishedStatus == nil
+                || now - lastPublishUptime >= 160_000_000 else { return }
+            lastPublishUptime = now
+            lastPublishedStatus = currentStatus
             let status = currentStatus
             guard status != publishedStatus else { return }
             publishedStatus = status
@@ -414,19 +451,19 @@ struct ARObjectScannerView: UIViewRepresentable {
                 depthMap: depthMap,
                 confidenceMap: confidenceMap
             ) { depths, depthStride, confidence, confidenceStride, width, height in
-                let halfWidth = Int(Float(width) * self.selectionSettings.screenWidthFraction / 2)
-                let halfHeight = Int(Float(height) * self.selectionSettings.screenHeightFraction / 2)
-                let minX = max(width / 2 - halfWidth, 0)
-                let maxX = min(width / 2 + halfWidth, width)
-                let minY = max(height / 2 - halfHeight, 0)
-                let maxY = min(height / 2 + halfHeight, height)
+                let crop = DepthCropping.cropRect(
+                    screenWidthFraction: self.selectionSettings.screenWidthFraction,
+                    screenHeightFraction: self.selectionSettings.screenHeightFraction,
+                    depthWidth: width,
+                    depthHeight: height
+                )
                 let pixelStride = max(1, self.configuration.depthPixelStride)
                 let projection = ARDepthProjection(frame: frame, depthWidth: width, depthHeight: height)
 
                 var result = LiDARDepthFrame(points: [], timestamp: frame.timestamp)
                 result.points.reserveCapacity(2_000)
-                for y in stride(from: minY, to: maxY, by: pixelStride) {
-                    for x in stride(from: minX, to: maxX, by: pixelStride) {
+                for y in stride(from: crop.minY, to: crop.maxY, by: pixelStride) {
+                    for x in stride(from: crop.minX, to: crop.maxX, by: pixelStride) {
                         let depth = depths[y * depthStride + x]
                         result.examinedSampleCount += 1
                         switch LiDARDepthSampleFilter.classify(
@@ -496,40 +533,13 @@ struct ARObjectScannerView: UIViewRepresentable {
             )
         }
 
-        private func makeLockedVolume(
-            seed: SIMD3<Float>,
-            cameraTransform: simd_float4x4
-        ) -> LiDARScanVolume {
-            var cameraRight = SIMD3<Float>(
-                cameraTransform.columns.0.x,
-                0,
-                cameraTransform.columns.0.z
-            )
-            if simd_length_squared(cameraRight) < 0.001 {
-                cameraRight = SIMD3<Float>(1, 0, 0)
-            }
-            cameraRight = simd_normalize(cameraRight)
-            let worldUp = SIMD3<Float>(0, 1, 0)
-            let horizontalDepth = simd_normalize(simd_cross(cameraRight, worldUp))
-            return LiDARScanVolume(
-                centre: seed,
-                axisX: cameraRight,
-                axisY: worldUp,
-                axisZ: horizontalDepth,
-                halfExtents: SIMD3<Float>(
-                    selectionSettings.volumeWidth / 2,
-                    selectionSettings.volumeHeight / 2,
-                    selectionSettings.volumeDepth / 2
-                )
-            )
-        }
-
         private func showLockedVolume(_ volume: LiDARScanVolume) {
             DispatchQueue.main.async {
                 guard let arView = self.arView else { return }
                 self.selectionAnchorEntity?.removeFromParent()
                 let anchor = AnchorEntity(world: volume.transform)
-                var material = UnlitMaterial(color: UIColor.cyan.withAlphaComponent(0.12))
+                // Green to match the on-screen guide's locked state and docs.
+                var material = UnlitMaterial(color: UIColor.green.withAlphaComponent(0.12))
                 material.blending = .transparent(opacity: 0.12)
                 let size = volume.halfExtents * 2
                 let box = ModelEntity(

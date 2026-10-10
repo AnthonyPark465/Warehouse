@@ -72,7 +72,17 @@ enum ManualMeasurementGeometry {
     /// Keeps accidental double-taps distinct without imposing a practical
     /// minimum product footprint.
     static let minimumPointSpacingMetres = 0.001
-    static let maximumPlaneDeviationMetres = 0.02
+    /// Real tabletop taps scatter more than the old 2 cm limit allowed. Up to
+    /// 3.5 cm is accepted; scatter past `planeDeviationPenaltyStartMetres`
+    /// lowers confidence instead of hard-rejecting the boundary (D11).
+    static let maximumPlaneDeviationMetres = 0.035
+    /// Below this deviation the confidence penalty matches the historical
+    /// behaviour; the 2–3.5 cm band adds an extra penalty.
+    static let planeDeviationPenaltyStartMetres = 0.02
+    /// Slack for bottom/top limit markers relative to the fitted base plane.
+    /// Named so `height()` and bottom-marker placement stay at the same 3 cm
+    /// even though the boundary-fit tolerance above was relaxed (D2/D6).
+    static let limitMarkerPlaneSlackMetres = 0.03
     static let minimumHeightMetres = 0.001
     static let maximumHeightMetres = 25.0
     /// ARKit world tracking with `.gravity` alignment uses +Y as world up.
@@ -97,9 +107,15 @@ enum ManualMeasurementGeometry {
                 maximumDeviationCM: plane.maximumDeviation * 100
             )
         }
-        let polygon = points.map(plane.project)
-        guard !hasSelfIntersection(polygon) else {
-            throw ManualMeasurementGeometryError.selfIntersection
+        var polygon = points.map(plane.project)
+        if hasSelfIntersection(polygon) {
+            // Corners tapped in Z/diagonal order still describe one footprint;
+            // retry in angular order around the centroid before rejecting (D10).
+            let reordered = angularBoundaryOrder(polygon).map { polygon[$0] }
+            guard !hasSelfIntersection(reordered) else {
+                throw ManualMeasurementGeometryError.selfIntersection
+            }
+            polygon = reordered
         }
         let signedArea = polygonArea(polygon)
         guard abs(signedArea) > 0.000_000_1 else {
@@ -163,7 +179,7 @@ enum ManualMeasurementGeometry {
             throw ManualMeasurementGeometryError.invalidHeight
         }
         guard abs(boundary.plane.signedDistance(to: lowerPoint))
-                <= maximumPlaneDeviationMetres * 1.5
+                <= limitMarkerPlaneSlackMetres
         else {
             throw ManualMeasurementGeometryError.pointOutsideFootprint(name: "bottom")
         }
@@ -175,6 +191,100 @@ enum ManualMeasurementGeometry {
             throw ManualMeasurementGeometryError.pointOutsideFootprint(name: "top")
         }
         return measuredHeight
+    }
+
+    /// Bottom/top limit markers must sit on the fitted base plane (within the
+    /// 3 cm slack) and inside the boundary footprint plus a 25% margin, the
+    /// same rules `height()` enforces after the fact (D2/D6).
+    static func limitMarkerIsOnBase(
+        _ worldPoint: SIMD3<Float>,
+        boundary: BoundaryMeasurement
+    ) -> Bool {
+        let point3 = SIMD3<Double>(worldPoint)
+        guard abs(boundary.plane.signedDistance(to: point3))
+                <= limitMarkerPlaneSlackMetres
+        else { return false }
+        let margin = max(
+            boundary.footprint.lengthMetres,
+            boundary.footprint.widthMetres
+        ) * 0.25
+        return point(
+            boundary.plane.project(point3),
+            near: boundary.projectedBoundary,
+            margin: margin
+        )
+    }
+
+    /// Vertex order sorted by angle around the centroid. Taps made in a
+    /// Z/diagonal pattern come back as a simple polygon in this order.
+    static func angularBoundaryOrder(_ polygon: [SIMD2<Double>]) -> [Int] {
+        guard polygon.count >= 3 else { return Array(polygon.indices) }
+        let centroid = polygon.reduce(.zero, +) / Double(polygon.count)
+        return polygon.indices.sorted {
+            atan2(polygon[$0].y - centroid.y, polygon[$0].x - centroid.x)
+                < atan2(polygon[$1].y - centroid.y, polygon[$1].x - centroid.x)
+        }
+    }
+
+    /// Non-nil when the tapped marker order self-intersects but the angular
+    /// order does not: the permutation that repairs the boundary. Callers
+    /// apply it to their marker storage so the rendered outline and the scan
+    /// prism match the measured footprint (D10).
+    static func repairedBoundaryOrder(_ worldPoints: [SIMD3<Float>]) -> [Int]? {
+        guard worldPoints.count >= 3 else { return nil }
+        let points = worldPoints.map(SIMD3<Double>.init)
+        guard let plane = try? fitPlane(to: points) else { return nil }
+        let polygon = points.map(plane.project)
+        guard hasSelfIntersection(polygon) else { return nil }
+        let order = angularBoundaryOrder(polygon)
+        let reordered = order.map { polygon[$0] }
+        return hasSelfIntersection(reordered) ? nil : order
+    }
+
+    /// A point guaranteed to lie inside the polygon: the area centroid when
+    /// it is interior, otherwise the centroid of the largest ear-clipped
+    /// triangle, which is interior by construction. The vertex centroid can
+    /// fall outside a concave footprint and mis-seed region growing (D12).
+    static func interiorSeedPoint(for polygon: [SIMD2<Double>]) -> SIMD2<Double>? {
+        guard polygon.count >= 3 else { return nil }
+        let area = polygonArea(polygon)
+        if abs(area) > 1e-9 {
+            var centroid = SIMD2<Double>.zero
+            for index in polygon.indices {
+                let current = polygon[index]
+                let next = polygon[(index + 1) % polygon.count]
+                centroid += (current + next)
+                    * (current.x * next.y - next.x * current.y)
+            }
+            centroid /= 6 * area
+            if pointInPolygon(centroid, polygon: polygon) { return centroid }
+        }
+        let indices = triangulationIndices(for: polygon)
+        var best: (area: Double, centroid: SIMD2<Double>)?
+        for start in stride(from: 0, to: indices.count, by: 3) {
+            let a = polygon[Int(indices[start])]
+            let b = polygon[Int(indices[start + 1])]
+            let c = polygon[Int(indices[start + 2])]
+            let triangleArea = abs(cross(b - a, c - a)) / 2
+            if best == nil || triangleArea > best!.area {
+                best = (triangleArea, (a + b + c) / 3)
+            }
+        }
+        return best?.centroid
+            ?? polygon.reduce(.zero, +) / Double(polygon.count)
+    }
+
+    /// Reuses the fusion prism's even-odd/edge test rather than duplicating a
+    /// second point-in-polygon implementation.
+    static func pointInPolygon(
+        _ point: SIMD2<Double>,
+        polygon: [SIMD2<Double>]
+    ) -> Bool {
+        LiDARPolygonalPrism.pointInPolygon(
+            SIMD2<Float>(Float(point.x), Float(point.y)),
+            polygon: polygon.map { SIMD2<Float>(Float($0.x), Float($0.y)) },
+            margin: 0
+        )
     }
 
     /// Fits a least-squares plane. The normal is the eigenvector associated

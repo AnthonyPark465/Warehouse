@@ -49,7 +49,6 @@ struct ManualARSessionView: UIViewRepresentable {
         /// Read and written on the main queue only.
         private var cornerPatchIsNeeded = true
         private var markerAnchors: [ARAnchor] = []
-        private var renderedMarkerPositions: [SIMD3<Float>] = []
         private var lastPreviewUpdate: TimeInterval = 0
         private var handledPlacementRequestID = 0
         private var renderedRevision = -1
@@ -70,6 +69,9 @@ struct ManualARSessionView: UIViewRepresentable {
         /// Incremented whenever the session's world coordinate system may
         /// have changed. Delegate callbacks arrive on the main queue.
         private var coordinateEpoch = 0
+        /// Main-actor mirror of the newest frame timestamp, used to judge
+        /// corner-lock freshness at placement time.
+        @MainActor private var latestFrameTimestamp: TimeInterval = 0
         // Corner recognition: rolling reticle patch + current lock (main actor).
         private var cornerLockWindow = ObjectCornerLockWindow()
         private var lockedCorner: ObjectCornerLockWindow.Lock?
@@ -134,7 +136,6 @@ struct ManualARSessionView: UIViewRepresentable {
             guard let sceneView else { return }
             markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
             markerAnchors.removeAll()
-            renderedMarkerPositions.removeAll()
             sceneView.session.delegate = nil
             sceneView.delegate = nil
             sceneView.session.pause()
@@ -197,18 +198,36 @@ struct ManualARSessionView: UIViewRepresentable {
             let depthFrame = scan.isActive ? makeDepthFrame(from: frame) : nil
             // Corners are only recognised while boundary markers are placed.
             let cornerPatch = cornerPatchIsNeeded ? extractCornerPatch(from: frame) : nil
+            let trackingSnapshot = Self.trackingSnapshot(of: trackingState)
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                latestFrameTimestamp = now
                 cornerPatchIsNeeded = state.stage == .boundary
                 state.updateTracking(trackingState)
-                let sample = raycastAtCentre()
-                state.updatePreview(sample)
-                updateCornerLock(sample: sample, patch: cornerPatch, timestamp: now)
-                updatePreview(sample)
+                let centre = raycastAtCentre()
+                state.updatePreview(centre.sample)
+                state.updatePlacementGuidance(centre.guidance)
+                updateCornerLock(
+                    sample: centre.sample,
+                    patch: cornerPatch,
+                    timestamp: now,
+                    tracking: trackingSnapshot
+                )
+                updatePreview(centre.sample)
             }
             guard let depthFrame else { return }
             fusionQueue.async { [weak self] in
                 self?.integrateProductFrame(depthFrame, generation: scan.generation)
+            }
+        }
+
+        private static func trackingSnapshot(
+            of state: ARCamera.TrackingState
+        ) -> TrackingQualitySnapshot {
+            switch state {
+            case .normal: .normal
+            case .limited: .limited
+            case .notAvailable: .unavailable
             }
         }
 
@@ -479,10 +498,12 @@ struct ManualARSessionView: UIViewRepresentable {
             let centreX = width / 2
             let centreY = height / 2
             var points: [SIMD3<Float>] = []
-            points.reserveCapacity(240)
+            points.reserveCapacity(640)
             let projection = ARDepthProjection(frame: frame, depthWidth: width, depthHeight: height)
-            for y in stride(from: centreY - 14, through: centreY + 14, by: 2) {
-                for x in stride(from: centreX - 14, through: centreX + 14, by: 2) {
+            // ±24 px (was ±14): small products need the wider patch for both
+            // corner legs to gather enough coverage to fit lines.
+            for y in stride(from: centreY - 24, through: centreY + 24, by: 2) {
+                for x in stride(from: centreX - 24, through: centreX + 24, by: 2) {
                     guard x >= 0, x < width, y >= 0, y < height else { continue }
                     let depth = depths[y * rowStride + x]
                     guard depth.isFinite, depth >= 0.10, depth <= 3 else { continue }
@@ -502,7 +523,8 @@ struct ManualARSessionView: UIViewRepresentable {
         private func updateCornerLock(
             sample: CentreRaycastSample?,
             patch: CornerPatch?,
-            timestamp: TimeInterval
+            timestamp: TimeInterval,
+            tracking: TrackingQualitySnapshot
         ) {
             guard state.stage == .boundary, let sample, let patch else {
                 if lockedCorner != nil || state.stage != .boundary {
@@ -516,7 +538,8 @@ struct ManualARSessionView: UIViewRepresentable {
                 patchWorldPoints: patch.points,
                 cameraWorld: patch.cameraWorld,
                 timestamp: timestamp,
-                depthConfidence: patch.depthConfidence
+                depthConfidence: patch.depthConfidence,
+                trackingState: tracking
             )
             guard timestamp - lastCornerRecognitionAt >= 0.3 else { return }
             lastCornerRecognitionAt = timestamp
@@ -537,12 +560,20 @@ struct ManualARSessionView: UIViewRepresentable {
         /// locked, otherwise the raw centre raycast.
         @MainActor
         private func placementSample() -> CentreRaycastSample? {
-            let raw = raycastAtCentre()
+            let raw = raycastAtCentre().sample
             guard state.stage == .boundary, let lockedCorner, let raw else {
                 return raw
             }
             cornerLockWindow.reset()
             self.lockedCorner = nil
+            // Advisory only: a stale or drifted lock falls back to the raw
+            // raycast rather than snapping the marker to where the user was
+            // aiming almost half a second ago (D3f). It never blocks placing.
+            guard ObjectCornerLockWindow.lockIsUsableForPlacement(
+                lockedCorner,
+                reticleWorld: raw.position,
+                at: latestFrameTimestamp
+            ) else { return raw }
             return CentreRaycastSample(
                 position: lockedCorner.worldPosition,
                 raycastType: "recognisedCorner",
@@ -669,12 +700,15 @@ struct ManualARSessionView: UIViewRepresentable {
             return SIMD3(world.x, world.y, world.z)
         }
 
+        /// Centre sample plus a human-readable reason when the sample is
+        /// unusable, so the UI can say WHY Place is disabled instead of
+        /// silently greying it out (D6).
         @MainActor
-        private func raycastAtCentre() -> CentreRaycastSample? {
+        private func raycastAtCentre() -> (sample: CentreRaycastSample?, guidance: String?) {
             guard let sceneView,
                   sceneView.bounds.width > 0,
                   sceneView.bounds.height > 0
-            else { return nil }
+            else { return (nil, nil) }
             let centre = CGPoint(x: sceneView.bounds.midX, y: sceneView.bounds.midY)
 
             if state.stage == .topLimit {
@@ -685,25 +719,32 @@ struct ManualARSessionView: UIViewRepresentable {
                 // selected bottom. Do not fall back through the object.
                 if let frame = sceneView.session.currentFrame,
                    frame.smoothedSceneDepth != nil || frame.sceneDepth != nil {
-                    guard let sample = depthSampleAtCentre(frame: frame),
-                          isUsableTopSample(sample)
-                    else { return nil }
-                    return sample
+                    guard let sample = depthSampleAtCentre(frame: frame) else {
+                        return (nil, "No reliable depth under the centre dot. Move closer to the product's top.")
+                    }
+                    if let problem = topSampleProblem(sample) {
+                        return (nil, problem)
+                    }
+                    return (sample, nil)
                 }
 
                 // Non-LiDAR fallback: use only finite/estimated surfaces.
                 // Infinite planes are deliberately excluded for the top marker.
+                var lastProblem: String?
                 for target in [
                     ARRaycastQuery.Target.estimatedPlane,
                     .existingPlaneGeometry
                 ] {
                     if let result = raycast(from: centre, target: target, in: sceneView),
-                       let sample = sample(from: result, target: target, in: sceneView),
-                       isUsableTopSample(sample) {
-                        return sample
+                       let sample = sample(from: result, target: target, in: sceneView) {
+                        if let problem = topSampleProblem(sample) {
+                            lastProblem = problem
+                        } else {
+                            return (sample, nil)
+                        }
                     }
                 }
-                return nil
+                return (nil, lastProblem ?? "Aim the centre dot at a detected surface above the bottom limit.")
             }
 
             let existing = raycast(
@@ -718,12 +759,12 @@ struct ManualARSessionView: UIViewRepresentable {
                 ? raycast(from: centre, target: .estimatedPlane, in: sceneView)
                 : nil
             let result = existing ?? infinite ?? estimated
-            guard let result else { return nil }
+            guard let result else { return (nil, nil) }
 
             let target: ARRaycastQuery.Target = existing != nil
                 ? .existingPlaneGeometry
                 : (infinite != nil ? .existingPlaneInfinite : .estimatedPlane)
-            return sample(from: result, target: target, in: sceneView)
+            return (sample(from: result, target: target, in: sceneView), nil)
         }
 
         @MainActor
@@ -857,18 +898,30 @@ struct ManualARSessionView: UIViewRepresentable {
             )
         }
 
+        /// Nil when the sample can be used as a top limit; otherwise the
+        /// reason it cannot, surfaced as live guidance (D6).
         @MainActor
-        private func isUsableTopSample(_ sample: CentreRaycastSample) -> Bool {
+        private func topSampleProblem(_ sample: CentreRaycastSample) -> String? {
             guard let bottom = state.bottomMarker,
-                  let boundary = state.boundaryMeasurement,
-                  sample.position.y - bottom.position.simd.y
+                  let boundary = state.boundaryMeasurement
+            else {
+                return "Set the base boundary and bottom limit before the top limit."
+            }
+            guard sample.position.y - bottom.position.simd.y
                     >= Float(ManualMeasurementGeometry.minimumHeightMetres)
-            else { return false }
-            return (try? ManualMeasurementGeometry.height(
-                top: sample.position,
-                bottom: bottom.position.simd,
-                boundary: boundary
-            )) != nil
+            else {
+                return "The aimed surface is not above the bottom limit. Aim at the product's top."
+            }
+            do {
+                _ = try ManualMeasurementGeometry.height(
+                    top: sample.position,
+                    bottom: bottom.position.simd,
+                    boundary: boundary
+                )
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
         }
 
         @MainActor
@@ -927,20 +980,31 @@ struct ManualARSessionView: UIViewRepresentable {
             let boundary = state.boundaryMarkers.map { $0.position.simd }
             let bottom = state.bottomMarker?.position.simd
             let top = state.topMarker?.position.simd
-            let markerPositions = boundary + [bottom, top].compactMap { $0 }
-            if markerPositions != renderedMarkerPositions {
-                markerAnchors.forEach { sceneView.session.remove(anchor: $0) }
-                markerAnchors.removeAll()
-                boundary.forEach {
-                    addMarkerAnchor(at: $0, name: AnchorName.boundary)
+            // Diff anchors incrementally: removing and re-adding every marker
+            // on any change made all of them blink out and pop back in (D17).
+            var desired: [(position: SIMD3<Float>, name: String)] =
+                boundary.map { ($0, AnchorName.boundary) }
+            if let bottom { desired.append((bottom, AnchorName.bottom)) }
+            if let top { desired.append((top, AnchorName.top)) }
+            var kept: [ARAnchor] = []
+            for anchor in markerAnchors {
+                let position = SIMD3<Float>(
+                    anchor.transform.columns.3.x,
+                    anchor.transform.columns.3.y,
+                    anchor.transform.columns.3.z
+                )
+                if let index = desired.firstIndex(where: {
+                    $0.name == anchor.name && $0.position == position
+                }) {
+                    desired.remove(at: index)
+                    kept.append(anchor)
+                } else {
+                    sceneView.session.remove(anchor: anchor)
                 }
-                if let bottom {
-                    addMarkerAnchor(at: bottom, name: AnchorName.bottom)
-                }
-                if let top {
-                    addMarkerAnchor(at: top, name: AnchorName.top)
-                }
-                renderedMarkerPositions = markerPositions
+            }
+            markerAnchors = kept
+            for marker in desired {
+                addMarkerAnchor(at: marker.position, name: marker.name)
             }
             for (start, end) in zip(boundary, boundary.dropFirst()) {
                 addLine(from: start, to: end, color: .systemCyan)

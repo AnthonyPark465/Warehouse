@@ -172,7 +172,7 @@ struct LiDARPolygonalPrism: Equatable {
         )
     }
 
-    private static func pointInPolygon(
+    static func pointInPolygon(
         _ point: SIMD2<Float>,
         polygon: [SIMD2<Float>],
         margin: Float

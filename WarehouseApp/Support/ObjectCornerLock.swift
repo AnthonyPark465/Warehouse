@@ -12,13 +12,22 @@ struct ObjectCornerLockWindow {
     struct Lock: Equatable {
         let worldPosition: SIMD3<Float>
         let uncertaintyMetres: Double
+        /// Frame timestamp of the recognition; placement rejects stale locks.
+        let recognisedAt: TimeInterval
     }
 
     var configuration = CornerEstimatorConfiguration.standard
     /// A recognised corner farther than this from the reticle is not locked.
     var maximumLockDistanceMetres = 0.08
     /// Reticle drift beyond this restarts the window (aiming at a new corner).
-    var maximumReticleDriftMetres: Float = 0.10
+    /// Measured against the rolling recent aim, not the first hit, so slow
+    /// scanning along a long edge does not thrash the window (D3c).
+    var maximumReticleDriftMetres: Float = 0.15
+    /// A lock older than this at placement time is discarded (D3f).
+    static let maximumLockAgeSeconds: TimeInterval = 0.4
+    /// A lock farther than this from the current reticle sample is discarded
+    /// at placement time (D3f). Tighter than recognition's lock distance.
+    static let maximumLockToReticleMetres: Float = 0.04
     /// Evidence cap per recognition run. The estimators scale super-linearly
     /// with sample count; a uniform subsample keeps recognition fast while
     /// staying far above the estimators' minimum support requirements.
@@ -29,6 +38,10 @@ struct ObjectCornerLockWindow {
     private var epoch = UUID()
     private var startedAt: TimeInterval?
     private var frameSequence = 0
+    /// Exponential moving average of the reticle over roughly the last 0.5 s
+    /// (integrate runs at ~10 Hz); the drift reference for `integrate`.
+    private var recentReticleAverage: SIMD3<Float>?
+    private let reticleSmoothing: Float = 0.25
 
     mutating func reset() {
         originWorld = nil
@@ -36,6 +49,20 @@ struct ObjectCornerLockWindow {
         epoch = UUID()
         startedAt = nil
         frameSequence = 0
+        recentReticleAverage = nil
+    }
+
+    /// Placement policy: a lock may snap a placement only while fresh and
+    /// near the current reticle sample; otherwise placement falls back to the
+    /// raw sample. Advisory only — this can never block a placement.
+    static func lockIsUsableForPlacement(
+        _ lock: Lock,
+        reticleWorld: SIMD3<Float>,
+        at timestamp: TimeInterval
+    ) -> Bool {
+        timestamp - lock.recognisedAt <= maximumLockAgeSeconds
+            && simd_distance(lock.worldPosition, reticleWorld)
+                <= maximumLockToReticleMetres
     }
 
     /// Registers one frame's reticle hit and the depth points around it.
@@ -46,16 +73,20 @@ struct ObjectCornerLockWindow {
         patchWorldPoints: [SIMD3<Float>],
         cameraWorld: SIMD3<Float>,
         timestamp: TimeInterval,
-        depthConfidence: Double
+        depthConfidence: Double,
+        trackingState: TrackingQualitySnapshot = .normal
     ) {
-        if let originWorld,
-           simd_distance(originWorld, reticleWorld) > maximumReticleDriftMetres {
+        if let recent = recentReticleAverage,
+           simd_distance(recent, reticleWorld) > maximumReticleDriftMetres {
             reset()
         }
         if originWorld == nil {
             originWorld = reticleWorld
             startedAt = timestamp
         }
+        recentReticleAverage = recentReticleAverage.map {
+            $0 + (reticleWorld - $0) * reticleSmoothing
+        } ?? reticleWorld
         guard let origin = originWorld else { return }
         frameSequence += 1
         let cameraLocal = cameraWorld - origin
@@ -75,8 +106,9 @@ struct ObjectCornerLockWindow {
                 ),
                 timestamp: timestamp,
                 frameSequence: frameSequence,
-                trackingState: .normal,
-                depthConfidence: depthConfidence
+                trackingState: trackingState,
+                depthConfidence: depthConfidence,
+                coordinateEpoch: epoch
             ))
         }
         // Slide the window so stale geometry cannot outvote fresh evidence.
@@ -128,13 +160,27 @@ struct ObjectCornerLockWindow {
             corner.acceptedLocalPosition.y - Double(reticleLocal.z)
         )
         guard simd_length(offset) <= maximumLockDistanceMetres else { return nil }
+        // The estimators solve in the horizontal plane; the corner's height is
+        // the median elevation of the captured patch (the surface the fit was
+        // anchored to), not the window origin's y = 0 (D3e).
+        let elevation = medianValue(evidence.map(\.localPosition.y))
         return Lock(
             worldPosition: origin + SIMD3<Float>(
                 Float(corner.acceptedLocalPosition.x),
-                0,
+                elevation.isFinite ? Float(elevation) : 0,
                 Float(corner.acceptedLocalPosition.y)
             ),
-            uncertaintyMetres: corner.uncertaintyMetres
+            uncertaintyMetres: corner.uncertaintyMetres,
+            recognisedAt: timestamp
         )
+    }
+
+    private func medianValue(_ values: [Double]) -> Double {
+        let sorted = values.filter(\.isFinite).sorted()
+        guard !sorted.isEmpty else { return .infinity }
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[sorted.count / 2 - 1] + sorted[sorted.count / 2]) / 2
+        }
+        return sorted[sorted.count / 2]
     }
 }

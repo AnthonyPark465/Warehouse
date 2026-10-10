@@ -134,6 +134,9 @@ struct LocalCornerPatchSample: Codable, Equatable, Identifiable {
     var frameSequence: Int
     var trackingState: TrackingQualitySnapshot
     var depthConfidence: Double
+    /// Coordinate epoch the sample was captured under. Optional so samples
+    /// persisted before this field existed still decode; nil is trusted.
+    var coordinateEpoch: UUID? = nil
 }
 
 struct FittedCornerEdge: Codable, Equatable {

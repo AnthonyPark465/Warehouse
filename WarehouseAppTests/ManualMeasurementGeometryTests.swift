@@ -88,7 +88,7 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         state.finishProductScan()
 
         XCTAssertNotEqual(state.stage, .review)
-        XCTAssertNotNil(state.errorMessage)
+        XCTAssertNotNil(state.statusReason)
     }
 
     @MainActor
@@ -125,7 +125,7 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         state.finishProductScan()
         XCTAssertEqual(state.stage, .review)
 
-        state.continueProductScan()
+        state.restartProductScan()
 
         XCTAssertEqual(state.stage, .productScan)
         XCTAssertTrue(state.productScanIsActive)
@@ -153,7 +153,7 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         state.finishProductScan()
 
         XCTAssertNotEqual(state.stage, .review)
-        XCTAssertEqual(state.errorMessage, guidance)
+        XCTAssertEqual(state.statusReason, guidance)
     }
 
     func testInteriorPointOfConcaveBoundaryLiesInsideIt() throws {
@@ -186,7 +186,9 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         XCTAssertTrue(state.boundaryMarkers.isEmpty)
         XCTAssertNil(state.bottomMarker)
         XCTAssertNil(state.topMarker)
-        XCTAssertNotNil(state.errorMessage)
+        // Placement rejections are inline status text, not modal errors (D16).
+        XCTAssertNotNil(state.statusReason)
+        XCTAssertNil(state.errorMessage)
     }
 
     @MainActor
@@ -209,7 +211,8 @@ final class ManualMeasurementGeometryTests: XCTestCase {
 
         XCTAssertEqual(state.stage, .topLimit)
         XCTAssertNil(state.topMarker)
-        XCTAssertNotNil(state.errorMessage)
+        // Placement rejections are inline status text, not modal errors (D16).
+        XCTAssertNotNil(state.statusReason)
     }
 
     func testRotatedRectangleProducesOrientationIndependentDimensions() throws {
@@ -309,18 +312,24 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         XCTAssertEqual(boundary.footprint.lengthMetres, 6, accuracy: 0.000_01)
     }
 
-    func testRejectsSelfIntersectingBoundary() {
-        let bowTie: [SIMD3<Float>] = [
+    /// D10: corners tapped in a Z/diagonal order used to be rejected as a
+    /// self-intersection; they are now reordered by angle around the
+    /// centroid into the footprint the user actually marked.
+    func testZOrderBoundaryTapsAreAccepted() throws {
+        let zOrder: [SIMD3<Float>] = [
             [0, 0, 0], [0.3, 0, 0.3], [0, 0, 0.3], [0.3, 0, 0]
         ]
-        XCTAssertThrowsError(try ManualMeasurementGeometry.measureBoundary(bowTie)) {
-            XCTAssertEqual($0 as? ManualMeasurementGeometryError, .selfIntersection)
-        }
+        let boundary = try ManualMeasurementGeometry.measureBoundary(zOrder)
+        XCTAssertEqual(boundary.footprint.lengthMetres, 0.3, accuracy: 0.000_01)
+        XCTAssertEqual(boundary.footprint.widthMetres, 0.3, accuracy: 0.000_01)
+        XCTAssertEqual(boundary.footprint.areaSquareMetres, 0.09, accuracy: 0.000_01)
     }
 
     func testRejectsNonCoplanarBoundary() {
+        // 30 cm out of plane: far beyond the relaxed 3.5 cm tolerance (the
+        // old 10 cm corner now fits under the tilted least-squares plane).
         let points: [SIMD3<Float>] = [
-            [0, 0, 0], [0.4, 0, 0], [0.4, 0.1, 0.3], [0, 0, 0.3]
+            [0, 0, 0], [0.4, 0, 0], [0.4, 0.3, 0.3], [0, 0, 0.3]
         ]
         XCTAssertThrowsError(try ManualMeasurementGeometry.measureBoundary(points))
     }
@@ -348,6 +357,175 @@ final class ManualMeasurementGeometryTests: XCTestCase {
         state.place(sample([0.1, 0, 0.1]))
         state.place(sample([0.1, 0.2, 0.1]))
         XCTAssertEqual(state.stage, .productScan)
+        return state
+    }
+
+    // MARK: - Phase 3 stabilization coverage
+
+    @MainActor
+    func testBottomMarkerBelowBasePlaneIsRejectedWithReason() {
+        let state = confirmedBaseState()
+
+        state.place(sample([0.1, -0.1, 0.1]))
+
+        XCTAssertNil(state.bottomMarker)
+        XCTAssertEqual(state.stage, .bottomLimit)
+        XCTAssertEqual(
+            state.statusReason,
+            "Place the bottom marker on the product's base, inside the scanned boundary."
+        )
+    }
+
+    @MainActor
+    func testBottomMarkerFarOutsideFootprintIsRejected() {
+        let state = confirmedBaseState()
+
+        state.place(sample([1.5, 0, 1.5]))
+
+        XCTAssertNil(state.bottomMarker)
+        XCTAssertNotNil(state.statusReason)
+    }
+
+    @MainActor
+    func testUndoAfterReplaceDoesNotTrapOnNextPlacement() {
+        let state = confirmedBaseState()
+        state.replaceBoundaryPoint(at: 3)
+
+        state.undo()
+        state.place(sample([0.9, 0, 0.9]))
+
+        XCTAssertEqual(state.boundaryMarkers.count, 5)
+        XCTAssertNil(state.statusReason)
+    }
+
+    @MainActor
+    func testRelaxedPlaneScatterIsAcceptedWithConfidencePenalty() throws {
+        let flat = boundaryState([
+            [0, 0, 0], [0.4, 0, 0], [0.4, 0, 0.3], [0, 0, 0.3]
+        ])
+        let scattered = boundaryState([
+            [0, 0.025, 0], [0.4, -0.025, 0], [0.4, 0.025, 0.3], [0, -0.025, 0.3]
+        ])
+
+        let measurement = try XCTUnwrap(scattered.boundaryMeasurement)
+        XCTAssertGreaterThan(measurement.plane.maximumDeviation, 0.02)
+        XCTAssertLessThan(scattered.confidence, flat.confidence)
+    }
+
+    func testFourCentimetreScatterIsStillRejected() {
+        let points: [SIMD3<Float>] = [
+            [0, 0.04, 0], [0.4, -0.04, 0], [0.4, 0.04, 0.3], [0, -0.04, 0.3]
+        ]
+        XCTAssertThrowsError(try ManualMeasurementGeometry.measureBoundary(points))
+    }
+
+    @MainActor
+    func testConcaveFootprintSeedLiesInsideThePolygon() throws {
+        let state = ManualARMeasurementState()
+        state.updatePreview(sample([0, 0, 0]))
+        state.updateTracking(.normal)
+        [
+            sample([0, 0, 0]),
+            sample([0.2, 0, 0]),
+            sample([0.2, 0, 0.2]),
+            sample([0.1, 0, 0.02]),
+            sample([0, 0, 0.2])
+        ].forEach(state.place)
+        state.closeBoundary()
+        state.confirmBase()
+        state.place(sample([0.03, 0, 0.03]))
+        state.place(sample([0.03, 0.3, 0.03]))
+
+        let region = try XCTUnwrap(state.productScanRegion)
+        let seed = try XCTUnwrap(state.productSeed)
+        XCTAssertTrue(region.contains(seed))
+
+        // The vertex centroid this replaced falls outside the concave notch.
+        let vertexCentre = region.polygon.reduce(SIMD2<Float>.zero, +)
+            / Float(region.polygon.count)
+        let vertexSeed = region.origin
+            + region.axisU * vertexCentre.x
+            + region.axisV * vertexCentre.y
+            + region.normal * (region.lowerOffset + 0.02)
+        XCTAssertFalse(region.contains(vertexSeed))
+    }
+
+    @MainActor
+    func testBoundaryFallbackCaptureUsesMinimumAreaRectangleAndMarkerHeight() throws {
+        let state = productScanReadyState()
+
+        let capture = try XCTUnwrap(state.makeBoundaryFallbackCapture())
+
+        XCTAssertEqual(capture.rawDimensionsCM.length, 40, accuracy: 0.01)
+        XCTAssertEqual(capture.rawDimensionsCM.width, 30, accuracy: 0.01)
+        XCTAssertEqual(capture.rawDimensionsCM.height, 50, accuracy: 0.01)
+        XCTAssertEqual(capture.scanMethod, .standardAR)
+        XCTAssertEqual(capture.confidence, 0.5)
+        XCTAssertEqual(capture.manualMeasurement?.scanningRegionOnly, false)
+    }
+
+    @MainActor
+    func testReplaceBottomKeepsGeometricallyValidTopMarker() {
+        let state = productScanReadyState()
+
+        state.replaceBottom()
+        XCTAssertNotNil(state.topMarker)
+        XCTAssertEqual(state.stage, .bottomLimit)
+
+        state.place(sample([0.15, 0, 0.15]))
+
+        XCTAssertNotNil(state.bottomMarker)
+        XCTAssertNotNil(state.topMarker)
+        XCTAssertEqual(state.stage, .productScan)
+    }
+
+    @MainActor
+    func testReplaceBottomClearsTopThatBecomesInvalid() {
+        // Top only 2 cm above the base: a replacement bottom placed above it
+        // invalidates the retained top and returns to the top-limit stage.
+        let state = confirmedBaseState()
+        state.place(sample([0.1, 0, 0.1]))
+        state.place(sample([0.1, 0.02, 0.1]))
+        XCTAssertEqual(state.stage, .productScan)
+
+        state.replaceBottom()
+        state.place(sample([0.1, 0.025, 0.1]))
+
+        XCTAssertNil(state.topMarker)
+        XCTAssertEqual(state.stage, .topLimit)
+    }
+
+    @MainActor
+    private func confirmedBaseState() -> ManualARMeasurementState {
+        let state = ManualARMeasurementState()
+        state.updatePreview(sample([0, 0, 0]))
+        state.updateTracking(.normal)
+        [
+            sample([0, 0, 0]),
+            sample([0.4, 0, 0]),
+            sample([0.4, 0, 0.3]),
+            sample([0, 0, 0.3])
+        ].forEach(state.place)
+        state.closeBoundary()
+        state.confirmBase()
+        return state
+    }
+
+    @MainActor
+    private func productScanReadyState() -> ManualARMeasurementState {
+        let state = confirmedBaseState()
+        state.place(sample([0.1, 0, 0.1]))
+        state.place(sample([0.1, 0.5, 0.1]))
+        return state
+    }
+
+    @MainActor
+    private func boundaryState(_ corners: [SIMD3<Float>]) -> ManualARMeasurementState {
+        let state = ManualARMeasurementState()
+        state.updatePreview(sample(corners[0]))
+        state.updateTracking(.normal)
+        corners.forEach { state.place(sample($0)) }
+        state.closeBoundary()
         return state
     }
 
